@@ -102,6 +102,18 @@ class ArchitectureAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def render_target_chat_batch(
+        self,
+        processor: Any,
+        conversations: Sequence[Sequence[Mapping[str, Any]]],
+        config: TargetGenerationConfig | None = None,
+        *,
+        thinking_enabled: bool | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
     def render_judge_chat(
         self,
         processor: Any,

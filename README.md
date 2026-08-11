@@ -77,6 +77,7 @@ requires every packaged case to match.
 | `target_generation.system_prompt` | `null` | Optional system message prepended to every target request. |
 | `target_generation.thinking_enabled` | `true` | Whether the model's official chat template enables its thinking response mode. |
 | `target_generation.max_new_tokens` | `4096` | Maximum generated tokens per target response. |
+| `target_generation.batch_size` | `1` | Fixed target-generation batch size; values above one require effective greedy decoding with one beam. |
 | `target_generation.do_sample` | `false` | Sampling mode. |
 | `target_generation.num_beams` | `1` | Beam count. |
 | `target_generation.temperature` | `null` | Sampling temperature. |
@@ -115,11 +116,11 @@ The adapter is selected from the pinned checkpoint's `model_type`. The included 
 
 ## Artifacts and privacy
 
-Artifacts are content-hashed and tied to their model, inputs, runtime profiles, and upstream results. Each completed
-generation or judgment is saved before the next input, and rerunning the same stage resumes its matching checkpoint.
-Error summaries show stable reason codes and point to owner-only diagnostics. Prompt text, generated tokens, parsed
-responses, and private checkpoints use owner-only permissions and are not copied into the exported checkpoint. The
-pipeline does not publish models or artifacts.
+Artifacts are content-hashed and bound to their model, inputs, runtime profiles, and upstream results. Completed
+generations and judgments are checkpointed incrementally; rerunning a stage resumes its matching checkpoint. Error
+summaries contain stable reason codes and reference owner-only diagnostics. Prompt text, generated tokens, parsed
+responses, and private checkpoints remain owner-only and are excluded from exported checkpoints. The pipeline does
+not publish models or artifacts.
 
 ## References
 

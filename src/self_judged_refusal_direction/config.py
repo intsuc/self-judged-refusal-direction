@@ -47,6 +47,7 @@ class TargetGenerationConfig:
     system_prompt: str | None = None
     thinking_enabled: bool = True
     max_new_tokens: int = 4096
+    batch_size: int = 1
     do_sample: bool | None = False
     num_beams: int | None = 1
     temperature: float | None = None
@@ -169,6 +170,8 @@ class ProjectConfig:
             errors.append("target_generation.thinking_enabled must be a boolean")
         if not _positive_integer(generation.max_new_tokens):
             errors.append("target_generation.max_new_tokens must be a positive integer")
+        if not _positive_integer(generation.batch_size):
+            errors.append("target_generation.batch_size must be a positive integer")
         if generation.do_sample is not None and not isinstance(generation.do_sample, bool):
             errors.append("target_generation.do_sample must be a boolean or null")
         if generation.num_beams is not None and not _positive_integer(generation.num_beams):
@@ -201,6 +204,11 @@ class ProjectConfig:
         )
         if any(value is not None for value in sampling_values) and generation.do_sample is False:
             errors.append("target generation sampling parameters require do_sample=true or null")
+        if _positive_integer(generation.batch_size) and generation.batch_size > 1:
+            if generation.do_sample is True:
+                errors.append("target_generation.batch_size greater than one requires effective greedy generation")
+            if generation.num_beams is not None and generation.num_beams != 1:
+                errors.append("target_generation.batch_size greater than one requires num_beams=1")
         if not all(
             isinstance(paths, tuple) and all(isinstance(path, str) for path in paths)
             for paths in (self.data.prompt_files, self.data.reference_files)

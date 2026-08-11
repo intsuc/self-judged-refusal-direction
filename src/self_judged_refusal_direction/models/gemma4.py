@@ -147,6 +147,43 @@ class Gemma4Adapter(ArchitectureAdapter):
         thinking_enabled: bool | None = None,
         **kwargs: Any,
     ) -> Any:
+        resolved = self._target_thinking_mode(config, thinking_enabled)
+        return self._render_chat(processor, messages, enable_thinking=resolved, **kwargs)
+
+    def render_target_chat_batch(
+        self,
+        processor: Any,
+        conversations: Sequence[Sequence[Mapping[str, Any]]],
+        config: TargetGenerationConfig | None = None,
+        *,
+        thinking_enabled: bool | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if not conversations:
+            raise InvariantError("target chat batch must not be empty")
+        resolved = self._target_thinking_mode(config, thinking_enabled)
+        options = dict(kwargs)
+        if "padding" in options or "padding_side" in options:
+            raise InvariantError("target chat batch padding cannot be overridden")
+        raw_processor_options = options.pop("processor_kwargs", None)
+        if raw_processor_options is None:
+            processor_options: dict[str, Any] = {}
+        elif isinstance(raw_processor_options, Mapping):
+            processor_options = dict(raw_processor_options)
+        else:
+            raise InvariantError("target chat batch processor_kwargs must be a mapping")
+        if "padding" in processor_options or "padding_side" in processor_options:
+            raise InvariantError("target chat batch padding cannot be overridden")
+        processor_options["padding"] = True
+        processor_options["padding_side"] = "left"
+        options["processor_kwargs"] = processor_options
+        return self._render_chat(processor, conversations, enable_thinking=resolved, **options)
+
+    def _target_thinking_mode(
+        self,
+        config: TargetGenerationConfig | None,
+        thinking_enabled: bool | None,
+    ) -> bool:
         configured = config.thinking_enabled if config is not None else None
         if configured is not None and not isinstance(configured, bool):
             raise InvariantError("target thinking mode must be a boolean")
@@ -158,7 +195,7 @@ class Gemma4Adapter(ArchitectureAdapter):
             if configured is not None and thinking_enabled is not configured:
                 raise InvariantError("explicit target thinking mode conflicts with generation config")
             resolved = thinking_enabled
-        return self._render_chat(processor, messages, enable_thinking=resolved, **kwargs)
+        return resolved
 
     def render_judge_chat(
         self,
@@ -467,7 +504,7 @@ class Gemma4Adapter(ArchitectureAdapter):
     def _render_chat(
         self,
         processor: Any,
-        messages: Sequence[Mapping[str, Any]],
+        messages: Sequence[Mapping[str, Any]] | Sequence[Sequence[Mapping[str, Any]]],
         *,
         enable_thinking: bool,
         **kwargs: Any,

@@ -53,6 +53,20 @@ def _as_token_ids(value: Any, name: str) -> tuple[int, ...]:
     return tuple(data)
 
 
+def _as_token_rows(value: Any, name: str) -> tuple[tuple[int, ...], ...]:
+    if isinstance(value, torch.Tensor):
+        data = value.detach().to(device="cpu").tolist()
+    elif hasattr(value, "tolist") and not isinstance(value, list | tuple):
+        data = value.tolist()
+    else:
+        data = value
+    if not isinstance(data, list | tuple) or any(
+        not isinstance(row, list | tuple) or any(not isinstance(item, int) for item in row) for row in data
+    ):
+        raise InvariantError(f"{name} must contain a batch of token sequences")
+    return tuple(tuple(row) for row in data)
+
+
 def _move_inputs(inputs: Any, device: torch.device | None) -> Any:
     if device is None:
         return inputs
@@ -76,6 +90,72 @@ def _generated_sequence(output: Any) -> Any:
     raise InvariantError("target generation must return exactly one sequence")
 
 
+def _generated_sequences(output: Any, batch_size: int) -> tuple[tuple[int, ...], ...]:
+    sequences = _as_token_rows(getattr(output, "sequences", output), "target generation")
+    if len(sequences) != batch_size:
+        raise InvariantError("target generation returned a different batch size")
+    return sequences
+
+
+def _left_padded_prefixes(
+    inputs: Mapping[str, Any],
+    processor: Any,
+    batch_size: int,
+) -> tuple[tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]]:
+    input_rows = _as_token_rows(inputs.get("input_ids"), "target input_ids")
+    attention_rows = _as_token_rows(inputs.get("attention_mask"), "target attention_mask")
+    if len(input_rows) != batch_size or len(attention_rows) != batch_size:
+        raise InvariantError("rendered target chat returned a different batch size")
+    if not input_rows or not input_rows[0]:
+        raise InvariantError("rendered target chat has an empty input sequence")
+    width = len(input_rows[0])
+    pad_token_id = getattr(getattr(processor, "tokenizer", None), "pad_token_id", None)
+    prefixes: list[tuple[int, ...]] = []
+    for input_row, attention_row in zip(input_rows, attention_rows, strict=True):
+        if len(input_row) != width or len(attention_row) != width:
+            raise InvariantError("rendered target chat batch is not rectangular")
+        try:
+            prefix_start = attention_row.index(1)
+        except ValueError as error:
+            raise InvariantError("rendered target chat has an empty input sequence") from error
+        if attention_row != (0,) * prefix_start + (1,) * (width - prefix_start):
+            raise InvariantError("rendered target chat batch is not left padded")
+        if prefix_start and (
+            not isinstance(pad_token_id, int) or any(token != pad_token_id for token in input_row[:prefix_start])
+        ):
+            raise InvariantError("rendered target chat has invalid left padding")
+        prefixes.append(input_row[prefix_start:])
+    return input_rows, tuple(prefixes)
+
+
+def _terminal_token_ids(value: Any) -> frozenset[int]:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return frozenset((value,))
+    if isinstance(value, list | tuple) and all(isinstance(item, int) and not isinstance(item, bool) for item in value):
+        return frozenset(value)
+    return frozenset()
+
+
+def _processor_pad_token_id(processor: Any) -> int:
+    value = getattr(getattr(processor, "tokenizer", None), "pad_token_id", None)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise InvariantError("batched target generation requires a processor pad token")
+    return value
+
+
+def _normalize_generated(
+    tokens: tuple[int, ...],
+    terminal_ids: frozenset[int],
+    pad_token_id: int,
+) -> tuple[int, ...]:
+    for index, token in enumerate(tokens):
+        if token in terminal_ids:
+            if any(value != pad_token_id for value in tokens[index + 1 :]):
+                raise InvariantError("target generation continued after its first terminal token")
+            return tokens[: index + 1]
+    return tokens
+
+
 def _safe_decode(processor: Any, tokens: Sequence[int]) -> str:
     try:
         try:
@@ -95,13 +175,9 @@ def _safe_decode(processor: Any, tokens: Sequence[int]) -> str:
 
 def _terminal_generated(runtime: Runtime, tokens: tuple[int, ...]) -> bool:
     generation_config = getattr(runtime.model, "generation_config", None)
-    eos_token_id = getattr(generation_config, "eos_token_id", None)
-    if isinstance(eos_token_id, int):
-        terminal_ids = {eos_token_id}
-    elif isinstance(eos_token_id, list | tuple):
-        terminal_ids = {int(value) for value in eos_token_id}
-    else:
-        terminal_ids = set()
+    terminal_ids = _terminal_token_ids(getattr(generation_config, "eos_token_id", None))
+    if tokens and tokens[-1] in terminal_ids:
+        return True
     pad_token_id = getattr(getattr(runtime.processor, "tokenizer", None), "pad_token_id", None)
     meaningful = list(tokens)
     while meaningful and pad_token_id is not None and meaningful[-1] == pad_token_id:
@@ -111,6 +187,17 @@ def _terminal_generated(runtime: Runtime, tokens: tuple[int, ...]) -> bool:
 
 def _trajectory_hash(values: dict[str, Any]) -> str:
     return object_sha256(values)
+
+
+def generation_config_hash(config: TargetGenerationConfig, resolved_kwargs: Mapping[str, Any]) -> str:
+    return object_sha256(
+        {
+            "system_prompt": config.system_prompt,
+            "thinking_enabled": config.thinking_enabled,
+            "batch_size": config.batch_size,
+            "generate_kwargs": resolved_kwargs,
+        }
+    )
 
 
 def generation_kwargs(config: TargetGenerationConfig) -> dict[str, Any]:
@@ -125,7 +212,10 @@ def generation_kwargs(config: TargetGenerationConfig) -> dict[str, Any]:
     return values
 
 
-def resolved_generation_kwargs(model: Any, config: TargetGenerationConfig) -> dict[str, Any]:
+def _resolved_generation_configuration(
+    model: Any,
+    config: TargetGenerationConfig,
+) -> tuple[Any, dict[str, Any]]:
     prepare = getattr(model, "_prepare_generation_config", None)
     if not callable(prepare):
         raise InvariantError("model does not support generation configuration resolution")
@@ -145,6 +235,45 @@ def resolved_generation_kwargs(model: Any, config: TargetGenerationConfig) -> di
         getattr(config, name) is not None for name in ("temperature", "top_p", "top_k", "min_p", "typical_p")
     ):
         raise InvariantError("sampling parameters require sampling-enabled generation")
+    return resolved, values
+
+
+def _generation_mode(resolved: Any) -> str:
+    get_generation_mode = getattr(resolved, "get_generation_mode", None)
+    if not callable(get_generation_mode):
+        raise InvariantError("resolved generation configuration has no generation mode")
+    try:
+        mode = get_generation_mode()
+    except (AttributeError, TypeError, ValueError) as error:
+        raise InvariantError("model generation mode could not be resolved") from error
+    value = getattr(mode, "value", mode)
+    if not isinstance(value, str):
+        raise InvariantError("resolved model generation mode is invalid")
+    return value
+
+
+def resolved_generation_kwargs(model: Any, config: TargetGenerationConfig) -> dict[str, Any]:
+    _, values = _resolved_generation_configuration(model, config)
+    return values
+
+
+def resolved_batch_generation_kwargs(
+    model: Any,
+    processor: Any,
+    config: TargetGenerationConfig,
+) -> dict[str, Any]:
+    resolved, values = _resolved_generation_configuration(model, config)
+    if config.batch_size == 1:
+        return values
+    if values.get("do_sample") is not False or _generation_mode(resolved) != "greedy_search":
+        raise InvariantError("batched target generation requires greedy search")
+    if values.get("num_beams") != 1:
+        raise InvariantError("batched target generation requires num_beams=1")
+    if values.get("num_return_sequences") != 1:
+        raise InvariantError("batched target generation requires num_return_sequences=1")
+    processor_pad_token_id = _processor_pad_token_id(processor)
+    if values.get("pad_token_id") != processor_pad_token_id:
+        raise InvariantError("model and processor pad token ids differ")
     return values
 
 
@@ -211,41 +340,148 @@ class TargetTrajectoryGenerator:
         if sequence[: len(prefix_ids)] != prefix_ids:
             raise InvariantError("target generation did not preserve its input prefix")
         generated_ids = sequence[len(prefix_ids) :]
-        generation_config_hash = object_sha256(
-            {
-                "system_prompt": generation.system_prompt,
-                "thinking_enabled": generation.thinking_enabled,
-                "generate_kwargs": resolved_kwargs,
-            }
+        generation_hash = generation_config_hash(generation, resolved_kwargs)
+        return self._trajectory_from_generation(
+            prompt_id=resolved_prompt_id,
+            original_prompt=original_prompt,
+            generated_ids=generated_ids,
+            prefix_ids=prefix_ids,
+            generation_config_hash=generation_hash,
+            split=resolved_split,
+            seed=resolved_seed,
         )
 
+    def generate_batch(self, prompts: Sequence[PromptRecord]) -> list[TargetTrajectory]:
+        records = tuple(prompts)
+        if not records:
+            return []
+        if any(not isinstance(prompt, PromptRecord) for prompt in records):
+            raise InvariantError("target generation batch must contain PromptRecord values")
+
+        runtime = self.runtime.load()
+        config = runtime.config
+        generation = config.target_generation
+        if len(records) > generation.batch_size:
+            raise InvariantError("target generation batch exceeds configured batch_size")
+        if generation.batch_size == 1:
+            return [self.generate(records[0])]
+        resolved_kwargs = resolved_batch_generation_kwargs(runtime.model, runtime.processor, generation)
+        processor_pad_token_id = _processor_pad_token_id(runtime.processor)
+        if len(records) == 1:
+            return [self.generate(records[0])]
+
+        resolved_seed = config.run.seed
+        torch.manual_seed(resolved_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(resolved_seed)
+
+        conversations: list[list[dict[str, str]]] = []
+        for prompt in records:
+            messages: list[dict[str, str]] = []
+            if generation.system_prompt is not None:
+                messages.append({"role": "system", "content": generation.system_prompt})
+            messages.append({"role": "user", "content": prompt.original_prompt})
+            prompt_token_count = len(
+                runtime.processor.tokenizer.encode(prompt.original_prompt, add_special_tokens=False)
+            )
+            if prompt_token_count > config.data.max_text_tokens:
+                raise InvariantError(
+                    f"prompt has {prompt_token_count} tokens; maximum is {config.data.max_text_tokens}"
+                )
+            conversations.append(messages)
+
+        rendered = runtime.adapter.render_target_chat_batch(
+            runtime.processor,
+            conversations,
+            config=generation,
+        )
+        inputs = _move_inputs(rendered, runtime.adapter.input_device(runtime.model))
+        if not isinstance(inputs, Mapping) or "input_ids" not in inputs:
+            raise InvariantError("rendered target chat has no input_ids")
+        input_rows, prefix_rows = _left_padded_prefixes(inputs, runtime.processor, len(records))
+        required_context = len(input_rows[0]) + generation.max_new_tokens
+        context_window = runtime.adapter.context_window(runtime.model)
+        if required_context > context_window:
+            raise InvariantError(
+                f"target generation requires {required_context} tokens but context window is {context_window}"
+            )
+
+        target_generation_kwargs = generation_kwargs(generation)
+        generate = getattr(runtime.model, "generate", None)
+        if not callable(generate):
+            raise InvariantError("model does not support generation")
+        with torch.inference_mode():
+            output = generate(**dict(inputs), **target_generation_kwargs)
+        sequences = _generated_sequences(output, len(records))
+        input_width = len(input_rows[0])
+        terminal_ids = _terminal_token_ids(resolved_kwargs.get("eos_token_id"))
+        generation_hash = generation_config_hash(generation, resolved_kwargs)
+        trajectories: list[TargetTrajectory] = []
+        for record, input_row, prefix_ids, sequence in zip(
+            records,
+            input_rows,
+            prefix_rows,
+            sequences,
+            strict=True,
+        ):
+            if sequence[:input_width] != input_row:
+                raise InvariantError("target generation did not preserve its input prefix")
+            generated_ids = _normalize_generated(
+                sequence[input_width:],
+                terminal_ids,
+                processor_pad_token_id,
+            )
+            trajectories.append(
+                self._trajectory_from_generation(
+                    prompt_id=record.prompt_id,
+                    original_prompt=record.original_prompt,
+                    generated_ids=generated_ids,
+                    prefix_ids=prefix_ids,
+                    generation_config_hash=generation_hash,
+                    split=record.split,
+                    seed=resolved_seed,
+                )
+            )
+        return trajectories
+
+    def _trajectory_from_generation(
+        self,
+        *,
+        prompt_id: str,
+        original_prompt: str,
+        generated_ids: tuple[int, ...],
+        prefix_ids: tuple[int, ...],
+        generation_config_hash: str,
+        split: Split | None,
+        seed: int,
+    ) -> TargetTrajectory:
         try:
-            parsed = runtime.adapter.parse_target_trajectory(
-                runtime.processor,
+            parsed = self.runtime.adapter.parse_target_trajectory(
+                self.runtime.processor,
                 generated_ids,
                 prefix_ids=prefix_ids,
-                thinking_enabled=generation.thinking_enabled,
+                thinking_enabled=self.runtime.config.target_generation.thinking_enabled,
             )
         except ImportError, MemoryError, OSError, RuntimeError, SubprocessError:
             raise
         except Exception as error:
             return self._parser_error_trajectory(
-                prompt_id=resolved_prompt_id,
+                prompt_id=prompt_id,
                 original_prompt=original_prompt,
                 generated_ids=generated_ids,
                 generation_config_hash=generation_config_hash,
-                generation_truncated=not _terminal_generated(runtime, generated_ids),
-                split=resolved_split,
-                seed=resolved_seed,
+                generation_truncated=not _terminal_generated(self.runtime, generated_ids),
+                split=split,
+                seed=seed,
                 error=error,
             )
         return self._successful_trajectory(
-            prompt_id=resolved_prompt_id,
+            prompt_id=prompt_id,
             original_prompt=original_prompt,
             parsed=parsed,
             generation_config_hash=generation_config_hash,
-            split=resolved_split,
-            seed=resolved_seed,
+            split=split,
+            seed=seed,
         )
 
     def _successful_trajectory(
@@ -340,6 +576,8 @@ def generate_target_trajectory(
 __all__ = [
     "TargetTrajectoryGenerator",
     "generate_target_trajectory",
+    "generation_config_hash",
     "generation_kwargs",
+    "resolved_batch_generation_kwargs",
     "resolved_generation_kwargs",
 ]

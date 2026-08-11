@@ -23,7 +23,7 @@ from self_judged_refusal_direction.artifacts import ArtifactPaths, ArtifactStore
 from self_judged_refusal_direction.config import ModelConfig, ProjectConfig, RunConfig, TargetGenerationConfig
 from self_judged_refusal_direction.editing import ProjectionKind, WeightEditPlan
 from self_judged_refusal_direction.errors import ArtifactError, CompatibilityError, ConfigurationError, InvariantError
-from self_judged_refusal_direction.generation import resolved_generation_kwargs
+from self_judged_refusal_direction.generation import generation_config_hash, resolved_generation_kwargs
 from self_judged_refusal_direction.hashing import canonical_json_bytes, file_sha256, object_sha256, tensor_sha256
 from self_judged_refusal_direction.models.base import ArchitectureAdapter
 from self_judged_refusal_direction.prompting import judge_profile_hash
@@ -141,12 +141,9 @@ def export_edited_model(
     config.validate()
     if not isinstance(judge_validation_hash, str) or not judge_validation_hash:
         raise InvariantError("judge validation hash is required")
-    effective_generation_config_hash = object_sha256(
-        {
-            "system_prompt": config.target_generation.system_prompt,
-            "thinking_enabled": config.target_generation.thinking_enabled,
-            "generate_kwargs": resolved_generation_kwargs(model, config.target_generation),
-        }
+    effective_generation_config_hash = generation_config_hash(
+        config.target_generation,
+        resolved_generation_kwargs(model, config.target_generation),
     )
     if not defer_reload:
         raise InvariantError("fresh reload must be deferred until the edited model is released")

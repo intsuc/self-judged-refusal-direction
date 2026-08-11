@@ -5,7 +5,7 @@ from typing import Any, cast
 import pytest
 
 from self_judged_refusal_direction.checkpoint import PrivateCheckpoint
-from self_judged_refusal_direction.config import ModelConfig, ProjectConfig
+from self_judged_refusal_direction.config import ModelConfig, ProjectConfig, TargetGenerationConfig
 from self_judged_refusal_direction.errors import ArtifactError
 from self_judged_refusal_direction.hashing import object_sha256
 from self_judged_refusal_direction.pipeline import _checkpointed_target_trajectories
@@ -17,6 +17,11 @@ class TargetRuntime:
         self.config = config
         self.fail_prompt_id = fail_prompt_id
         self.calls: list[str] = []
+        self.batches: list[tuple[str, ...]] = []
+
+    def generate_targets(self, prompts: list[PromptRecord]) -> list[TargetTrajectory]:
+        self.batches.append(tuple(prompt.prompt_id for prompt in prompts))
+        return [self.generate_target(prompt) for prompt in prompts]
 
     def generate_target(self, prompt: PromptRecord) -> TargetTrajectory:
         self.calls.append(prompt.prompt_id)
@@ -142,3 +147,41 @@ def test_target_generation_resumes_after_fatal_interruption(tmp_path, monkeypatc
     assert interrupted.calls == ["prompt-0", "prompt-1"]
     assert resumed.calls == ["prompt-1", "prompt-2"]
     assert [asdict(item)["prompt_id"] for item in trajectories] == [item.prompt_id for item in prompts]
+
+
+def test_target_generation_resumes_with_the_original_batch_plan(tmp_path, monkeypatch) -> None:
+    config = ProjectConfig(
+        model=ModelConfig(id="model", revision="a" * 40),
+        target_generation=TargetGenerationConfig(batch_size=2),
+    )
+    prompts = [
+        PromptRecord(
+            prompt_id=f"prompt-{index}", original_prompt=f"request {index}", group_id=str(index), split="train"
+        )
+        for index in range(3)
+    ]
+    monkeypatch.setattr(
+        "self_judged_refusal_direction.pipeline._target_generation_profile_hash",
+        lambda config, runtime: "generation-profile",
+    )
+    directory = tmp_path / "generation"
+    existing = TargetRuntime(config).generate_target(prompts[0])
+    with PrivateCheckpoint(
+        directory,
+        identity="generation",
+        prompt_keys=[prompt.prompt_id for prompt in prompts],
+    ) as checkpoint:
+        checkpoint.write(0, prompts[0].prompt_id, existing.as_dict())
+
+    resumed = TargetRuntime(config)
+    trajectories = _checkpointed_target_trajectories(
+        cast(Any, resumed),
+        config,
+        prompts,
+        directory=directory,
+        identity="generation",
+        desc="test",
+    )
+
+    assert resumed.batches == [("prompt-0", "prompt-1"), ("prompt-2",)]
+    assert [item.prompt_id for item in trajectories] == [item.prompt_id for item in prompts]

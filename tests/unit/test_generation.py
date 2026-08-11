@@ -19,6 +19,7 @@ from self_judged_refusal_direction.errors import InvariantError, TargetParseErro
 from self_judged_refusal_direction.generation import TargetTrajectoryGenerator, resolved_generation_kwargs
 from self_judged_refusal_direction.hashing import object_sha256
 from self_judged_refusal_direction.models.base import ParsedTargetOutput
+from self_judged_refusal_direction.schema import PromptRecord
 
 
 class TokenizerSpy:
@@ -74,6 +75,36 @@ class ModelSpy:
         return torch.tensor([[*prefix, 9, 3]], dtype=torch.long)
 
 
+class GreedyBatchModelSpy(ModelSpy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.generation_config = GenerationConfig(
+            do_sample=False,
+            num_beams=1,
+            num_return_sequences=1,
+            eos_token_id=[3, 4],
+            pad_token_id=0,
+        )
+
+    def generate(self, **options: Any) -> torch.Tensor:
+        self.options = options
+        prefixes = options["input_ids"].tolist()
+        return torch.tensor(
+            [
+                [*prefixes[0], 9, 3, 0],
+                [*prefixes[1], 8, 7, 4],
+            ],
+            dtype=torch.long,
+        )
+
+
+class InvalidTailBatchModelSpy(GreedyBatchModelSpy):
+    def generate(self, **options: Any) -> torch.Tensor:
+        output = super().generate(**options)
+        output[0, -1] = 99
+        return output
+
+
 class AdapterSpy:
     def __init__(self) -> None:
         self.messages: list[dict[str, str]] | None = None
@@ -126,6 +157,43 @@ class AdapterSpy:
             final_token_start=0,
             final_token_end=1,
             terminal_found=True,
+        )
+
+
+class BatchAdapterSpy(AdapterSpy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conversations: list[list[dict[str, str]]] | None = None
+        self.parse_calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+
+    def render_target_chat_batch(
+        self,
+        processor: Any,
+        conversations: list[list[dict[str, str]]],
+        config: TargetGenerationConfig | None = None,
+        **kwargs: Any,
+    ) -> dict[str, torch.Tensor]:
+        del processor, config, kwargs
+        self.conversations = conversations
+        return {
+            "input_ids": torch.tensor([[0, 0, 11, 12], [21, 22, 23, 24]], dtype=torch.long),
+            "attention_mask": torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]], dtype=torch.long),
+        }
+
+    def parse_target_trajectory(
+        self,
+        processor: Any,
+        generated_ids: tuple[int, ...],
+        *,
+        prefix_ids: tuple[int, ...],
+        thinking_enabled: bool,
+    ) -> ParsedTargetOutput:
+        self.parse_calls.append((tuple(generated_ids), tuple(prefix_ids)))
+        return super().parse_target_trajectory(
+            processor,
+            generated_ids,
+            prefix_ids=prefix_ids,
+            thinking_enabled=thinking_enabled,
         )
 
 
@@ -239,10 +307,98 @@ def test_generation_uses_target_profile_and_hashes_resolved_model_defaults() -> 
         {
             "system_prompt": "target system",
             "thinking_enabled": False,
+            "batch_size": 1,
             "generate_kwargs": effective,
         }
     )
     assert trajectory.parser_status == "OK"
+
+
+def test_greedy_batch_generation_restores_prefixes_and_removes_only_post_eos_padding() -> None:
+    generation = TargetGenerationConfig(
+        system_prompt="target system",
+        thinking_enabled=False,
+        max_new_tokens=24,
+        batch_size=2,
+        do_sample=None,
+        num_beams=None,
+    )
+    config = ProjectConfig(
+        run=RunConfig(seed=17),
+        model=ModelConfig(revision="a" * 40),
+        target_generation=generation,
+        data=DataConfig(max_text_tokens=32),
+    )
+    runtime = RuntimeSpy(config)
+    runtime.adapter = BatchAdapterSpy()
+    runtime.model = GreedyBatchModelSpy()
+    prompts = [
+        PromptRecord(prompt_id="first", original_prompt="one", group_id="a", split="train"),
+        PromptRecord(prompt_id="second", original_prompt="two", group_id="b", split="validation"),
+    ]
+
+    trajectories = TargetTrajectoryGenerator(cast(Any, runtime)).generate_batch(prompts)
+
+    assert runtime.adapter.conversations == [
+        [
+            {"role": "system", "content": "target system"},
+            {"role": "user", "content": "one"},
+        ],
+        [
+            {"role": "system", "content": "target system"},
+            {"role": "user", "content": "two"},
+        ],
+    ]
+    assert runtime.adapter.parse_calls == [
+        ((9, 3), (11, 12)),
+        ((8, 7, 4), (21, 22, 23, 24)),
+    ]
+    assert [trajectory.prompt_id for trajectory in trajectories] == ["first", "second"]
+    assert [trajectory.split for trajectory in trajectories] == ["train", "validation"]
+    assert [trajectory.raw_generated_token_ids for trajectory in trajectories] == [(9, 3), (8, 7, 4)]
+    effective = resolved_generation_kwargs(runtime.model, generation)
+    assert {trajectory.generation_config_hash for trajectory in trajectories} == {
+        object_sha256(
+            {
+                "system_prompt": "target system",
+                "thinking_enabled": False,
+                "batch_size": 2,
+                "generate_kwargs": effective,
+            }
+        )
+    }
+
+
+def test_batch_profile_rejects_inherited_non_greedy_mode_for_single_remainder() -> None:
+    config = ProjectConfig(
+        model=ModelConfig(revision="a" * 40),
+        target_generation=TargetGenerationConfig(batch_size=2, do_sample=None, num_beams=None),
+    )
+    runtime = RuntimeSpy(config)
+    runtime.model = GreedyBatchModelSpy()
+    runtime.model.generation_config.penalty_alpha = 0.6
+    runtime.model.generation_config.top_k = 4
+    prompt = PromptRecord(prompt_id="only", original_prompt="one", group_id="a", split="train")
+
+    with pytest.raises(InvariantError, match="requires greedy search"):
+        TargetTrajectoryGenerator(cast(Any, runtime)).generate_batch([prompt])
+
+
+def test_batch_generation_rejects_non_padding_after_first_eos() -> None:
+    config = ProjectConfig(
+        model=ModelConfig(revision="a" * 40),
+        target_generation=TargetGenerationConfig(batch_size=2, max_new_tokens=24),
+    )
+    runtime = RuntimeSpy(config)
+    runtime.adapter = BatchAdapterSpy()
+    runtime.model = InvalidTailBatchModelSpy()
+    prompts = [
+        PromptRecord(prompt_id="first", original_prompt="one", group_id="a", split="train"),
+        PromptRecord(prompt_id="second", original_prompt="two", group_id="b", split="train"),
+    ]
+
+    with pytest.raises(InvariantError, match="continued after its first terminal"):
+        TargetTrajectoryGenerator(cast(Any, runtime)).generate_batch(prompts)
 
 
 def test_generation_preserves_structured_parser_diagnostics() -> None:

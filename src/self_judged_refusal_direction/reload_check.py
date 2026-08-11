@@ -16,7 +16,11 @@ from tqdm import tqdm
 
 from self_judged_refusal_direction.config import ModelConfig, TargetGenerationConfig
 from self_judged_refusal_direction.errors import InvariantError
-from self_judged_refusal_direction.generation import generation_kwargs, resolved_generation_kwargs
+from self_judged_refusal_direction.generation import (
+    generation_config_hash,
+    generation_kwargs,
+    resolved_generation_kwargs,
+)
 from self_judged_refusal_direction.hashing import canonical_json_bytes, object_sha256
 from self_judged_refusal_direction.models.base import ArchitectureAdapter
 from self_judged_refusal_direction.models.registry import adapter_for_config
@@ -234,12 +238,9 @@ def perform_reload_check(request: dict[str, Any]) -> ReloadCheckReport:
     target_thinking_enabled = target_generation.thinking_enabled
     target_trajectory_passed = False
     target_trajectory_required = bool(request.get("verify_target_trajectory", True))
-    actual_generation_config_hash = object_sha256(
-        {
-            "system_prompt": target_generation.system_prompt,
-            "thinking_enabled": target_generation.thinking_enabled,
-            "generate_kwargs": resolved_generation_kwargs(model, target_generation),
-        }
+    actual_generation_config_hash = generation_config_hash(
+        target_generation,
+        resolved_generation_kwargs(model, target_generation),
     )
     if actual_generation_config_hash != str(request["expected_generation_config_hash"]):
         raise InvariantError("fresh reload generation configuration does not match")

@@ -52,7 +52,11 @@ from self_judged_refusal_direction.evaluation import (
     parser_statistics,
     select_candidate,
 )
-from self_judged_refusal_direction.generation import TargetTrajectoryGenerator, resolved_generation_kwargs
+from self_judged_refusal_direction.generation import (
+    TargetTrajectoryGenerator,
+    generation_config_hash,
+    resolved_batch_generation_kwargs,
+)
 from self_judged_refusal_direction.hashing import file_sha256, object_sha256, tensor_sha256
 from self_judged_refusal_direction.judge_validation import (
     judge_validation_fixture_hash,
@@ -285,13 +289,12 @@ def _check_error_rate(count: int, total: int, config: ProjectConfig, phase: str)
 
 
 def _target_generation_profile_hash(config: ProjectConfig, runtime: BaseModelRuntime | IntervenedModelRuntime) -> str:
-    return object_sha256(
-        {
-            "system_prompt": config.target_generation.system_prompt,
-            "thinking_enabled": config.target_generation.thinking_enabled,
-            "generate_kwargs": resolved_generation_kwargs(runtime.model, config.target_generation),
-        }
+    generate_kwargs = resolved_batch_generation_kwargs(
+        runtime.model,
+        runtime.processor,
+        config.target_generation,
     )
+    return generation_config_hash(config.target_generation, generate_kwargs)
 
 
 def _implementation_hash(*values: Any) -> str:
@@ -353,6 +356,30 @@ def _validate_checkpointed_trajectory(
         raise ArtifactError("failed checkpoint trajectory has incomplete diagnostics")
 
 
+def _fixed_batches[T](values: Sequence[T], batch_size: int) -> Iterable[Sequence[T]]:
+    for start in range(0, len(values), batch_size):
+        yield values[start : start + batch_size]
+
+
+def _generate_target_batch(
+    runtime: BaseModelRuntime | IntervenedModelRuntime,
+    prompts: Sequence[PromptRecord],
+    config: ProjectConfig,
+    generation_profile_hash: str,
+) -> list[TargetTrajectory]:
+    trajectories = runtime.generate_targets(prompts)
+    if len(trajectories) != len(prompts):
+        raise InvariantError("target generation batch returned an unexpected number of trajectories")
+    for trajectory, prompt in zip(trajectories, prompts, strict=True):
+        _validate_checkpointed_trajectory(
+            trajectory,
+            prompt,
+            config,
+            generation_profile_hash,
+        )
+    return trajectories
+
+
 def _validate_checkpointed_judgment(result: JudgeResult, trajectory: TargetTrajectory) -> None:
     if result.trajectory_hash != trajectory.trajectory_hash:
         raise ArtifactError("checkpoint judgment references a different trajectory")
@@ -380,6 +407,7 @@ def _checkpointed_target_trajectories(
         prompt_keys=prompt_keys,
     ) as checkpoint:
         entries = checkpoint.load()
+        trajectory_by_ordinal: dict[int, TargetTrajectory] = {}
         for entry in entries:
             trajectory = TargetTrajectory.from_dict(entry.payload)
             _validate_checkpointed_trajectory(
@@ -388,7 +416,7 @@ def _checkpointed_target_trajectories(
                 config,
                 generation_profile_hash,
             )
-        completed = {entry.ordinal for entry in entries}
+            trajectory_by_ordinal[entry.ordinal] = trajectory
         error_count = sum(TargetTrajectory.from_dict(entry.payload).parser_status == "ERROR" for entry in entries)
         progress = tqdm(
             total=len(prompts),
@@ -400,21 +428,29 @@ def _checkpointed_target_trajectories(
         )
         progress.set_postfix(errors=error_count)
         try:
-            for ordinal, prompt in enumerate(prompts):
-                if ordinal in completed:
+            for ordinals in _fixed_batches(range(len(prompts)), config.target_generation.batch_size):
+                if all(ordinal in trajectory_by_ordinal for ordinal in ordinals):
                     continue
-                trajectory = runtime.generate_target(prompt)
-                _validate_checkpointed_trajectory(
-                    trajectory,
-                    prompt,
+                batch_prompts = [prompts[ordinal] for ordinal in ordinals]
+                trajectories = _generate_target_batch(
+                    runtime,
+                    batch_prompts,
                     config,
                     generation_profile_hash,
                 )
-                checkpoint.write(ordinal, prompt.prompt_id, trajectory.as_dict())
-                if trajectory.parser_status == "ERROR":
-                    error_count += 1
-                    progress.set_postfix(errors=error_count)
-                progress.update()
+                for ordinal, trajectory in zip(ordinals, trajectories, strict=True):
+                    checkpointed = trajectory_by_ordinal.get(ordinal)
+                    if checkpointed is not None and trajectory != checkpointed:
+                        raise ArtifactError("regenerated target batch does not match its checkpoint")
+                for ordinal, prompt, trajectory in zip(ordinals, batch_prompts, trajectories, strict=True):
+                    if ordinal in trajectory_by_ordinal:
+                        continue
+                    checkpoint.write(ordinal, prompt.prompt_id, trajectory.as_dict())
+                    trajectory_by_ordinal[ordinal] = trajectory
+                    if trajectory.parser_status == "ERROR":
+                        error_count += 1
+                        progress.set_postfix(errors=error_count)
+                    progress.update()
         finally:
             progress.close()
         return [TargetTrajectory.from_dict(entry.payload) for entry in checkpoint.require_complete()]
@@ -861,6 +897,7 @@ def inspect_model(config_path: str) -> None:
     config, store = _load(config_path, require_judge_validation=False)
     with BaseModelRuntime(config) as runtime:
         _validate_static_context_budget(config, runtime)
+        _target_generation_profile_hash(config, runtime)
         fingerprints = runtime.adapter.processor_fingerprints(runtime.processor)
         report = dataclasses.asdict(runtime.compatibility_report)
         if not report["errors"]:
@@ -915,7 +952,9 @@ def generate_baseline_trajectories(config_path: str) -> None:
         if len(grouped["test"]) > config.data.max_test_prompts:
             retained_test = sorted(grouped["test"], key=lambda item: item.prompt_id)[: config.data.max_test_prompts]
             records = [item for item in records if item.split != "test"] + retained_test
-        baseline_records = [item for item in records if item.split in {"train", "validation"}]
+        grouped = records_by_split(records)
+        records = [*grouped["train"], *grouped["validation"], *grouped["test"]]
+        baseline_records = [*grouped["train"], *grouped["validation"]]
         if not baseline_records:
             raise PipelineError("prompt split contains no discovery or validation records")
         generation_hash = _baseline_generation_hash(config, runtime, records)
@@ -943,54 +982,15 @@ def generate_baseline_trajectories(config_path: str) -> None:
                 _validate_checkpointed_trajectory(trajectory, record, config, generation_profile_hash)
             active_generation = True
         if not active_generation:
-            prompt_keys = [record.prompt_id for record in baseline_records]
             checkpoint_directory = store.paths.baseline_generation_checkpoint / generation_hash
-            with PrivateCheckpoint(
-                checkpoint_directory,
+            trajectories = _checkpointed_target_trajectories(
+                runtime,
+                config,
+                baseline_records,
+                directory=checkpoint_directory,
                 identity=generation_hash,
-                prompt_keys=prompt_keys,
-            ) as checkpoint:
-                entries = checkpoint.load()
-                for entry in entries:
-                    trajectory = TargetTrajectory.from_dict(entry.payload)
-                    _validate_checkpointed_trajectory(
-                        trajectory,
-                        baseline_records[entry.ordinal],
-                        config,
-                        generation_profile_hash,
-                    )
-                completed = {entry.ordinal for entry in entries}
-                error_count = sum(
-                    TargetTrajectory.from_dict(entry.payload).parser_status == "ERROR" for entry in entries
-                )
-                progress = tqdm(
-                    total=len(baseline_records),
-                    initial=len(entries),
-                    desc="Generating baseline trajectories",
-                    unit="prompt",
-                    dynamic_ncols=True,
-                    disable=None,
-                )
-                progress.set_postfix(errors=error_count)
-                try:
-                    for ordinal, record in enumerate(baseline_records):
-                        if ordinal in completed:
-                            continue
-                        trajectory = runtime.generate_target(record)
-                        _validate_checkpointed_trajectory(
-                            trajectory,
-                            record,
-                            config,
-                            generation_profile_hash,
-                        )
-                        checkpoint.write(ordinal, record.prompt_id, trajectory.as_dict())
-                        if trajectory.parser_status == "ERROR":
-                            error_count += 1
-                            progress.set_postfix(errors=error_count)
-                        progress.update()
-                finally:
-                    progress.close()
-                trajectories = [TargetTrajectory.from_dict(entry.payload) for entry in checkpoint.require_complete()]
+                desc="Generating baseline trajectories",
+            )
     baseline_profile = _profile(
         store,
         target=True,
@@ -1450,6 +1450,7 @@ def evaluate_candidates(config_path: str) -> None:
     trajectories = _load_baseline_trajectories(store, chat_template_hash)
     baseline_trajectories = {item.prompt_id: item for item in trajectories}
     records = {item.prompt_id: item for item in _load_prompt_records(store, config)}
+    baseline_prompt_plan = [records[item.prompt_id] for item in trajectories]
     reference_fallback = [records[item.prompt_id].original_prompt for item in validation if item.label == "NON_REFUSAL"]
     pilot_labels = _balanced_subset(validation, config.search.pilot_prompts_per_class)
     pilot_metrics, _, pilot_evaluation_identity = _evaluate_candidates_phase(
@@ -1460,6 +1461,7 @@ def evaluate_candidates(config_path: str) -> None:
         pilot_labels,
         records,
         baseline_trajectories,
+        baseline_prompt_plan,
         reference_fallback,
         artifact_profile=profile,
         evaluation_phase="pilot_evaluation",
@@ -1480,6 +1482,7 @@ def evaluate_candidates(config_path: str) -> None:
         validation,
         records,
         baseline_trajectories,
+        baseline_prompt_plan,
         reference_fallback,
         artifact_profile=profile,
         evaluation_phase="full_validation",
@@ -1563,6 +1566,7 @@ def _candidate_phase_identity(
     labeled: Sequence[LabeledTrajectory],
     prompt_records: Mapping[str, PromptRecord],
     baseline_trajectories: Mapping[str, TargetTrajectory],
+    baseline_prompt_plan: Sequence[PromptRecord],
     reference_fallback: Sequence[str],
     artifact_profile: ArtifactProfile,
     evaluation_phase: str,
@@ -1595,6 +1599,10 @@ def _candidate_phase_identity(
             "baseline_trajectory_hashes": {
                 item.prompt_id: baseline_trajectories[item.prompt_id].trajectory_hash for item in labeled
             },
+            "baseline_batch_plan": [
+                [dataclasses.asdict(prompt) for prompt in batch]
+                for batch in _fixed_batches(baseline_prompt_plan, config.target_generation.batch_size)
+            ],
             "reference_input": reference_input,
             "activation_addition_beta": (
                 config.acceptance.activation_addition_beta if evaluation_phase == "full_validation" else None
@@ -1604,6 +1612,8 @@ def _candidate_phase_identity(
                 evaluate_behavior,
                 mean_next_token_kl,
                 WeightEditPlan,
+                TargetTrajectoryGenerator,
+                type(adapter_for_config(config)),
                 IntervenedModelRuntime,
                 BaseModelRuntime,
             ),
@@ -1683,6 +1693,7 @@ def _evaluate_candidates_phase(
     labeled: Sequence[LabeledTrajectory],
     prompt_records: Mapping[str, PromptRecord],
     baseline_trajectories: Mapping[str, TargetTrajectory],
+    baseline_prompt_plan: Sequence[PromptRecord],
     reference_fallback: Sequence[str],
     *,
     artifact_profile: ArtifactProfile,
@@ -1692,6 +1703,17 @@ def _evaluate_candidates_phase(
     labels = {item.prompt_id: item.label for item in labeled}
     prompts = [prompt_records[item.prompt_id] for item in labeled]
     non_refusal_prompts = [prompt_records[item.prompt_id] for item in labeled if item.label == "NON_REFUSAL"]
+    baseline_prompt_ids = [prompt.prompt_id for prompt in baseline_prompt_plan]
+    if len(set(baseline_prompt_ids)) != len(baseline_prompt_ids) or set(baseline_prompt_ids) != set(
+        baseline_trajectories
+    ):
+        raise ArtifactError("candidate generation baseline batch plan is invalid")
+    baseline_batches = tuple(
+        tuple(batch) for batch in _fixed_batches(baseline_prompt_plan, config.target_generation.batch_size)
+    )
+    baseline_batch_index = {
+        prompt.prompt_id: batch_index for batch_index, batch in enumerate(baseline_batches) for prompt in batch
+    }
     phase_identity = _candidate_phase_identity(
         config,
         bundle,
@@ -1699,6 +1721,7 @@ def _evaluate_candidates_phase(
         labeled,
         prompt_records,
         baseline_trajectories,
+        baseline_prompt_plan,
         reference_fallback,
         artifact_profile,
         evaluation_phase,
@@ -1778,6 +1801,66 @@ def _evaluate_candidates_phase(
             if len(generation_entries) < len(generation_plan) or len(quality_entries) < len(candidates):
                 with IntervenedModelRuntime(config) as runtime:
                     _validate_activation_chat_profile(artifact_profile, runtime.chat_template_hash)
+
+                    def generate_batches(ordinals: Sequence[int]) -> None:
+                        nonlocal generation_error_count
+                        target_ordinal_by_prompt_id: dict[str, int] = {}
+                        for ordinal in ordinals:
+                            prompt_id = generation_plan[ordinal][2].prompt_id
+                            if prompt_id in target_ordinal_by_prompt_id:
+                                raise InvariantError("candidate generation plan contains a duplicate prompt")
+                            target_ordinal_by_prompt_id[prompt_id] = ordinal
+                        try:
+                            batch_indices = sorted(
+                                {baseline_batch_index[prompt_id] for prompt_id in target_ordinal_by_prompt_id}
+                            )
+                        except KeyError as error:
+                            raise ArtifactError("candidate prompt is missing from the baseline batch plan") from error
+                        for batch_index in batch_indices:
+                            batch_prompts = baseline_batches[batch_index]
+                            batch_ordinals = [
+                                target_ordinal_by_prompt_id[prompt.prompt_id]
+                                for prompt in batch_prompts
+                                if prompt.prompt_id in target_ordinal_by_prompt_id
+                            ]
+                            if all(ordinal in trajectory_by_ordinal for ordinal in batch_ordinals):
+                                continue
+                            trajectories = _generate_target_batch(
+                                runtime,
+                                batch_prompts,
+                                config,
+                                generation_profile_hash,
+                            )
+                            target_trajectories = [
+                                (target_ordinal_by_prompt_id[prompt.prompt_id], trajectory)
+                                for prompt, trajectory in zip(batch_prompts, trajectories, strict=True)
+                                if prompt.prompt_id in target_ordinal_by_prompt_id
+                            ]
+                            for ordinal, trajectory in target_trajectories:
+                                checkpointed = trajectory_by_ordinal.get(ordinal)
+                                if checkpointed is not None and trajectory != checkpointed:
+                                    raise ArtifactError(
+                                        "regenerated candidate target batch does not match its checkpoint"
+                                    )
+                            for ordinal, trajectory in target_trajectories:
+                                if ordinal in trajectory_by_ordinal:
+                                    continue
+                                planned_candidate, kind, _ = generation_plan[ordinal]
+                                generation_checkpoint.write(
+                                    ordinal,
+                                    generation_keys[ordinal],
+                                    {
+                                        "candidate_id": planned_candidate.candidate_id,
+                                        "kind": kind,
+                                        "trajectory": trajectory.as_dict(),
+                                    },
+                                )
+                                trajectory_by_ordinal[ordinal] = trajectory
+                                if trajectory.parser_status == "ERROR":
+                                    generation_error_count += 1
+                                    generation_progress.set_postfix(errors=generation_error_count)
+                                generation_progress.update()
+
                     missing_quality = len(quality_entries) < len(candidates)
                     if missing_quality:
                         base_logits = [
@@ -1816,32 +1899,10 @@ def _evaluate_candidates_phase(
                         direction = bundle.direction(candidate)
                         plan = runtime.adapter.build_weight_edit_plan(runtime.model, direction)
                         removal_ordinals = [
-                            ordinal for ordinal in missing_ordinals if generation_plan[ordinal][1] == "removal"
+                            ordinal for ordinal in candidate_ordinals if generation_plan[ordinal][1] == "removal"
                         ]
                         with plan.temporary(runtime.model):
-                            for ordinal in removal_ordinals:
-                                _, kind, prompt = generation_plan[ordinal]
-                                trajectory = runtime.generate_target(prompt)
-                                _validate_checkpointed_trajectory(
-                                    trajectory,
-                                    prompt,
-                                    config,
-                                    generation_profile_hash,
-                                )
-                                generation_checkpoint.write(
-                                    ordinal,
-                                    generation_keys[ordinal],
-                                    {
-                                        "candidate_id": candidate.candidate_id,
-                                        "kind": kind,
-                                        "trajectory": trajectory.as_dict(),
-                                    },
-                                )
-                                trajectory_by_ordinal[ordinal] = trajectory
-                                if trajectory.parser_status == "ERROR":
-                                    generation_error_count += 1
-                                    generation_progress.set_postfix(errors=generation_error_count)
-                                generation_progress.update()
+                            generate_batches(removal_ordinals)
                             if needs_quality:
                                 intervention_logits = [
                                     _next_token_logits(runtime, prompt)
@@ -1859,37 +1920,15 @@ def _evaluate_candidates_phase(
                                     leave=False,
                                 )
                         addition_ordinals = [
-                            ordinal for ordinal in missing_ordinals if generation_plan[ordinal][1] == "addition"
+                            ordinal for ordinal in candidate_ordinals if generation_plan[ordinal][1] == "addition"
                         ]
-                        if addition_ordinals:
+                        if any(ordinal not in trajectory_by_ordinal for ordinal in addition_ordinals):
                             beta = config.acceptance.activation_addition_beta
                             if beta is None:
                                 raise InvariantError("addition checkpoint plan has no configured coefficient")
                             block_name = _transformer_block_name(runtime, candidate.layer)
                             with plan.activation_addition(runtime.model, block_name, beta * candidate.norm):
-                                for ordinal in addition_ordinals:
-                                    _, kind, prompt = generation_plan[ordinal]
-                                    trajectory = runtime.generate_target(prompt)
-                                    _validate_checkpointed_trajectory(
-                                        trajectory,
-                                        prompt,
-                                        config,
-                                        generation_profile_hash,
-                                    )
-                                    generation_checkpoint.write(
-                                        ordinal,
-                                        generation_keys[ordinal],
-                                        {
-                                            "candidate_id": candidate.candidate_id,
-                                            "kind": kind,
-                                            "trajectory": trajectory.as_dict(),
-                                        },
-                                    )
-                                    trajectory_by_ordinal[ordinal] = trajectory
-                                    if trajectory.parser_status == "ERROR":
-                                        generation_error_count += 1
-                                        generation_progress.set_postfix(errors=generation_error_count)
-                                    generation_progress.update()
+                                generate_batches(addition_ordinals)
                         if needs_quality:
                             mean_kl = mean_next_token_kl(base_logits, intervention_logits) if base_logits else 0.0
                             ce_loss_delta = intervention_ce - base_ce

@@ -42,6 +42,7 @@ class ProcessorSpy:
         self.tokenizer = CharacterTokenizer()
         self.parsed = parsed or {"role": "assistant", "content": ""}
         self.prefix: list[int] | None = None
+        self.chat_messages: Any = None
         self.chat_options: dict[str, Any] | None = None
 
     def decode(self, token_ids: list[int], **kwargs: Any) -> str:
@@ -54,7 +55,7 @@ class ProcessorSpy:
         return self.parsed
 
     def apply_chat_template(self, messages: list[dict[str, str]], **options: Any) -> dict[str, Any]:
-        del messages
+        self.chat_messages = messages
         self.chat_options = options
         return {"input_ids": [[1]]}
 
@@ -89,6 +90,29 @@ def test_render_target_chat_resolves_config_and_explicit_thinking_modes() -> Non
             config=TargetGenerationConfig(thinking_enabled=True),
             thinking_enabled=False,
         )
+
+
+def test_render_target_chat_batch_requires_left_padding() -> None:
+    adapter = Gemma4Adapter()
+    processor = ProcessorSpy()
+    conversations = [
+        [{"role": "user", "content": "short"}],
+        [{"role": "user", "content": "longer"}],
+    ]
+
+    adapter.render_target_chat_batch(
+        processor,
+        conversations,
+        config=TargetGenerationConfig(thinking_enabled=False),
+    )
+
+    assert processor.chat_messages == conversations
+    assert processor.chat_options is not None
+    assert processor.chat_options["enable_thinking"] is False
+    assert processor.chat_options["processor_kwargs"] == {"padding": True, "padding_side": "left"}
+
+    with pytest.raises(InvariantError, match="padding cannot be overridden"):
+        adapter.render_target_chat_batch(processor, conversations, processor_kwargs={"padding_side": "right"})
 
 
 def test_processor_fingerprints_include_chat_and_response_templates() -> None:

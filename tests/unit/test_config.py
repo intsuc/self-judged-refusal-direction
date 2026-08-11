@@ -69,6 +69,24 @@ def test_sampling_parameters_require_sampling() -> None:
             "num_beams",
         ),
         (
+            replace(valid_config(), target_generation=replace(valid_config().target_generation, batch_size=0)),
+            "batch_size",
+        ),
+        (
+            replace(
+                valid_config(),
+                target_generation=replace(valid_config().target_generation, batch_size=2, do_sample=True),
+            ),
+            "effective greedy",
+        ),
+        (
+            replace(
+                valid_config(),
+                target_generation=replace(valid_config().target_generation, batch_size=2, num_beams=2),
+            ),
+            "num_beams=1",
+        ),
+        (
             replace(valid_config(), target_generation=replace(valid_config().target_generation, temperature=0.0)),
             "temperature",
         ),
@@ -170,7 +188,7 @@ def test_experiment_hash_boundary() -> None:
     assert acceptance_changed.target_generation_config_hash == config.target_generation_config_hash
     generation_changed = replace(
         config,
-        target_generation=replace(config.target_generation, system_prompt="system", repetition_penalty=1.1),
+        target_generation=replace(config.target_generation, batch_size=2),
     )
     assert generation_changed.target_generation_config_hash != config.target_generation_config_hash
     assert generation_changed.config_hash != config.config_hash

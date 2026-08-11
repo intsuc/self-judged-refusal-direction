@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from typing import Any, Self
 
@@ -177,6 +178,11 @@ class _ModelRuntime:
             split=split,
             seed=seed,
         )
+
+    def generate_targets(self, prompts: Sequence[PromptRecord]) -> list[TargetTrajectory]:
+        from self_judged_refusal_direction.generation import TargetTrajectoryGenerator
+
+        return TargetTrajectoryGenerator(self).generate_batch(prompts)
 
     def close(self) -> None:
         try:
