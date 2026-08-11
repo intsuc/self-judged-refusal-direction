@@ -50,6 +50,13 @@ def test_full_context_and_fail_closed_policies_are_not_configurable() -> None:
         replace(config, judge=replace(config.judge, infrastructure_error_policy="continue")).validate()
 
 
+def test_structured_prompt_files_are_rejected() -> None:
+    config = valid_config()
+
+    with pytest.raises(ConfigurationError, match=r"\.txt extension"):
+        replace(config, data=replace(config.data, raw_prompt_files=("prompts.jsonl",))).validate()
+
+
 @pytest.mark.parametrize(
     ("config", "message"),
     [

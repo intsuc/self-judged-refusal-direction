@@ -33,12 +33,12 @@ uv sync --locked
 Create or copy a YAML configuration and set at least:
 
 - `model.id`, a 40-character commit `model.revision`, and a registered `model.adapter`
-- `data.raw_prompt_files`
+- `data.raw_prompt_files`, containing one or more UTF-8 `.txt` paths
 - `run.output_dir`
 - dataset sizes and evaluation thresholds appropriate for the run
 
-Prompt inputs may be text, JSON, JSONL, NDJSON, or CSV. Optional `data.quality_text_files` provide a separate corpus for
-CE-loss evaluation.
+Each non-empty physical line in a prompt file is one prompt. Multiline prompts and structured input formats are not
+supported. Optional `.txt` files in `data.quality_text_files` provide a separate corpus for CE-loss evaluation.
 
 Inspect compatibility before starting the full run:
 

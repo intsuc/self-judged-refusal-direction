@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import csv
-import json
 import random
 import re
 import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 from self_judged_refusal_direction.artifacts import ArtifactProfile, ArtifactStore
 from self_judged_refusal_direction.config import DataConfig, ProjectConfig
@@ -28,7 +26,6 @@ _HEX = re.compile(r"\b(?:0x)?[0-9a-f]{12,}\b", re.IGNORECASE)
 _NUMBER = re.compile(r"(?<!\w)[+-]?(?:\d+(?:[.,:/-]\d+)*|\.\d+)(?!\w)")
 _QUOTED = re.compile(r"(?s)([\"'`])(?:\\.|(?!\1).){2,}\1")
 _TOKEN = re.compile(r"<[^>]+>|[\w]+|[^\w\s]", re.UNICODE)
-_PROMPT_KEYS = ("prompt", "instruction", "text", "original_prompt", "query", "request")
 
 
 def normalize_prompt(value: str) -> str:
@@ -146,68 +143,9 @@ def assign_template_family_groups(prompts: Sequence[str], threshold: float = 0.9
     return {prompt: group_ids[disjoint.find(index)] for index, prompt in enumerate(normalized)}
 
 
-def _extract_prompt(value: Any, source: Path, index: int) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, Mapping):
-        for key in _PROMPT_KEYS:
-            prompt = value.get(key)
-            if isinstance(prompt, str):
-                return prompt
-    raise ArtifactError(f"prompt record has no string prompt at {source}:{index}")
-
-
-def _json_values(value: Any, source: Path) -> Iterator[Any]:
-    if isinstance(value, list):
-        yield from value
-        return
-    if isinstance(value, Mapping):
-        for key in ("prompts", "instructions", "records", "data"):
-            nested = value.get(key)
-            if isinstance(nested, list):
-                yield from nested
-                return
-        yield value
-        return
-    if isinstance(value, str):
-        yield value
-        return
-    raise ArtifactError(f"unsupported JSON prompt structure in {source}")
-
-
 def _read_prompt_file(path: Path) -> Iterator[str]:
-    suffix = path.suffix.casefold()
-    if suffix == ".json":
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise ArtifactError(f"failed to read prompt file: {path}") from error
-        for index, item in enumerate(_json_values(value, path), start=1):
-            yield _extract_prompt(item, path, index)
-        return
-    if suffix in {".jsonl", ".ndjson"}:
-        try:
-            with path.open(encoding="utf-8") as stream:
-                for line_number, line in enumerate(stream, start=1):
-                    if not line.strip():
-                        continue
-                    try:
-                        value = json.loads(line)
-                    except json.JSONDecodeError as error:
-                        raise ArtifactError(f"invalid JSON at {path}:{line_number}") from error
-                    yield _extract_prompt(value, path, line_number)
-        except (OSError, UnicodeError) as error:
-            raise ArtifactError(f"failed to read prompt file: {path}") from error
-        return
-    if suffix == ".csv":
-        try:
-            with path.open(encoding="utf-8", newline="") as stream:
-                reader = csv.DictReader(stream)
-                for line_number, row in enumerate(reader, start=2):
-                    yield _extract_prompt(row, path, line_number)
-        except (OSError, UnicodeError, csv.Error) as error:
-            raise ArtifactError(f"failed to read prompt file: {path}") from error
-        return
+    if path.suffix.casefold() != ".txt":
+        raise ArtifactError(f"prompt files must use the .txt extension: {path}")
     try:
         with path.open(encoding="utf-8") as stream:
             for line in stream:

@@ -253,6 +253,12 @@ class ProjectConfig:
             for paths in (self.data.raw_prompt_files, self.data.quality_text_files)
         ):
             errors.append("data prompt file collections must contain strings")
+        elif any(
+            Path(path).suffix.casefold() != ".txt"
+            for paths in (self.data.raw_prompt_files, self.data.quality_text_files)
+            for path in paths
+        ):
+            errors.append("data prompt files must use the .txt extension")
         if self.data.deduplicate is not True:
             errors.append("data.deduplicate must be true")
         if self.data.split_before_labeling is not True:
