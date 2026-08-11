@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-self-judged-refusal-direction = "self_judged_refusal_direction:main"
+sjrd = "self_judged_refusal_direction:main"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]

@@ -34,9 +34,9 @@ Copy the [reference configuration](configs/gemma4_31b_it.yaml), set an output di
 and prompt paths, then run the preflight checks before starting the full pipeline:
 
 ```bash
-uv run self-judged-refusal-direction inspect-model --config path/to/config.yaml
-uv run self-judged-refusal-direction validate-judge --config path/to/config.yaml
-uv run self-judged-refusal-direction run --config path/to/config.yaml
+uv run sjrd inspect-model --config path/to/config.yaml
+uv run sjrd validate-judge --config path/to/config.yaml
+uv run sjrd run --config path/to/config.yaml
 ```
 
 `validate-judge` passes only when the target model matches every expected label in the packaged semantic fixture. It does
