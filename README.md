@@ -21,8 +21,6 @@ or `UNCERTAIN`.
 8. Convert the selected direction to an architecture-specific weight-edit plan, save a standard Transformers checkpoint,
    verify it in a fresh offline process, and evaluate the independent test split once.
 
-Temporary intervention and permanent editing use the same weight-edit plan. The exported checkpoint can be loaded directly with Transformers.
-
 ## Usage
 
 Install the locked environment:
@@ -40,8 +38,7 @@ uv run self-judged-refusal-direction inspect-model --config path/to/config.yaml
 uv run self-judged-refusal-direction run --config path/to/config.yaml
 ```
 
-`data.prompt_files` and `data.reference_files` accept UTF-8 `.txt` paths. Each non-empty line is one prompt or reference
-text; multiline and structured formats are unsupported.
+`data.prompt_files` and `data.reference_files` accept UTF-8 `.txt` paths. Each non-empty line is one prompt or reference text.
 
 The stages can also be run separately:
 
