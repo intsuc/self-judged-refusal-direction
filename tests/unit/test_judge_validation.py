@@ -19,8 +19,7 @@ def test_judge_validation_requires_complete_exact_results() -> None:
         JudgeValidationCase(
             case_id=label.value.lower(),
             original_prompt="prompt",
-            thinking_text="thinking",
-            final_answer="answer",
+            trajectory="thinking\nanswer",
             generation_truncated=False,
             expected_label=label,
         )

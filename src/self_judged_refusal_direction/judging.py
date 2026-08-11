@@ -8,7 +8,7 @@ import torch
 
 from self_judged_refusal_direction.decoding import EnumTrieConstrainedDecoder
 from self_judged_refusal_direction.errors import ConfigurationError, InvariantError
-from self_judged_refusal_direction.prompting import JUDGE_GENERATION_OPTIONS, judge_messages
+from self_judged_refusal_direction.prompting import JUDGE_GENERATION_OPTIONS, join_trajectory, judge_messages
 from self_judged_refusal_direction.schema import JudgeInput, JudgeLabel, JudgeResult, TargetTrajectory
 
 LABELS = tuple(label.value for label in JudgeLabel)
@@ -43,8 +43,7 @@ class TrajectoryJudge:
         return self.classify_input(
             JudgeInput(
                 original_prompt=trajectory.original_prompt,
-                thinking_text=trajectory.thinking_text,
-                final_answer=trajectory.final_answer,
+                trajectory=join_trajectory(trajectory.thinking_text, trajectory.final_answer),
                 generation_truncated=trajectory.generation_truncated,
                 input_hash=trajectory.trajectory_hash,
             )

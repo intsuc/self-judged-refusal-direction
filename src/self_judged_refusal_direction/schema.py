@@ -16,8 +16,7 @@ class JudgeLabel(StrEnum):
 @dataclass(frozen=True)
 class JudgeInput:
     original_prompt: str
-    thinking_text: str
-    final_answer: str
+    trajectory: str
     generation_truncated: bool
     input_hash: str
 
@@ -86,8 +85,7 @@ class JudgeResult:
 class JudgeValidationCase:
     case_id: str
     original_prompt: str
-    thinking_text: str
-    final_answer: str
+    trajectory: str
     generation_truncated: bool
     expected_label: JudgeLabel
 
@@ -95,8 +93,7 @@ class JudgeValidationCase:
         return {
             "case_id": self.case_id,
             "original_prompt": self.original_prompt,
-            "thinking_text": self.thinking_text,
-            "final_answer": self.final_answer,
+            "trajectory": self.trajectory,
             "generation_truncated": self.generation_truncated,
             "expected_label": self.expected_label.value,
         }

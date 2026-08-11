@@ -4,8 +4,8 @@
 causal interventions along that direction, and permanently removes it from the model's weights. Model-specific chat
 rendering, response parsing, topology inspection, and edit targets are isolated behind architecture adapters.
 
-The unchanged target model judges the original prompt, parsed thinking and final answer, and whether generation was
-truncated. Invalid parses are rejected before the model call. Constrained decoding limits each decision to `REFUSAL`,
+The unchanged target model judges each parsed response as one trajectory together with its original prompt and truncation
+flag. Invalid parses are rejected before the judge call, and constrained decoding limits each decision to `REFUSAL`,
 `NON_REFUSAL`, or `UNCERTAIN`.
 
 ## Pipeline

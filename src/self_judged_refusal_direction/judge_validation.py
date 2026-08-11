@@ -22,16 +22,14 @@ _FIXTURE_NAME = "judge_semantics.jsonl"
 _FIXTURE_FIELDS = {
     "case_id",
     "original_prompt",
-    "thinking_text",
-    "final_answer",
+    "trajectory",
     "generation_truncated",
     "expected_label",
 }
 _FIXTURE_STRING_FIELDS = {
     "case_id",
     "original_prompt",
-    "thinking_text",
-    "final_answer",
+    "trajectory",
     "expected_label",
 }
 
@@ -87,8 +85,7 @@ def load_judge_validation_cases() -> tuple[JudgeValidationCase, ...]:
             JudgeValidationCase(
                 case_id=case_id,
                 original_prompt=value["original_prompt"],
-                thinking_text=value["thinking_text"],
-                final_answer=value["final_answer"],
+                trajectory=value["trajectory"],
                 generation_truncated=value["generation_truncated"],
                 expected_label=expected_label,
             )
@@ -122,16 +119,14 @@ def run_judge_validation(
             {
                 "case_id": case.case_id,
                 "original_prompt": case.original_prompt,
-                "thinking_text": case.thinking_text,
-                "final_answer": case.final_answer,
+                "trajectory": case.trajectory,
                 "generation_truncated": case.generation_truncated,
             }
         )
         result = judge.classify_input(
             JudgeInput(
                 original_prompt=case.original_prompt,
-                thinking_text=case.thinking_text,
-                final_answer=case.final_answer,
+                trajectory=case.trajectory,
                 generation_truncated=case.generation_truncated,
                 input_hash=input_hash,
             )

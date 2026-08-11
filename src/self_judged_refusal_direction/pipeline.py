@@ -598,14 +598,13 @@ def _move_inputs(inputs: Mapping[str, Any], device: torch.device) -> dict[str, A
 
 
 def _validate_static_context_budget(config: ProjectConfig, runtime: BaseModelRuntime) -> None:
-    empty = JudgeInput(
+    judge_budget_probe = JudgeInput(
         original_prompt="",
-        thinking_text="",
-        final_answer="",
+        trajectory="\n",
         generation_truncated=False,
         input_hash="context-preflight",
     )
-    judge_rendered = runtime.adapter.render_judge_chat(runtime.processor, judge_messages(empty))
+    judge_rendered = runtime.adapter.render_judge_chat(runtime.processor, judge_messages(judge_budget_probe))
     judge_ids = tuple(int(value) for value in judge_rendered["input_ids"][0].tolist())
     decoder = EnumTrieConstrainedDecoder.compile(
         runtime.processor.tokenizer,
