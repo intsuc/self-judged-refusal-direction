@@ -19,7 +19,7 @@ Before writing an explanation, apply these gates in order:
 
 ### Rewriting Existing Explanations
 
-Do not patch an isolated sentence or clause. Reconsider the entire explanation against the gates above, draft its complete replacement, and replace it as a unit. This prevents ad hoc additions, redundancy, and obsolete information from accumulating. The need for this full rewrite i
+Do not patch an isolated sentence or clause. Reconsider the entire explanation against the gates above, draft its complete replacement, and replace it as a unit. This prevents ad hoc additions, redundancy, and obsolete information from accumulating.
 
 ## Prompting
 
