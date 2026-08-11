@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+import gc
+import weakref
+from typing import Any
+
+import torch
+
+from self_judged_refusal_direction.config import JudgeConfig, ModelConfig, ProjectConfig
+from self_judged_refusal_direction.judging import TrajectoryJudge
+from self_judged_refusal_direction.models.gemma4 import Gemma4Adapter
+from self_judged_refusal_direction.schema import TargetTrajectory
+
+
+class CharacterTokenizer:
+    eos_token_id = 3
+    pad_token_id = 0
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [ord(character) for character in text]
+
+    def decode(self, token_ids: Any, skip_special_tokens: bool = False) -> str:
+        del skip_special_tokens
+        return "".join(chr(token_id) for token_id in token_ids if token_id > self.eos_token_id)
+
+
+class ProcessorSpy:
+    def __init__(self) -> None:
+        self.tokenizer = CharacterTokenizer()
+        self.options: dict[str, Any] | None = None
+
+    def apply_chat_template(self, messages: list[dict[str, str]], **options: Any) -> dict[str, torch.Tensor]:
+        del messages
+        self.options = options
+        return {
+            "input_ids": torch.tensor([[ord("P")]], dtype=torch.long),
+            "attention_mask": torch.ones((1, 1), dtype=torch.long),
+        }
+
+
+class BrokenProcessor(ProcessorSpy):
+    def apply_chat_template(self, messages: list[dict[str, str]], **options: Any) -> dict[str, torch.Tensor]:
+        del messages, options
+        raise TypeError("broken processor")
+
+
+class ToyJudgeAdapter(Gemma4Adapter):
+    def __init__(self, context: int):
+        self.context = context
+
+    def context_window(self, model: Any) -> int:
+        del model
+        return self.context
+
+    def input_device(self, model: Any) -> torch.device:
+        del model
+        return torch.device("cpu")
+
+
+class ToyJudgeModel:
+    def __init__(self, tokenizer: CharacterTokenizer, label: str):
+        self.tokenizer = tokenizer
+        self.label = label
+        self.generate_calls = 0
+
+    def generate(self, input_ids: torch.Tensor, **options: Any) -> torch.Tensor:
+        self.generate_calls += 1
+        prefix_allowed_tokens_fn = options["prefix_allowed_tokens_fn"]
+        sequence = input_ids[0].tolist()
+        for token_id in self.tokenizer.encode(self.label):
+            assert token_id in prefix_allowed_tokens_fn(0, torch.tensor(sequence))
+            sequence.append(token_id)
+        assert self.tokenizer.eos_token_id in prefix_allowed_tokens_fn(0, torch.tensor(sequence))
+        sequence.append(self.tokenizer.eos_token_id)
+        return torch.tensor([sequence], dtype=input_ids.dtype)
+
+
+def trajectory() -> TargetTrajectory:
+    return TargetTrajectory(
+        prompt_id="prompt",
+        original_prompt="request",
+        raw_generated_token_ids=(1, 2),
+        raw_decoded_output="thinking answer",
+        thinking_segments=("thinking",),
+        thinking_text="thinking",
+        final_answer="answer",
+        thinking_token_start=0,
+        thinking_token_end=1,
+        final_token_start=1,
+        final_token_end=2,
+        generation_truncated=False,
+        parser_status="OK",
+        model_revision="a" * 40,
+        generation_config_hash="generation",
+        trajectory_hash="trajectory",
+    )
+
+
+def judge_config() -> ProjectConfig:
+    return ProjectConfig(
+        model=ModelConfig(revision="a" * 40),
+        judge=JudgeConfig(score_allowed_labels=False, safety_margin_tokens=0),
+    )
+
+
+def test_judge_uses_thinking_disabled_and_preserves_semantic_uncertain() -> None:
+    processor = ProcessorSpy()
+    adapter = ToyJudgeAdapter(context=128)
+    model = ToyJudgeModel(processor.tokenizer, "UNCERTAIN")
+    judge = TrajectoryJudge(judge_config(), adapter, model, processor, "chat")
+
+    result = judge.classify(trajectory())
+
+    assert processor.options is not None
+    assert processor.options["enable_thinking"] is False
+    assert model.generate_calls == 1
+    assert result.status == "OK"
+    assert result.label == "UNCERTAIN"
+    assert result.error_code is None
+
+
+def test_context_overflow_is_error_not_uncertain() -> None:
+    processor = ProcessorSpy()
+    adapter = ToyJudgeAdapter(context=12)
+    model = ToyJudgeModel(processor.tokenizer, "UNCERTAIN")
+    judge = TrajectoryJudge(judge_config(), adapter, model, processor, "chat")
+
+    result = judge.classify(trajectory())
+
+    assert processor.options is not None
+    assert processor.options["enable_thinking"] is False
+    assert model.generate_calls == 0
+    assert result.status == "ERROR"
+    assert result.label is None
+    assert result.error_code == "ConfigurationError"
+
+
+def test_adapter_failure_is_returned_as_judge_error() -> None:
+    processor = BrokenProcessor()
+    adapter = ToyJudgeAdapter(context=128)
+    model = ToyJudgeModel(processor.tokenizer, "NON_REFUSAL")
+    judge = TrajectoryJudge(judge_config(), adapter, model, processor, "chat")
+
+    result = judge.classify(trajectory())
+
+    assert result.status == "ERROR"
+    assert result.label is None
+    assert result.error_code == "TypeError"
+
+
+def test_judge_does_not_own_runtime_resources() -> None:
+    processor = ProcessorSpy()
+    model = ToyJudgeModel(processor.tokenizer, "NON_REFUSAL")
+    model_ref = weakref.ref(model)
+    processor_ref = weakref.ref(processor)
+    judge = TrajectoryJudge(judge_config(), ToyJudgeAdapter(context=128), model, processor, "chat")
+
+    del model
+    del processor
+    gc.collect()
+
+    assert model_ref() is None
+    assert processor_ref() is None
+    result = judge.classify(trajectory())
+    assert result.status == "ERROR"
+    assert result.error_code == "InvariantError"

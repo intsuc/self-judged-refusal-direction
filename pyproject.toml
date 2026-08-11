@@ -1,19 +1,29 @@
 [project]
-name = "do-not-refuse"
+name = "self-judged-refusal-direction"
 version = "0.0.0"
+description = "Self-judged trajectory-level refusal direction extraction and weight editing"
+readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "accelerate>=1.12.0",
     "huggingface-hub>=1.27.0",
+    "numpy>=2.0",
+    "pyyaml>=6.0",
+    "safetensors>=0.7.0",
     "torch>=2.13.0",
     "torchvision>=0.28.0",
+    "transformers>=5.13.0,<6",
 ]
 
 [project.scripts]
-do-not-refuse = "do_not_refuse:main"
+self-judged-refusal-direction = "self_judged_refusal_direction:main"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-include = [".python-version", "calibration/**", "configs/**"]
 
 [[tool.uv.index]]
 name = "pytorch-cu132"
@@ -27,3 +37,21 @@ torch = [
 torchvision = [
     { index = "pytorch-cu132", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "ruff>=0.14",
+    "ty>=0.0.1a20",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

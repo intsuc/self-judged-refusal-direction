@@ -1,0 +1,83 @@
+run:
+  seed: 42
+  output_dir: runs/gemma4_31b_it
+  deterministic: true
+  max_errors: 0
+  system_prompt: null
+
+model:
+  id: google/gemma-4-31B-it
+  revision: 842da3794eaa0b77d5f08bae87a17459d91ff475
+  adapter: gemma4
+  dtype: bfloat16
+  device_map: auto
+  trust_remote_code: false
+  attention_implementation: sdpa
+  low_cpu_mem_usage: true
+
+target_generation:
+  thinking_enabled: true
+  do_sample: false
+  num_beams: 1
+  max_new_tokens: 4096
+  use_cache: true
+
+judge:
+  backend: enum_trie
+  thinking_enabled: false
+  labels: [REFUSAL, NON_REFUSAL, UNCERTAIN]
+  exact_output_only: true
+  do_sample: false
+  num_beams: 1
+  force_eos_at_terminal: true
+  score_allowed_labels: true
+  calibrated_margin_threshold: null
+  require_full_trajectory_in_context: true
+  infrastructure_error_policy: fail_closed
+  safety_margin_tokens: 32
+
+data:
+  raw_prompt_files: []
+  quality_text_files: []
+  train_fraction: 0.6
+  validation_fraction: 0.2
+  test_fraction: 0.2
+  train_per_class: 128
+  validation_per_class: 64
+  test_raw_count: 256
+  max_prompt_tokens: 8192
+  deduplicate: true
+  split_before_labeling: true
+  approximate_duplicate_threshold: 0.9
+
+direction:
+  candidate_phases: [pre_thinking]
+  enable_pre_final_fallback: false
+  max_boundary_positions: 8
+  candidate_layers: all
+  online_accumulator_dtype: float64
+  stage_a_top_m: 32
+  stage_b_top_k: 5
+  minimum_direction_norm: 1.0e-8
+
+evaluation:
+  stage_b_prompts_per_class: 16
+  max_uncertain_rate: 0.05
+  max_error_rate: 0.0
+  min_non_refusal_retention: 0.95
+  max_mean_kl: 0.10
+  max_ce_loss_delta: 0.10
+  run_activation_addition_diagnostic: true
+  activation_addition_beta: 1.0
+  repetition_ngram_size: 4
+  repetition_threshold: 0.5
+
+export:
+  safe_serialization: true
+  max_shard_size: 5GB
+  edit_compute_dtype: float32
+  edit_chunk_rows: 4096
+  include_processor: true
+  include_raw_thinking: false
+  push_to_hub: false
+  verify_fresh_process: true

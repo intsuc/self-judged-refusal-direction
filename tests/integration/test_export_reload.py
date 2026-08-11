@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
+
+import pytest
+import torch
+from transformers import Gemma4Config, Gemma4ForConditionalGeneration, Gemma4TextConfig
+
+from self_judged_refusal_direction.config import ExportConfig, ModelConfig, ProjectConfig, RunConfig
+from self_judged_refusal_direction.exporting import complete_deferred_reload, export_edited_model
+from self_judged_refusal_direction.models.gemma4 import Gemma4Adapter
+from self_judged_refusal_direction.pipeline import _mean_ce_loss
+
+
+class LocalBackend:
+    def to_str(self) -> str:
+        return '{"model":"local"}'
+
+
+class LocalTokenizer:
+    backend_tokenizer = LocalBackend()
+
+    def __call__(self, _text: str, **_kwargs: object) -> dict[str, torch.Tensor]:
+        return {
+            "input_ids": torch.tensor([[2, 4, 6, 8, 3]]),
+            "attention_mask": torch.ones(1, 5, dtype=torch.long),
+        }
+
+
+class LocalProcessor:
+    tokenizer = LocalTokenizer()
+
+    def to_dict(self) -> dict[str, str]:
+        return {"processor_class": "LocalProcessor"}
+
+    def save_pretrained(self, output_dir: str | Path) -> None:
+        target = Path(output_dir) / "processor_config.json"
+        target.write_text('{"processor_class":"LocalProcessor"}\n', encoding="utf-8")
+
+
+def tiny_gemma4(final_logit_softcapping: float | None = None) -> Gemma4ForConditionalGeneration:
+    text = Gemma4TextConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        max_position_embeddings=64,
+        sliding_window=16,
+        layer_types=["sliding_attention", "full_attention"],
+        hidden_size_per_layer_input=0,
+        vocab_size_per_layer_input=32,
+        tie_word_embeddings=True,
+        attention_k_eq_v=False,
+        final_logit_softcapping=final_logit_softcapping,
+    )
+    config = Gemma4Config(
+        text_config=text,
+        vision_config=None,
+        audio_config=None,
+        tie_word_embeddings=True,
+        image_token_id=30,
+        video_token_id=29,
+        audio_token_id=28,
+    )
+    return Gemma4ForConditionalGeneration(config).eval()
+
+
+@pytest.mark.parametrize("softcap", [None, 4.0])
+def test_chunked_ce_matches_model_loss(softcap: float | None) -> None:
+    torch.manual_seed(7)
+    model = tiny_gemma4(softcap)
+    processor = LocalProcessor()
+    inputs = processor.tokenizer("quality", return_tensors="pt", add_special_tokens=True)
+    with torch.inference_mode():
+        expected = model(**inputs, labels=inputs["input_ids"], use_cache=False, return_dict=True).loss
+    runtime = SimpleNamespace(model=model, adapter=Gemma4Adapter(), processor=processor)
+    actual = _mean_ce_loss(cast(Any, runtime), ["quality"])
+    assert actual == pytest.approx(float(expected.item()), rel=2e-6, abs=2e-6)
+
+
+def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
+    torch.manual_seed(11)
+    model = tiny_gemma4()
+    adapter = Gemma4Adapter()
+    direction = torch.tensor([0.2, -0.3, 0.5, 0.1, -0.4, 0.6, -0.2, 0.7])
+    plan = adapter.build_weight_edit_plan(model, direction)
+    config = ProjectConfig(
+        run=RunConfig(output_dir=str(tmp_path / "run")),
+        model=ModelConfig(
+            id="local/tiny-gemma4",
+            revision="a" * 40,
+            dtype="float32",
+            device_map="cpu",
+            attention_implementation="sdpa",
+        ),
+        export=ExportConfig(
+            safe_serialization=True,
+            max_shard_size="10MB",
+            edit_compute_dtype="float32",
+            edit_chunk_rows=3,
+            include_processor=True,
+            include_raw_thinking=False,
+            push_to_hub=False,
+            verify_fresh_process=True,
+        ),
+    )
+    probe = {
+        "input_ids": torch.tensor([[2, 4, 6, 8], [2, 3, 5, 7]]),
+        "attention_mask": torch.ones(2, 4, dtype=torch.long),
+    }
+    output_dir = tmp_path / "exported_model"
+    expected_parameter_count = sum(parameter.numel() for parameter in model.parameters())
+
+    result = export_edited_model(
+        model,
+        LocalProcessor(),
+        adapter,
+        plan,
+        config,
+        probe,
+        output_dir=output_dir,
+        validation_metrics={"removal_success_rate": 0.75},
+        test_metrics={"non_refusal_retention_rate": 1.0},
+        probe_atol=3e-5,
+        probe_rtol=3e-5,
+        orthogonality_atol=3e-5,
+        reload_timeout_seconds=60,
+        verify_reload_target_trajectory=False,
+    )
+    assert result.reload is None
+    assert result.deferred_reload is not None
+    assert model.model.language_model.embed_tokens.weight is model.lm_head.weight
+    del model
+    result = complete_deferred_reload(result)
+
+    manifest = json.loads((output_dir / "edit_manifest.json").read_text(encoding="utf-8"))
+    readme = (output_dir / "README.md").read_text(encoding="utf-8")
+
+    assert result.temporary_permanent_equivalence.passed
+    assert result.reload is not None
+    assert result.reload.passed
+    assert result.reload.model_module.startswith("transformers.")
+    assert result.reload.parameter_count == expected_parameter_count
+    assert all(check.passed for check in result.orthogonality)
+    assert (output_dir / "config.json").is_file()
+    assert tuple(output_dir.glob("*.safetensors"))
+    assert not tuple(output_dir.glob("*.bin"))
+    assert (output_dir / "processor_config.json").is_file()
+    assert manifest["base_revision"] == "a" * 40
+    assert manifest["selected_projection_rank"] == 1
+    assert manifest["privacy"] == {"push_to_hub": False, "raw_thinking_included": False}
+    assert manifest["fresh_reload"]["probe_logits_match"] is True
+    assert manifest["fresh_reload"]["target_trajectory_required"] is False
+    assert manifest["temporary_permanent_equivalence"]["passed"] is True
+    assert "trajectory-level refusal direction" in readme
+    assert "contains no raw thinking artifacts" in readme
+    assert not tuple(output_dir.glob("*.private.jsonl"))
