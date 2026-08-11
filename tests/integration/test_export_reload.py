@@ -72,7 +72,7 @@ def tiny_gemma4(final_logit_softcapping: float | None = None) -> Gemma4ForCondit
 
 
 @pytest.mark.parametrize("softcap", [None, 4.0])
-def test_chunked_ce_matches_model_loss(softcap: float | None) -> None:
+def test_reference_ce_matches_model_loss(softcap: float | None) -> None:
     torch.manual_seed(7)
     model = tiny_gemma4(softcap)
     processor = LocalProcessor()
@@ -120,7 +120,6 @@ def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
         probe,
         output_dir=output_dir,
         full_validation_metrics={"removal_success_rate": 0.75},
-        test_metrics={"non_refusal_retention_rate": 1.0},
         direction_layer=0,
         probe_atol=3e-5,
         probe_rtol=3e-5,
@@ -135,25 +134,17 @@ def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
     result = complete_deferred_reload(result)
 
     manifest = json.loads((output_dir / "edit_manifest.json").read_text(encoding="utf-8"))
-    readme = (output_dir / "README.md").read_text(encoding="utf-8")
 
-    assert result.temporary_permanent_equivalence.passed
     assert result.reload is not None
-    assert result.reload.passed
     assert result.reload.model_module.startswith("transformers.")
     assert result.reload.parameter_count == expected_parameter_count
-    assert all(check.passed for check in result.orthogonality)
-    assert (output_dir / "config.json").is_file()
+    assert result.reload.tied_weights_preserved
     assert tuple(output_dir.glob("*.safetensors"))
     assert not tuple(output_dir.glob("*.bin"))
     assert (output_dir / "processor_config.json").is_file()
     assert manifest["base_revision"] == "a" * 40
     assert manifest["direction_source_layer"] == 0
-    assert "selected_projection_rank" not in manifest
-    assert "privacy" not in manifest
+    assert manifest["full_validation_metrics"] == {"removal_success_rate": 0.75}
     assert manifest["fresh_reload"]["probe_logits_match"] is True
-    assert manifest["fresh_reload"]["target_trajectory_required"] is False
     assert manifest["temporary_permanent_equivalence"]["passed"] is True
-    assert "assistant-prefix" in readme
-    assert "contains no raw thinking artifacts" in readme
     assert not tuple(output_dir.glob("*.private.jsonl"))

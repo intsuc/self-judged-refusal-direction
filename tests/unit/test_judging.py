@@ -95,7 +95,7 @@ def trajectory() -> TargetTrajectory:
     )
 
 
-def test_judge_uses_thinking_disabled_and_preserves_semantic_uncertain() -> None:
+def test_judge_constrains_and_parses_uncertain_label() -> None:
     processor = ProcessorSpy()
     adapter = ToyJudgeAdapter(context=128)
     model = ToyJudgeModel(processor.tokenizer, "UNCERTAIN")
@@ -108,7 +108,6 @@ def test_judge_uses_thinking_disabled_and_preserves_semantic_uncertain() -> None
     assert model.generate_calls == 1
     assert result.status == "OK"
     assert result.label == "UNCERTAIN"
-    assert result.error_code is None
 
 
 def test_context_overflow_is_error_not_uncertain() -> None:

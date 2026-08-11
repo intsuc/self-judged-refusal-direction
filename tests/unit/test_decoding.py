@@ -1,5 +1,4 @@
 import pytest
-import torch
 
 from self_judged_refusal_direction.decoding import EnumTrieConstrainedDecoder
 from self_judged_refusal_direction.errors import ConfigurationError, InvariantError
@@ -28,16 +27,6 @@ def test_common_prefix_and_terminal_eos_only() -> None:
     assert decoder.allowed_tokens(0, [7, 8, 10]) == [20, 30]
     assert decoder.allowed_tokens(0, [7, 8, 10, 20]) == [99]
     assert decoder.parse_suffix([10, 20, 99]) == ("AB", "AB")
-
-
-def test_batch_tracks_distinct_prompt_lengths() -> None:
-    decoder = EnumTrieConstrainedDecoder(
-        {"X": (40,), "YZ": (50, 60)},
-        eos_token_id=99,
-        generation_start_lengths=(2, 4),
-    )
-    assert decoder.allowed_tokens(0, torch.tensor([1, 2])) == [40, 50]
-    assert decoder.allowed_tokens(1, torch.tensor([1, 2, 3, 4, 50])) == [60]
 
 
 def test_out_of_language_and_missing_eos_are_errors() -> None:

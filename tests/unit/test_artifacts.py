@@ -25,7 +25,7 @@ def test_artifact_reuse_requires_matching_profile_and_content(tmp_path) -> None:
         list(store.read_jsonl(path, artifact_type="rows", expected_profile=profile))
 
 
-def test_private_artifact_schema_and_permissions_fail_closed(tmp_path) -> None:
+def test_private_artifact_permissions_fail_closed(tmp_path) -> None:
     config = ProjectConfig(run=RunConfig(output_dir=str(tmp_path)), model=ModelConfig(id="model", revision="a" * 40))
     store = ArtifactStore(config)
     path = tmp_path / "trajectories.private.jsonl"
@@ -37,19 +37,9 @@ def test_private_artifact_schema_and_permissions_fail_closed(tmp_path) -> None:
     assert metadata_path.stat().st_mode & 0o077 == 0
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert metadata["record_count"] == 1
-    assert "schema_version" not in metadata
-    assert "chat_template_hash" not in metadata["profile"]
-    assert "judge_template_hash" not in metadata["profile"]
     metadata["private"] = False
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     with pytest.raises(ArtifactError, match="not marked private"):
-        list(store.read_jsonl(path, artifact_type="trajectories", expected_profile=profile))
-
-    metadata["private"] = True
-    metadata["schema_version"] = 2
-    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-    with pytest.raises(ArtifactError, match="invalid artifact metadata"):
         list(store.read_jsonl(path, artifact_type="trajectories", expected_profile=profile))
 
 

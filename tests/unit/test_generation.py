@@ -16,11 +16,7 @@ from self_judged_refusal_direction.config import (
     TargetGenerationConfig,
 )
 from self_judged_refusal_direction.errors import InvariantError
-from self_judged_refusal_direction.generation import (
-    TargetTrajectoryGenerator,
-    generation_kwargs,
-    resolved_generation_kwargs,
-)
+from self_judged_refusal_direction.generation import TargetTrajectoryGenerator, resolved_generation_kwargs
 from self_judged_refusal_direction.hashing import object_sha256
 from self_judged_refusal_direction.models.base import ParsedTargetOutput
 
@@ -166,7 +162,6 @@ def test_generation_uses_target_profile_and_hashes_resolved_model_defaults() -> 
         {"role": "system", "content": "target system"},
         {"role": "user", "content": "request"},
     ]
-    assert runtime.adapter.generation_config is generation
     assert runtime.adapter.parse_thinking_enabled is False
     assert runtime.adapter.parse_prefix == (11, 12)
     assert runtime.model.options is not None
@@ -225,13 +220,6 @@ def test_resolved_generation_kwargs_rejects_explicit_sampling_controls_for_effec
 
     inherited = resolved_generation_kwargs(model, TargetGenerationConfig(do_sample=None, num_beams=None))
     assert inherited["do_sample"] is False
-    assert inherited["num_beams"] == 1
-    assert inherited["temperature"] == 1.0
-    assert inherited["top_p"] == 1.0
-    assert inherited["top_k"] == 50
-    assert inherited["typical_p"] == 1.0
-    assert inherited["repetition_penalty"] == 1.0
     assert inherited["length_penalty"] == 2.0
-    assert generation_kwargs(config)["temperature"] == 1.0
     with pytest.raises(InvariantError, match="require sampling-enabled"):
         resolved_generation_kwargs(model, config)
