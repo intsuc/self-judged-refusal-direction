@@ -4,21 +4,22 @@
 causal interventions along that direction, and permanently removes it from the model's weights. Model-specific chat
 rendering, response parsing, topology inspection, and edit targets are isolated behind architecture adapters.
 
-The target model also serves as the judge while its weights are still unchanged. The judge reads the original prompt,
-the model's parsed response, and parser status. Constrained decoding limits its decision to `REFUSAL`, `NON_REFUSAL`,
-or `UNCERTAIN`.
+The unchanged target model judges the original prompt, parsed thinking and final answer, and whether generation was
+truncated. Invalid parses are rejected before the model call. Constrained decoding limits each decision to `REFUSAL`,
+`NON_REFUSAL`, or `UNCERTAIN`.
 
 ## Pipeline
 
-1. Read one prompt per non-empty line, normalize and deduplicate prompts, group related templates, and split them before
+1. Validate the unchanged target model's judge decisions against the packaged semantic cases.
+2. Read one prompt per non-empty line, normalize and deduplicate prompts, group related templates, and split them before
    labeling.
-2. Generate and parse a baseline response for each prompt using the configured target-generation settings.
-3. Label each valid response with the unchanged base checkpoint.
-4. At each selected decoder layer, collect the residual activation at the last token of the rendered assistant prefix.
-5. Rank layer-wise mean-difference directions through `activation_screening`.
-6. Run causal interventions for the survivors on a small balanced subset through `pilot_evaluation`.
-7. Apply the acceptance criteria to the survivors on the full validation set through `full_validation`.
-8. Convert the selected direction to an architecture-specific weight-edit plan, save a standard Transformers checkpoint,
+3. Generate and parse a baseline response for each prompt using the configured target-generation settings.
+4. Label each valid response with the unchanged base checkpoint.
+5. At each selected decoder layer, collect the residual activation at the last token of the rendered assistant prefix.
+6. Rank layer-wise mean-difference directions through `activation_screening`.
+7. Run causal interventions for the survivors on a small balanced subset through `pilot_evaluation`.
+8. Apply the acceptance criteria to the survivors on the full validation set through `full_validation`.
+9. Convert the selected direction to an architecture-specific weight-edit plan, save a standard Transformers checkpoint,
    verify it in a fresh offline process, and evaluate the independent test split once.
 
 ## Usage
@@ -30,30 +31,34 @@ uv sync --locked
 ```
 
 Copy the [reference configuration](configs/gemma4_31b_it.yaml), set an output directory, model ID, pinned model revision,
-and prompt paths, then
-inspect compatibility before starting the full run:
+and prompt paths, then run the preflight checks before starting the full pipeline:
 
 ```bash
 uv run self-judged-refusal-direction inspect-model --config path/to/config.yaml
+uv run self-judged-refusal-direction validate-judge --config path/to/config.yaml
 uv run self-judged-refusal-direction run --config path/to/config.yaml
 ```
 
+`validate-judge` passes only when the target model matches every expected label in the packaged semantic fixture. It does
+not read user prompt files or generate target responses.
+
 `data.prompt_files` and `data.reference_files` accept UTF-8 `.txt` paths. Each non-empty line is one prompt or reference text.
 
-The stages can also be run separately:
+The preflight checks and pipeline stages can also be run separately:
 
-1. `generate-baseline-trajectories`
-2. `judge-baseline-trajectories`
-3. `collect-activations`
-4. `build-candidates`
-5. `evaluate-candidates`
-6. `export-model`
-7. `evaluate-export`
+1. `inspect-model`
+2. `validate-judge`
+3. `generate-baseline-trajectories`
+4. `judge-baseline-trajectories`
+5. `collect-activations`
+6. `build-candidates`
+7. `evaluate-candidates`
+8. `export-model`
+9. `evaluate-export`
 
 ## Configuration
 
-`null` decoding parameters inherit the loaded model's generation
-configuration.
+`null` decoding parameters inherit the loaded model's generation configuration.
 
 | Key | Default | Meaning |
 | --- | --- | --- |

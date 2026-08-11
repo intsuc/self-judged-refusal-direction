@@ -43,28 +43,40 @@ from self_judged_refusal_direction.evaluation import (
     select_candidate,
 )
 from self_judged_refusal_direction.hashing import file_sha256, object_sha256, tensor_sha256
+from self_judged_refusal_direction.judge_validation import (
+    judge_validation_fixture_hash,
+    judge_validation_passed,
+    load_judge_validation_cases,
+    run_judge_validation,
+    validate_judge_validation_results,
+)
 from self_judged_refusal_direction.judging import TrajectoryJudge
 from self_judged_refusal_direction.models.registry import adapter_for_config
 from self_judged_refusal_direction.prompting import (
     judge_messages,
     target_messages,
 )
-from self_judged_refusal_direction.prompting import (
-    judge_template_hash as current_judge_template_hash,
-)
+from self_judged_refusal_direction.prompting import judge_profile_hash as current_judge_profile_hash
 from self_judged_refusal_direction.runtime import BaseModelRuntime, IntervenedModelRuntime
 from self_judged_refusal_direction.schema import (
     CandidateMetrics,
     DirectionCandidate,
+    JudgeInput,
     JudgeLabel,
     JudgeResult,
+    JudgeValidationCase,
+    JudgeValidationResult,
     LabeledTrajectory,
     PromptRecord,
     TargetTrajectory,
 )
 
 
-def _load(path: str | Path) -> tuple[ProjectConfig, ArtifactStore]:
+def _load(
+    path: str | Path,
+    *,
+    require_judge_validation: bool = True,
+) -> tuple[ProjectConfig, ArtifactStore]:
     config = load_config(path)
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.manual_seed(config.run.seed)
@@ -76,6 +88,8 @@ def _load(path: str | Path) -> tuple[ProjectConfig, ArtifactStore]:
         torch.backends.cudnn.deterministic = True
     store = ArtifactStore(config)
     store.initialize_run()
+    if require_judge_validation:
+        _require_judge_validation(store)
     return config, store
 
 
@@ -84,13 +98,145 @@ def _profile(
     *,
     target: bool = False,
     chat_template_hash: str | None = None,
-    judge_template_hash: str | None = None,
+    judge_profile_hash: str | None = None,
+    judge_fixture_hash: str | None = None,
+    judge_validation_hash: str | None = None,
 ) -> ArtifactProfile:
     return store.profile(
         target=target,
         chat_template_hash=chat_template_hash,
-        judge_template_hash=judge_template_hash,
+        judge_profile_hash=judge_profile_hash,
+        judge_fixture_hash=judge_fixture_hash,
+        judge_validation_hash=judge_validation_hash,
     )
+
+
+def _judge_validation_proof(
+    runtime: BaseModelRuntime,
+    cases: Sequence[JudgeValidationCase],
+    results: Sequence[JudgeValidationResult],
+) -> str:
+    return object_sha256(
+        {
+            "fixture_hash": judge_validation_fixture_hash(cases),
+            "results": [result.as_dict() for result in results],
+            "checkpoint_checksum": runtime.checkpoint_checksum,
+            "chat_template_hash": runtime.chat_template_hash,
+            "judge_profile_hash": current_judge_profile_hash(),
+            "processor_fingerprints": runtime.adapter.processor_fingerprints(runtime.processor),
+        }
+    )
+
+
+def _load_judge_validation(
+    store: ArtifactStore,
+) -> tuple[tuple[JudgeValidationCase, ...], list[JudgeValidationResult], ArtifactMetadata]:
+    cases = load_judge_validation_cases()
+    expected_profile = _profile(
+        store,
+        judge_profile_hash=current_judge_profile_hash(),
+        judge_fixture_hash=judge_validation_fixture_hash(cases),
+    )
+    metadata = store.validate(
+        store.paths.judge_results,
+        artifact_type="judge_validation_results",
+        expected_profile=expected_profile,
+    )
+    if metadata.profile.chat_template_hash is None or metadata.profile.judge_validation_hash is None:
+        raise ArtifactError("judge validation provenance is incomplete")
+    rows = store.read_jsonl(
+        store.paths.judge_results,
+        artifact_type="judge_validation_results",
+        expected_profile=expected_profile,
+    )
+    results = [JudgeValidationResult.from_dict(row) for row in rows]
+    validate_judge_validation_results(cases, results)
+    if not judge_validation_passed(cases, results):
+        raise PipelineError(f"judge validation did not pass; results: {store.paths.judge_results}")
+    return cases, results, metadata
+
+
+def _require_judge_validation(
+    store: ArtifactStore,
+    runtime: BaseModelRuntime | None = None,
+) -> str:
+    cases, results, metadata = _load_judge_validation(store)
+    validation_hash = metadata.profile.judge_validation_hash
+    if validation_hash is None:
+        raise ArtifactError("judge validation hash is missing")
+    if runtime is not None:
+        if metadata.profile.chat_template_hash != runtime.chat_template_hash:
+            raise ArtifactError("judge validation used a different chat template")
+        if validation_hash != _judge_validation_proof(runtime, cases, results):
+            raise ArtifactError("judge validation proof does not match the loaded base model")
+    return validation_hash
+
+
+def _evaluate_judge_validation(
+    runtime: BaseModelRuntime,
+) -> tuple[
+    tuple[JudgeValidationCase, ...],
+    tuple[JudgeValidationResult, ...],
+    str,
+    str,
+]:
+    cases = load_judge_validation_cases()
+    results = run_judge_validation(runtime, cases)
+    validation_hash = _judge_validation_proof(runtime, cases, results)
+    return cases, results, validation_hash, runtime.chat_template_hash
+
+
+def _write_judge_validation(
+    store: ArtifactStore,
+    cases: Sequence[JudgeValidationCase],
+    results: Sequence[JudgeValidationResult],
+    validation_hash: str,
+    chat_template_hash: str,
+) -> None:
+    passed = judge_validation_passed(cases, results)
+    store.write_jsonl(
+        store.paths.judge_results,
+        results,
+        artifact_type="judge_validation_results",
+        profile=_profile(
+            store,
+            chat_template_hash=chat_template_hash,
+            judge_profile_hash=current_judge_profile_hash(),
+            judge_fixture_hash=judge_validation_fixture_hash(cases),
+            judge_validation_hash=validation_hash,
+        ),
+        private=False,
+    )
+    matched = sum(result.status == "OK" and result.actual_label == result.expected_label for result in results)
+    if not passed:
+        errors = sum(result.status == "ERROR" for result in results)
+        mismatches = len(results) - matched - errors
+        raise PipelineError(
+            f"judge validation failed with {mismatches} mismatches and {errors} errors; "
+            f"results: {store.paths.judge_results}"
+        )
+    print(f"Judge validation: PASS ({matched}/{len(results)}); results: {store.paths.judge_results}")
+
+
+def validate_judge(config_path: str) -> None:
+    config, store = _load(config_path, require_judge_validation=False)
+    load_judge_validation_cases()
+    with BaseModelRuntime(config) as runtime:
+        evidence = _evaluate_judge_validation(runtime)
+    _write_judge_validation(store, *evidence)
+
+
+def _ensure_judge_validation(config_path: str) -> None:
+    config, store = _load(config_path, require_judge_validation=False)
+    load_judge_validation_cases()
+    with BaseModelRuntime(config) as runtime:
+        try:
+            _require_judge_validation(store, runtime)
+        except ArtifactError, PipelineError:
+            evidence = _evaluate_judge_validation(runtime)
+        else:
+            return
+    _write_judge_validation(store, *evidence)
 
 
 def _check_error_budget(count: int, config: ProjectConfig, phase: str) -> None:
@@ -135,22 +281,12 @@ def _move_inputs(inputs: Mapping[str, Any], device: torch.device) -> dict[str, A
 
 
 def _validate_static_context_budget(config: ProjectConfig, runtime: BaseModelRuntime) -> None:
-    empty = TargetTrajectory(
-        prompt_id="context-preflight",
+    empty = JudgeInput(
         original_prompt="",
-        raw_generated_token_ids=(),
-        raw_decoded_output="",
         thinking_text="",
         final_answer="",
-        thinking_token_start=0,
-        thinking_token_end=0,
-        final_token_start=0,
-        final_token_end=0,
         generation_truncated=False,
-        parser_status="OK",
-        model_revision=config.model.revision,
-        generation_config_hash=config.target_generation_config_hash,
-        trajectory_hash="context-preflight",
+        input_hash="context-preflight",
     )
     judge_rendered = runtime.adapter.render_judge_chat(runtime.processor, judge_messages(empty))
     judge_ids = tuple(int(value) for value in judge_rendered["input_ids"][0].tolist())
@@ -211,6 +347,7 @@ def _load_baseline_judgments(
     store: ArtifactStore,
     chat_template_hash: str,
 ) -> list[JudgeResult]:
+    validation_hash = _require_judge_validation(store)
     rows = store.read_jsonl(
         store.paths.baseline_judgments,
         artifact_type="baseline_judgments",
@@ -218,7 +355,8 @@ def _load_baseline_judgments(
             store,
             target=True,
             chat_template_hash=chat_template_hash,
-            judge_template_hash=current_judge_template_hash(),
+            judge_profile_hash=current_judge_profile_hash(),
+            judge_validation_hash=validation_hash,
         ),
     )
     return [JudgeResult.from_dict(row) for row in rows]
@@ -229,6 +367,7 @@ def _load_labeled(
     chat_template_hash: str,
     split: Literal["train", "validation"],
 ) -> list[LabeledTrajectory]:
+    validation_hash = _require_judge_validation(store)
     path = store.paths.labeled_train if split == "train" else store.paths.labeled_validation
     rows = store.read_jsonl(
         path,
@@ -237,14 +376,15 @@ def _load_labeled(
             store,
             target=True,
             chat_template_hash=chat_template_hash,
-            judge_template_hash=current_judge_template_hash(),
+            judge_profile_hash=current_judge_profile_hash(),
+            judge_validation_hash=validation_hash,
         ),
     )
     return [LabeledTrajectory(**row) for row in rows]
 
 
 def inspect_model(config_path: str) -> None:
-    config, store = _load(config_path)
+    config, store = _load(config_path, require_judge_validation=False)
     with BaseModelRuntime(config) as runtime:
         _validate_static_context_budget(config, runtime)
         fingerprints = runtime.adapter.processor_fingerprints(runtime.processor)
@@ -270,6 +410,7 @@ def inspect_model(config_path: str) -> None:
 def generate_baseline_trajectories(config_path: str) -> None:
     config, store = _load(config_path)
     with BaseModelRuntime(config) as runtime:
+        _require_judge_validation(store, runtime)
         _validate_static_context_budget(config, runtime)
         tokenizer = runtime.processor.tokenizer
         records = ingest_and_split_prompts(
@@ -299,6 +440,7 @@ def generate_baseline_trajectories(config_path: str) -> None:
 def judge_baseline_trajectories(config_path: str) -> None:
     config, store = _load(config_path)
     with BaseModelRuntime(config) as runtime:
+        validation_hash = _require_judge_validation(store, runtime)
         trajectories = _load_baseline_trajectories(store, runtime.chat_template_hash)
         judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
         judgments = [judge.classify(trajectory) for trajectory in trajectories]
@@ -308,7 +450,8 @@ def judge_baseline_trajectories(config_path: str) -> None:
             store,
             target=True,
             chat_template_hash=runtime.chat_template_hash,
-            judge_template_hash=current_judge_template_hash(),
+            judge_profile_hash=current_judge_profile_hash(),
+            judge_validation_hash=validation_hash,
         )
         store.write_jsonl(
             store.paths.baseline_judgments,
@@ -359,6 +502,7 @@ def judge_baseline_trajectories(config_path: str) -> None:
 def collect_activations(config_path: str) -> None:
     config, store = _load(config_path)
     with BaseModelRuntime(config) as runtime:
+        validation_hash = _require_judge_validation(store, runtime)
         trajectories = _load_baseline_trajectories(store, runtime.chat_template_hash)
         labeled = _load_labeled(store, runtime.chat_template_hash, "train")
         trajectory_by_hash = {item.trajectory_hash: item for item in trajectories}
@@ -368,7 +512,8 @@ def collect_activations(config_path: str) -> None:
             store,
             target=True,
             chat_template_hash=runtime.chat_template_hash,
-            judge_template_hash=current_judge_template_hash(),
+            judge_profile_hash=current_judge_profile_hash(),
+            judge_validation_hash=validation_hash,
         )
         metadata = ArtifactMetadata(
             artifact_type="activation_statistics",
@@ -442,10 +587,16 @@ def build_direction_candidates(config_path: str) -> None:
 
 
 def _activation_dependent_profile(store: ArtifactStore) -> ArtifactProfile:
+    validation_hash = _require_judge_validation(store)
     metadata = store.validate(
         store.paths.activation_statistics,
         artifact_type="activation_statistics",
-        expected_profile=_profile(store, target=True),
+        expected_profile=_profile(
+            store,
+            target=True,
+            judge_profile_hash=current_judge_profile_hash(),
+            judge_validation_hash=validation_hash,
+        ),
     )
     if not metadata.private or metadata.profile.chat_template_hash is None:
         raise ArtifactError("activation statistics privacy or chat-template profile is invalid")
@@ -453,8 +604,12 @@ def _activation_dependent_profile(store: ArtifactStore) -> ArtifactProfile:
 
 
 def _validate_activation_chat_profile(profile: ArtifactProfile, chat_template_hash: str) -> None:
-    if profile.chat_template_hash != chat_template_hash or profile.judge_template_hash != current_judge_template_hash():
-        raise ArtifactError("activation-derived artifacts use a different chat template")
+    if (
+        profile.chat_template_hash != chat_template_hash
+        or profile.judge_profile_hash != current_judge_profile_hash()
+        or profile.judge_validation_hash is None
+    ):
+        raise ArtifactError("activation-derived artifacts use a different runtime profile")
 
 
 def evaluate_candidates(config_path: str) -> None:
@@ -475,6 +630,7 @@ def evaluate_candidates(config_path: str) -> None:
     except KeyError as error:
         raise ArtifactError("activation screening ranking references an unknown candidate") from error
     with BaseModelRuntime(config) as profile_runtime:
+        _require_judge_validation(store, profile_runtime)
         chat_template_hash = profile_runtime.chat_template_hash
         _validate_activation_chat_profile(profile, chat_template_hash)
     validation = _load_labeled(store, chat_template_hash, "validation")
@@ -492,6 +648,7 @@ def evaluate_candidates(config_path: str) -> None:
         records,
         baseline_trajectories,
         reference_fallback,
+        artifact_profile=profile,
         evaluation_phase="pilot_evaluation",
     )
     pilot_eligible = [item for item in pilot_metrics if item.hard_filter_passed]
@@ -511,6 +668,7 @@ def evaluate_candidates(config_path: str) -> None:
         records,
         baseline_trajectories,
         reference_fallback,
+        artifact_profile=profile,
         evaluation_phase="full_validation",
     )
     selected_metrics, selected_candidate = select_candidate(full_validation_metrics, by_id)
@@ -592,6 +750,7 @@ def _evaluate_candidates_phase(
     baseline_trajectories: Mapping[str, TargetTrajectory],
     reference_fallback: Sequence[str],
     *,
+    artifact_profile: ArtifactProfile,
     evaluation_phase: Literal["pilot_evaluation", "full_validation"],
 ) -> tuple[list[CandidateMetrics], dict[str, Any]]:
     labels = {item.prompt_id: item.label for item in labeled}
@@ -600,6 +759,7 @@ def _evaluate_candidates_phase(
     trajectory_rows: list[dict[str, Any]] = []
     quality: dict[str, tuple[float, float]] = {}
     with IntervenedModelRuntime(config) as runtime:
+        _validate_activation_chat_profile(artifact_profile, runtime.chat_template_hash)
         base_logits = [_next_token_logits(runtime, prompt) for prompt in non_refusal_prompts]
         reference_texts, reference_corpus = _resolve_reference_texts(config, runtime, reference_fallback)
         base_ce = _mean_ce_loss(runtime, reference_texts)
@@ -634,7 +794,6 @@ def _evaluate_candidates_phase(
                     }
                     for trajectory in additions
                 )
-        chat_template_hash = runtime.chat_template_hash
     errors = sum(row["trajectory"]["parser_status"] == "ERROR" for row in trajectory_rows)
     _check_error_budget(errors, config, f"{evaluation_phase} intervention generation")
     trajectories_path = (
@@ -646,16 +805,13 @@ def _evaluate_candidates_phase(
         trajectories_path,
         trajectory_rows,
         artifact_type=f"{evaluation_phase}_trajectories",
-        profile=_profile(
-            store,
-            target=True,
-            chat_template_hash=chat_template_hash,
-            judge_template_hash=current_judge_template_hash(),
-        ),
+        profile=artifact_profile,
         private=True,
     )
     judgment_rows: list[dict[str, Any]] = []
     with BaseModelRuntime(config) as runtime:
+        _require_judge_validation(store, runtime)
+        _validate_activation_chat_profile(artifact_profile, runtime.chat_template_hash)
         judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
         for row in trajectory_rows:
             trajectory = TargetTrajectory.from_dict(row["trajectory"])
@@ -681,12 +837,7 @@ def _evaluate_candidates_phase(
         judgments_path,
         judgment_rows,
         artifact_type=f"{evaluation_phase}_judgments",
-        profile=_profile(
-            store,
-            target=True,
-            chat_template_hash=chat_template_hash,
-            judge_template_hash=current_judge_template_hash(),
-        ),
+        profile=artifact_profile,
         private=False,
     )
     metrics: list[CandidateMetrics] = []
@@ -723,12 +874,7 @@ def _evaluate_candidates_phase(
         results_path,
         metrics,
         artifact_type=f"{evaluation_phase}_results",
-        profile=_profile(
-            store,
-            target=True,
-            chat_template_hash=chat_template_hash,
-            judge_template_hash=current_judge_template_hash(),
-        ),
+        profile=artifact_profile,
         private=False,
     )
     return metrics, reference_corpus
@@ -873,6 +1019,9 @@ def export_model(config_path: str) -> None:
 
     config, store = _load(config_path)
     profile = _activation_dependent_profile(store)
+    validation_hash = profile.judge_validation_hash
+    if validation_hash is None:
+        raise ArtifactError("activation profile has no judge validation hash")
     store.validate(
         store.paths.selected_direction,
         artifact_type="selected_direction",
@@ -890,6 +1039,7 @@ def export_model(config_path: str) -> None:
     prompt = validation[0]
     export_result: Any
     with IntervenedModelRuntime(config, direction=direction, install_temporary=False) as runtime:
+        _validate_activation_chat_profile(profile, runtime.chat_template_hash)
         plan = runtime.weight_edit_plan
         probe = runtime.adapter.render_target_chat(
             runtime.processor,
@@ -904,6 +1054,7 @@ def export_model(config_path: str) -> None:
             plan,
             config,
             probe,
+            judge_validation_hash=validation_hash,
             output_dir=store.paths.exported_model,
             full_validation_metrics=selection["metrics"],
             defer_reload=True,
@@ -939,6 +1090,7 @@ def _load_labeled_for_probe(
     activation_profile: ArtifactProfile,
 ) -> list[PromptRecord]:
     with BaseModelRuntime(config) as runtime:
+        _require_judge_validation(store, runtime)
         _validate_activation_chat_profile(activation_profile, runtime.chat_template_hash)
         labeled = _load_labeled(store, runtime.chat_template_hash, "validation")
     prompts = {item.prompt_id: item for item in _load_prompt_records(store, config)}
@@ -949,6 +1101,7 @@ def evaluate_export(config_path: str) -> None:
     from self_judged_refusal_direction.exporting import write_export_manifest
 
     config, store = _load(config_path)
+    validation_hash = _require_judge_validation(store)
     manifest_path = store.paths.exported_model / "edit_manifest.json"
     test_baseline_path = store.paths.evaluation / "test_baseline_trajectories.private.jsonl"
     test_baseline_judgments_path = store.paths.evaluation / "test_baseline_judgments.jsonl"
@@ -974,7 +1127,8 @@ def evaluate_export(config_path: str) -> None:
         expected_profile=_profile(
             store,
             target=True,
-            judge_template_hash=current_judge_template_hash(),
+            judge_profile_hash=current_judge_profile_hash(),
+            judge_validation_hash=validation_hash,
         ),
     )
     manifest = _read_json(manifest_path)
@@ -992,9 +1146,10 @@ def evaluate_export(config_path: str) -> None:
     )
     direction, direction_metadata = load_direction(store.paths.selected_direction)
     _validate_direction_selection(direction_metadata, selection)
-    _validate_export_manifest(config, manifest, selection, direction)
+    _validate_export_manifest(config, manifest, selection, direction, validation_hash)
     initial_manifest_hash = object_sha256(manifest)
     with BaseModelRuntime(config) as runtime:
+        _require_judge_validation(store, runtime)
         _validate_activation_chat_profile(profile, runtime.chat_template_hash)
         fingerprints = runtime.adapter.processor_fingerprints(runtime.processor)
         if runtime.chat_template_hash != manifest["chat_template_hash"]:
@@ -1055,7 +1210,8 @@ def evaluate_export(config_path: str) -> None:
             store,
             target=True,
             chat_template_hash=chat_template_hash,
-            judge_template_hash=current_judge_template_hash(),
+            judge_profile_hash=current_judge_profile_hash(),
+            judge_validation_hash=validation_hash,
         ),
         private=False,
     )
@@ -1075,6 +1231,7 @@ def evaluate_export(config_path: str) -> None:
     export_generation_errors = sum(item.parser_status == "ERROR" for item in export_trajectories)
     _check_error_budget(export_generation_errors, config, "test export trajectory generation")
     with BaseModelRuntime(config) as runtime:
+        _require_judge_validation(store, runtime)
         if runtime.checkpoint_checksum != base_checkpoint_checksum:
             raise InvariantError("test judges did not use the same immutable base checkpoint")
         judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
@@ -1122,24 +1279,14 @@ def evaluate_export(config_path: str) -> None:
             for trajectory in export_trajectories
         ),
         artifact_type="test_export_trajectories",
-        profile=_profile(
-            store,
-            target=True,
-            chat_template_hash=chat_template_hash,
-            judge_template_hash=current_judge_template_hash(),
-        ),
+        profile=profile,
         private=True,
     )
     store.write_jsonl(
         test_export_judgments_path,
         ({"export_manifest_hash": manifest_hash, "judgment": judgment.as_dict()} for judgment in export_judgments),
         artifact_type="test_export_judgments",
-        profile=_profile(
-            store,
-            target=True,
-            chat_template_hash=chat_template_hash,
-            judge_template_hash=current_judge_template_hash(),
-        ),
+        profile=profile,
         private=False,
     )
     _write_json_artifact(
@@ -1169,13 +1316,15 @@ def _validate_export_manifest(
     manifest: Mapping[str, Any],
     selection: Mapping[str, Any],
     direction: torch.Tensor,
+    judge_validation_hash_value: str,
 ) -> None:
     expected = {
         "base_model_id": config.model.id,
         "base_revision": config.model.revision,
         "config_hash": config.config_hash,
         "target_generation_config_hash": config.target_generation_config_hash,
-        "judge_template_hash": current_judge_template_hash(),
+        "judge_profile_hash": current_judge_profile_hash(),
+        "judge_validation_hash": judge_validation_hash_value,
     }
     mismatches = [name for name, value in expected.items() if manifest.get(name) != value]
     if mismatches:
@@ -1230,6 +1379,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def run_pipeline(config_path: str) -> None:
     inspect_model(config_path)
+    _ensure_judge_validation(config_path)
     generate_baseline_trajectories(config_path)
     judge_baseline_trajectories(config_path)
     collect_activations(config_path)

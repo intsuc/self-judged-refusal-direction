@@ -21,7 +21,7 @@ from self_judged_refusal_direction.errors import CompatibilityError, InvariantEr
 from self_judged_refusal_direction.generation import resolved_generation_kwargs
 from self_judged_refusal_direction.hashing import file_sha256, object_sha256, tensor_sha256
 from self_judged_refusal_direction.models.base import ArchitectureAdapter
-from self_judged_refusal_direction.prompting import judge_template_hash
+from self_judged_refusal_direction.prompting import judge_profile_hash
 from self_judged_refusal_direction.reload_check import (
     ReloadCheckReport,
     parameter_count,
@@ -90,6 +90,7 @@ def export_edited_model(
     config: ProjectConfig,
     probe_inputs: Mapping[str, torch.Tensor],
     *,
+    judge_validation_hash: str,
     output_dir: str | Path | None = None,
     full_validation_metrics: Mapping[str, Any] | None = None,
     test_metrics: Mapping[str, Any] | None = None,
@@ -104,6 +105,8 @@ def export_edited_model(
     reload_target_trajectory_max_new_tokens: int = 256,
 ) -> ExportResult:
     config.validate()
+    if not isinstance(judge_validation_hash, str) or not judge_validation_hash:
+        raise InvariantError("judge validation hash is required")
     effective_generation_config_hash = object_sha256(
         {
             "system_prompt": config.target_generation.system_prompt,
@@ -204,6 +207,7 @@ def export_edited_model(
         untouched_parameters_verified=verify_unchanged_parameters,
         direction_layer=direction_layer,
         effective_generation_config_hash=effective_generation_config_hash,
+        judge_validation_hash=judge_validation_hash,
     )
     write_export_manifest(target, manifest)
     _write_public_text(target / "README.md", _readme(config))
@@ -448,6 +452,7 @@ def _build_manifest(
     untouched_parameters_verified: bool,
     direction_layer: int,
     effective_generation_config_hash: str,
+    judge_validation_hash: str,
 ) -> dict[str, Any]:
     rules = []
     for operation in plan.operations:
@@ -462,7 +467,8 @@ def _build_manifest(
         "effective_generation_config_hash": effective_generation_config_hash,
         "target_thinking_enabled": config.target_generation.thinking_enabled,
         "chat_template_hash": chat_template_hash,
-        "judge_template_hash": judge_template_hash(),
+        "judge_profile_hash": judge_profile_hash(),
+        "judge_validation_hash": judge_validation_hash,
         **dict(processor_fingerprints),
         "direction_source_layer": direction_layer,
         "direction_sha256": tensor_sha256(plan.direction),
@@ -502,7 +508,8 @@ def write_export_manifest(output_dir: str | Path, manifest: Mapping[str, Any]) -
             config_hash=str(value["config_hash"]),
             target_generation_config_hash=str(value["target_generation_config_hash"]),
             chat_template_hash=str(value["chat_template_hash"]),
-            judge_template_hash=str(value["judge_template_hash"]),
+            judge_profile_hash=str(value["judge_profile_hash"]),
+            judge_validation_hash=str(value["judge_validation_hash"]),
         )
     except KeyError as error:
         raise InvariantError(f"export manifest profile field is missing: {error.args[0]}") from error

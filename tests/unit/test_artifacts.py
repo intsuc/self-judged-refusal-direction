@@ -7,7 +7,7 @@ from self_judged_refusal_direction.artifacts import ArtifactProfile, ArtifactSto
 from self_judged_refusal_direction.config import ModelConfig, ProjectConfig, RunConfig
 from self_judged_refusal_direction.errors import ArtifactError
 from self_judged_refusal_direction.pipeline import _validate_activation_chat_profile
-from self_judged_refusal_direction.prompting import judge_template_hash
+from self_judged_refusal_direction.prompting import judge_profile_hash
 
 
 def test_artifact_reuse_requires_matching_profile_and_content(tmp_path) -> None:
@@ -68,15 +68,16 @@ def test_environment_extensions_survive_and_identity_changes_fail_closed(tmp_pat
         store.initialize_run()
 
 
-def test_activation_artifacts_require_the_current_chat_template() -> None:
+def test_activation_artifacts_require_the_current_runtime_profile() -> None:
     profile = ArtifactProfile(
         model_id="model",
         model_revision="a" * 40,
         config_hash="config",
         chat_template_hash="chat-a",
-        judge_template_hash=judge_template_hash(),
+        judge_profile_hash=judge_profile_hash(),
+        judge_validation_hash="validation",
     )
 
     _validate_activation_chat_profile(profile, "chat-a")
-    with pytest.raises(ArtifactError, match="different chat template"):
+    with pytest.raises(ArtifactError, match="different runtime profile"):
         _validate_activation_chat_profile(profile, "chat-b")

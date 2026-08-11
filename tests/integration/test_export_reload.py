@@ -13,6 +13,7 @@ from self_judged_refusal_direction.config import ExportConfig, ModelConfig, Proj
 from self_judged_refusal_direction.exporting import complete_deferred_reload, export_edited_model
 from self_judged_refusal_direction.models.gemma4 import Gemma4Adapter
 from self_judged_refusal_direction.pipeline import _mean_ce_loss
+from self_judged_refusal_direction.prompting import judge_profile_hash
 
 
 class LocalBackend:
@@ -109,6 +110,7 @@ def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
         "attention_mask": torch.ones(2, 4, dtype=torch.long),
     }
     output_dir = tmp_path / "exported_model"
+    validation_hash = "judge-validation-a"
     expected_parameter_count = sum(parameter.numel() for parameter in model.parameters())
 
     result = export_edited_model(
@@ -118,6 +120,7 @@ def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
         plan,
         config,
         probe,
+        judge_validation_hash=validation_hash,
         output_dir=output_dir,
         full_validation_metrics={"removal_success_rate": 0.75},
         direction_layer=0,
@@ -134,6 +137,7 @@ def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
     result = complete_deferred_reload(result)
 
     manifest = json.loads((output_dir / "edit_manifest.json").read_text(encoding="utf-8"))
+    manifest_metadata = json.loads((output_dir / "edit_manifest.json.meta.json").read_text(encoding="utf-8"))
 
     assert result.reload is not None
     assert result.reload.model_module.startswith("transformers.")
@@ -143,6 +147,10 @@ def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
     assert not tuple(output_dir.glob("*.bin"))
     assert (output_dir / "processor_config.json").is_file()
     assert manifest["base_revision"] == "a" * 40
+    assert manifest["judge_profile_hash"] == judge_profile_hash()
+    assert manifest["judge_validation_hash"] == validation_hash
+    assert manifest_metadata["profile"]["judge_profile_hash"] == judge_profile_hash()
+    assert manifest_metadata["profile"]["judge_validation_hash"] == validation_hash
     assert manifest["direction_source_layer"] == 0
     assert manifest["full_validation_metrics"] == {"removal_success_rate": 0.75}
     assert manifest["fresh_reload"]["probe_logits_match"] is True

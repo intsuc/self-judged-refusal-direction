@@ -4,11 +4,22 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any, Literal
 
+from self_judged_refusal_direction.errors import ArtifactError
+
 
 class JudgeLabel(StrEnum):
     REFUSAL = "REFUSAL"
     NON_REFUSAL = "NON_REFUSAL"
     UNCERTAIN = "UNCERTAIN"
+
+
+@dataclass(frozen=True)
+class JudgeInput:
+    original_prompt: str
+    thinking_text: str
+    final_answer: str
+    generation_truncated: bool
+    input_hash: str
 
 
 @dataclass(frozen=True)
@@ -68,6 +79,80 @@ class JudgeResult:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> JudgeResult:
         return cls(**value)
+
+
+@dataclass(frozen=True)
+class JudgeValidationCase:
+    case_id: str
+    original_prompt: str
+    thinking_text: str
+    final_answer: str
+    generation_truncated: bool
+    expected_label: JudgeLabel
+
+    def as_dict(self) -> dict[str, str | bool]:
+        return {
+            "case_id": self.case_id,
+            "original_prompt": self.original_prompt,
+            "thinking_text": self.thinking_text,
+            "final_answer": self.final_answer,
+            "generation_truncated": self.generation_truncated,
+            "expected_label": self.expected_label.value,
+        }
+
+
+@dataclass(frozen=True)
+class JudgeValidationResult:
+    case_id: str
+    expected_label: JudgeLabel
+    status: Literal["OK", "ERROR"]
+    actual_label: JudgeLabel | None = None
+    error_code: str | None = None
+
+    def as_dict(self) -> dict[str, str]:
+        result = {
+            "case_id": self.case_id,
+            "expected_label": self.expected_label.value,
+            "status": self.status,
+        }
+        if self.actual_label is not None:
+            result["actual_label"] = self.actual_label.value
+        if self.error_code is not None:
+            result["error_code"] = self.error_code
+        return result
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> JudgeValidationResult:
+        if not isinstance(value, dict):
+            raise ArtifactError("judge validation result must be an object")
+        status = value.get("status")
+        required = {"case_id", "expected_label", "status"}
+        if status == "OK":
+            required.add("actual_label")
+        elif status == "ERROR":
+            required.add("error_code")
+        else:
+            raise ArtifactError("judge validation result has an invalid status")
+        if set(value) != required:
+            raise ArtifactError("judge validation result has invalid fields")
+        case_id = value["case_id"]
+        error_code = value.get("error_code")
+        if type(case_id) is not str or not case_id:
+            raise ArtifactError("judge validation result has an invalid case_id")
+        if error_code is not None and (type(error_code) is not str or not error_code):
+            raise ArtifactError("judge validation result has an invalid error_code")
+        try:
+            expected_label = JudgeLabel(value["expected_label"])
+            actual_label = JudgeLabel(value["actual_label"]) if "actual_label" in value else None
+        except (TypeError, ValueError) as error:
+            raise ArtifactError("judge validation result has an invalid label") from error
+        return cls(
+            case_id=case_id,
+            expected_label=expected_label,
+            status=status,
+            actual_label=actual_label,
+            error_code=error_code,
+        )
 
 
 @dataclass(frozen=True)

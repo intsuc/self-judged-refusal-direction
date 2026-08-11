@@ -7,10 +7,10 @@ import torch
 
 from self_judged_refusal_direction.decoding import EnumTrieConstrainedDecoder
 from self_judged_refusal_direction.errors import ConfigurationError, InvariantError
-from self_judged_refusal_direction.prompting import judge_messages
-from self_judged_refusal_direction.schema import JudgeResult, TargetTrajectory
+from self_judged_refusal_direction.prompting import JUDGE_GENERATION_OPTIONS, judge_messages
+from self_judged_refusal_direction.schema import JudgeInput, JudgeLabel, JudgeResult, TargetTrajectory
 
-LABELS = ("REFUSAL", "NON_REFUSAL", "UNCERTAIN")
+LABELS = tuple(label.value for label in JudgeLabel)
 
 
 class JudgeAdapter(Protocol):
@@ -37,10 +37,21 @@ class TrajectoryJudge:
 
     def classify(self, trajectory: TargetTrajectory) -> JudgeResult:
         if trajectory.parser_status != "OK":
-            return self._error(trajectory, "INVALID_TRAJECTORY")
+            return self._error(trajectory.trajectory_hash, "INVALID_TRAJECTORY")
+        return self.classify_input(
+            JudgeInput(
+                original_prompt=trajectory.original_prompt,
+                thinking_text=trajectory.thinking_text,
+                final_answer=trajectory.final_answer,
+                generation_truncated=trajectory.generation_truncated,
+                input_hash=trajectory.trajectory_hash,
+            )
+        )
+
+    def classify_input(self, judge_input: JudgeInput) -> JudgeResult:
         try:
             model, processor = self._resources()
-            rendered = self.adapter.render_judge_chat(processor, judge_messages(trajectory))
+            rendered = self.adapter.render_judge_chat(processor, judge_messages(judge_input))
             rendered = _move_batch(rendered, self.adapter.input_device(model))
             input_ids = rendered["input_ids"]
             if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -57,13 +68,11 @@ class TrajectoryJudge:
             with torch.inference_mode():
                 output = model.generate(
                     **generation_inputs,
-                    do_sample=False,
-                    num_beams=1,
+                    **JUDGE_GENERATION_OPTIONS,
                     max_new_tokens=decoder.max_new_tokens,
                     prefix_allowed_tokens_fn=decoder.prefix_allowed_tokens_fn,
                     eos_token_id=decoder.eos_token_id,
                     pad_token_id=processor.tokenizer.pad_token_id,
-                    use_cache=True,
                 )
             sequences = output.sequences if hasattr(output, "sequences") else output
             suffix = sequences[0, input_ids.shape[-1] :]
@@ -75,10 +84,10 @@ class TrajectoryJudge:
                 status="OK",
                 label=typed_label,
                 raw_output=raw_output,
-                trajectory_hash=trajectory.trajectory_hash,
+                trajectory_hash=judge_input.input_hash,
             )
         except Exception as error:
-            return self._error(trajectory, type(error).__name__)
+            return self._error(judge_input.input_hash, type(error).__name__)
 
     def _resources(self) -> tuple[Any, Any]:
         model = self._model_ref()
@@ -93,12 +102,12 @@ class TrajectoryJudge:
         if total > context:
             raise ConfigurationError(f"full judge input requires {total} tokens but context window is {context}")
 
-    def _error(self, trajectory: TargetTrajectory, error_code: str) -> JudgeResult:
+    def _error(self, input_hash: str, error_code: str) -> JudgeResult:
         return JudgeResult(
             status="ERROR",
             label=None,
             raw_output=None,
-            trajectory_hash=trajectory.trajectory_hash,
+            trajectory_hash=input_hash,
             error_code=error_code,
         )
 

@@ -3,51 +3,43 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable
+from typing import cast
 
 from self_judged_refusal_direction.errors import RefusalDirectionError
 
-COMMANDS = (
-    "inspect-model",
-    "generate-baseline-trajectories",
-    "judge-baseline-trajectories",
-    "collect-activations",
-    "build-candidates",
-    "evaluate-candidates",
-    "export-model",
-    "evaluate-export",
-    "run",
-)
+COMMAND_FUNCTION_NAMES = {
+    "inspect-model": "inspect_model",
+    "validate-judge": "validate_judge",
+    "generate-baseline-trajectories": "generate_baseline_trajectories",
+    "judge-baseline-trajectories": "judge_baseline_trajectories",
+    "collect-activations": "collect_activations",
+    "build-candidates": "build_direction_candidates",
+    "evaluate-candidates": "evaluate_candidates",
+    "export-model": "export_model",
+    "evaluate-export": "evaluate_export",
+    "run": "run_pipeline",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in COMMANDS:
+    for command in COMMAND_FUNCTION_NAMES:
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--config", required=True)
     return parser
 
 
-def command_functions() -> dict[str, Callable[[str], None]]:
+def command_function(command: str) -> Callable[[str], None]:
     from self_judged_refusal_direction import pipeline
 
-    return {
-        "inspect-model": pipeline.inspect_model,
-        "generate-baseline-trajectories": pipeline.generate_baseline_trajectories,
-        "judge-baseline-trajectories": pipeline.judge_baseline_trajectories,
-        "collect-activations": pipeline.collect_activations,
-        "build-candidates": pipeline.build_direction_candidates,
-        "evaluate-candidates": pipeline.evaluate_candidates,
-        "export-model": pipeline.export_model,
-        "evaluate-export": pipeline.evaluate_export,
-        "run": pipeline.run_pipeline,
-    }
+    return cast(Callable[[str], None], getattr(pipeline, COMMAND_FUNCTION_NAMES[command]))
 
 
 def main() -> None:
     args = build_parser().parse_args()
     try:
-        command_functions()[args.command](args.config)
+        command_function(args.command)(args.config)
     except RefusalDirectionError as error:
         print(f"error: {error}", file=sys.stderr)
         raise SystemExit(2) from error

@@ -28,7 +28,9 @@ class ArtifactProfile:
     config_hash: str
     target_generation_config_hash: str | None = None
     chat_template_hash: str | None = None
-    judge_template_hash: str | None = None
+    judge_profile_hash: str | None = None
+    judge_fixture_hash: str | None = None
+    judge_validation_hash: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -57,6 +59,7 @@ class ArtifactMetadata:
 class ArtifactPaths:
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve()
+        self.preflight = self.root / "preflight"
         self.data = self.root / "data"
         self.activations = self.root / "activations"
         self.directions = self.root / "directions"
@@ -64,8 +67,19 @@ class ArtifactPaths:
         self.exported_model = self.root / "exported_model"
 
     def create(self) -> None:
-        for path in (self.root, self.data, self.activations, self.directions, self.evaluation):
+        for path in (
+            self.root,
+            self.preflight,
+            self.data,
+            self.activations,
+            self.directions,
+            self.evaluation,
+        ):
             path.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def judge_results(self) -> Path:
+        return self.preflight / "judge_results.jsonl"
 
     @property
     def splits(self) -> Path:
@@ -165,7 +179,9 @@ class ArtifactStore:
         *,
         target: bool = False,
         chat_template_hash: str | None = None,
-        judge_template_hash: str | None = None,
+        judge_profile_hash: str | None = None,
+        judge_fixture_hash: str | None = None,
+        judge_validation_hash: str | None = None,
     ) -> ArtifactProfile:
         if self.config.model.id is None:
             raise ArtifactError("model ID is required")
@@ -175,7 +191,9 @@ class ArtifactStore:
             config_hash=self.config.config_hash,
             target_generation_config_hash=self.config.target_generation_config_hash if target else None,
             chat_template_hash=chat_template_hash,
-            judge_template_hash=judge_template_hash,
+            judge_profile_hash=judge_profile_hash,
+            judge_fixture_hash=judge_fixture_hash,
+            judge_validation_hash=judge_validation_hash,
         )
 
     def initialize_run(self) -> None:
@@ -183,6 +201,7 @@ class ArtifactStore:
         run_outputs = (
             self.paths.root / "resolved_config.yaml",
             self.paths.root / "model_compatibility.json",
+            self.paths.preflight,
             self.paths.data,
             self.paths.activations,
             self.paths.directions,
