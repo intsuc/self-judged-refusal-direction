@@ -107,9 +107,7 @@ The preflight checks and pipeline stages can also be run separately:
 ## Architecture adapters
 
 The adapter is selected from the pinned checkpoint's `model_type`. The included Gemma 4 adapter supports the
-[`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) reference configuration. Its
-mean-activation-difference and weight-orthogonalization approach builds on
-[`andyrdt/refusal_direction`](https://github.com/andyrdt/refusal_direction/tree/9d852fae1a9121c78b29142de733cb1340770cc3).
+[`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) reference configuration.
 
 ## Artifacts and privacy
 
@@ -117,3 +115,7 @@ Artifacts are content-hashed and tied to the pinned checkpoint, target-generatio
 fingerprints before reuse. Raw parsed trajectories can contain model thinking and are written with owner-only
 permissions. They are never copied into the exported checkpoint. The pipeline does not push models or artifacts to a
 Hub or expose a public endpoint.
+
+## References
+
+- [Arditi, A., Obeso, O., Syed, A., Paleka, D., Rimsky, N., Gurnee, W., & Nanda, N. (2024). **Refusal in Language Models Is Mediated by a Single Direction**. *ArXiv, abs/2406.11717*.](https://arxiv.org/abs/2406.11717)
