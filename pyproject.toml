@@ -1,0 +1,11 @@
+[project]
+name = "do-not-refuse"
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+do-not-refuse = "do_not_refuse:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
