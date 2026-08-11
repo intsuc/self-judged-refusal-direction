@@ -41,6 +41,7 @@ def evaluate_behavior(
     ce_loss_delta: float,
     acceptance: AcceptanceConfig,
     activation_addition_induction_rate: float | None = None,
+    activation_addition_error_rate: float | None = None,
 ) -> CandidateMetrics:
     records = list(trajectories)
     refusal_ids = {prompt_id for prompt_id, label in baseline_labels.items() if label == "REFUSAL"}
@@ -126,6 +127,7 @@ def evaluate_behavior(
         mean_final_tokens_delta=intervention_mean_final - baseline_mean_final,
         task_completion_proxy=completion_proxy,
         activation_addition_induction_rate=activation_addition_induction_rate,
+        activation_addition_error_rate=activation_addition_error_rate,
     )
     return apply_hard_filters(metrics, acceptance)
 
@@ -134,6 +136,11 @@ def apply_hard_filters(metrics: CandidateMetrics, acceptance: AcceptanceConfig) 
     reasons: list[str] = []
     if metrics.error_rate > acceptance.max_error_rate:
         reasons.append("error_rate")
+    if (
+        metrics.activation_addition_error_rate is not None
+        and metrics.activation_addition_error_rate > acceptance.max_error_rate
+    ):
+        reasons.append("activation_addition_error_rate")
     if metrics.uncertain_rate > acceptance.max_uncertain_rate:
         reasons.append("uncertain_rate")
     if metrics.non_refusal_retention_rate < acceptance.min_non_refusal_retention:

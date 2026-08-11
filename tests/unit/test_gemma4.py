@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from self_judged_refusal_direction.config import TargetGenerationConfig
-from self_judged_refusal_direction.errors import InvariantError
+from self_judged_refusal_direction.errors import InvariantError, TargetParseError, TargetParseErrorCode
 from self_judged_refusal_direction.models.gemma4 import Gemma4Adapter
 
 THINKING_OPEN = "<|channel>thought\n"
@@ -146,29 +146,37 @@ def test_parse_content_only_trajectory_has_empty_thinking_span() -> None:
 
 
 @pytest.mark.parametrize(
-    "output",
+    ("output", "error_code"),
     [
-        f"{THINKING_OPEN}reason{THINKING_CLOSE}answer{CONTENT_CLOSE}",
-        f"answer{THINKING_CLOSE}{CONTENT_CLOSE}",
-        "answer",
-        f"answer{CONTENT_CLOSE}trailing",
+        (
+            f"{THINKING_OPEN}reason{THINKING_CLOSE}answer{CONTENT_CLOSE}",
+            TargetParseErrorCode.THINKING_DELIMITER_IN_CONTENT,
+        ),
+        (f"answer{THINKING_CLOSE}{CONTENT_CLOSE}", TargetParseErrorCode.THINKING_DELIMITER_IN_CONTENT),
+        ("answer", TargetParseErrorCode.TERMINAL_MISSING),
+        (f"answer{CONTENT_CLOSE}trailing", TargetParseErrorCode.TRAILING_TOKENS),
     ],
 )
-def test_content_only_parser_rejects_thinking_delimiters_truncation_and_trailing(output: str) -> None:
+def test_content_only_parser_rejects_thinking_delimiters_truncation_and_trailing(
+    output: str,
+    error_code: TargetParseErrorCode,
+) -> None:
     adapter = Gemma4Adapter()
     processor = ProcessorSpy({"role": "assistant", "content": "answer"})
 
-    with pytest.raises(InvariantError):
+    with pytest.raises(TargetParseError) as raised:
         adapter.parse_target_trajectory(processor, token_ids(output), thinking_enabled=False)
+    assert raised.value.code is error_code
 
 
 def test_content_only_parser_rejects_nonempty_official_thinking() -> None:
     adapter = Gemma4Adapter()
     processor = ProcessorSpy({"role": "assistant", "thinking": "reason", "content": "answer"})
 
-    with pytest.raises(InvariantError, match="found thinking"):
+    with pytest.raises(TargetParseError, match="found thinking") as raised:
         adapter.parse_target_trajectory(
             processor,
             token_ids(f"answer{CONTENT_CLOSE}"),
             thinking_enabled=False,
         )
+    assert raised.value.code is TargetParseErrorCode.UNEXPECTED_THINKING

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import inspect
+import json
+import math
 import os
 import platform
 import tempfile
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -12,15 +15,16 @@ import accelerate
 import safetensors
 import torch
 import transformers
+from safetensors.torch import load_file, save_file
 from torch import nn
 from tqdm import tqdm
 
-from self_judged_refusal_direction.artifacts import ArtifactMetadata, ArtifactPaths, ArtifactProfile, ArtifactStore
-from self_judged_refusal_direction.config import ProjectConfig, TargetGenerationConfig
+from self_judged_refusal_direction.artifacts import ArtifactPaths, ArtifactStore
+from self_judged_refusal_direction.config import ModelConfig, ProjectConfig, RunConfig, TargetGenerationConfig
 from self_judged_refusal_direction.editing import ProjectionKind, WeightEditPlan
-from self_judged_refusal_direction.errors import CompatibilityError, InvariantError
+from self_judged_refusal_direction.errors import ArtifactError, CompatibilityError, ConfigurationError, InvariantError
 from self_judged_refusal_direction.generation import resolved_generation_kwargs
-from self_judged_refusal_direction.hashing import file_sha256, object_sha256, tensor_sha256
+from self_judged_refusal_direction.hashing import canonical_json_bytes, file_sha256, object_sha256, tensor_sha256
 from self_judged_refusal_direction.models.base import ArchitectureAdapter
 from self_judged_refusal_direction.prompting import judge_profile_hash
 from self_judged_refusal_direction.reload_check import (
@@ -79,8 +83,36 @@ class DeferredReload:
     target_trajectory_max_new_tokens: int
     target_generation: TargetGenerationConfig
     expected_generation_config_hash: str
+    export_implementation_hash: str
     seed: int
     revision: str
+
+
+_DEFERRED_RELOAD_REQUEST_NAME = "request.private.json"
+_DEFERRED_RELOAD_TENSOR_PREFIX = "tensors."
+_DEFERRED_RELOAD_TENSOR_SUFFIX = ".private.safetensors"
+_DEFERRED_RELOAD_BODY_KEYS = {
+    "attention_implementation",
+    "atol",
+    "device_map",
+    "dtype",
+    "expected_generation_config_hash",
+    "expected_parameter_count",
+    "expected_parameter_shapes",
+    "export_implementation_hash",
+    "model_dir",
+    "probe_input_names",
+    "processor_fingerprints",
+    "revision",
+    "rtol",
+    "seed",
+    "target_generation",
+    "target_trajectory_max_new_tokens",
+    "tensor_sha256",
+    "tied_parameter_pairs",
+    "timeout_seconds",
+    "verify_target_trajectory",
+}
 
 
 def export_edited_model(
@@ -102,6 +134,7 @@ def export_edited_model(
     verify_unchanged_parameters: bool = True,
     reload_timeout_seconds: float = 1800.0,
     defer_reload: bool = True,
+    deferred_reload_directory: str | Path | None = None,
     verify_reload_target_trajectory: bool = True,
     reload_target_trajectory_max_new_tokens: int = 256,
 ) -> ExportResult:
@@ -188,9 +221,12 @@ def export_edited_model(
         target_trajectory_max_new_tokens=reload_target_trajectory_max_new_tokens,
         target_generation=config.target_generation,
         expected_generation_config_hash=effective_generation_config_hash,
+        export_implementation_hash=export_implementation_hash(),
         seed=config.run.seed,
         revision=config.model.revision,
     )
+    if deferred_reload_directory is not None:
+        save_deferred_reload(reload_request, deferred_reload_directory)
     reload_report = None if defer_reload else _run_deferred_reload(reload_request)
     manifest = _build_manifest(
         config=config,
@@ -210,8 +246,8 @@ def export_edited_model(
         effective_generation_config_hash=effective_generation_config_hash,
         judge_validation_hash=judge_validation_hash,
     )
-    write_export_manifest(target, manifest)
     _write_public_text(target / "README.md", _readme(config))
+    write_export_manifest(target, manifest)
     return ExportResult(
         output_dir=str(target),
         edited_parameter_names=edited_parameter_names,
@@ -231,6 +267,324 @@ def complete_deferred_reload(result: ExportResult) -> ExportResult:
     manifest["fresh_reload"] = report.as_dict()
     write_export_manifest(result.output_dir, manifest)
     return replace(result, reload=report, deferred_reload=None, manifest=manifest)
+
+
+def save_deferred_reload(request: DeferredReload, directory: str | Path) -> Path:
+    _validate_deferred_reload(request)
+    target = Path(directory)
+    if target.is_symlink():
+        raise ArtifactError(f"deferred reload directory must not be a symlink: {target}")
+    target.mkdir(parents=True, exist_ok=True)
+    if not target.is_dir():
+        raise ArtifactError(f"deferred reload path is not a directory: {target}")
+    os.chmod(target, 0o700)
+
+    probe_input_names = sorted(request.probe_inputs)
+    tensors = {
+        **{
+            f"probe.{index}": request.probe_inputs[name].detach().to(device="cpu").contiguous()
+            for index, name in enumerate(probe_input_names)
+        },
+        "expected_logits": request.expected_logits.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+    }
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target, delete=False) as stream:
+            temporary = Path(stream.name)
+        save_file(tensors, temporary)
+        os.chmod(temporary, 0o600)
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        tensor_digest = file_sha256(temporary)
+        tensor_path = target / f"{_DEFERRED_RELOAD_TENSOR_PREFIX}{tensor_digest}{_DEFERRED_RELOAD_TENSOR_SUFFIX}"
+        if tensor_path.is_symlink():
+            raise ArtifactError(f"deferred reload tensor path must not be a symlink: {tensor_path}")
+        if tensor_path.exists():
+            if not tensor_path.is_file() or file_sha256(tensor_path) != tensor_digest:
+                raise ArtifactError(f"existing deferred reload tensor artifact is invalid: {tensor_path}")
+            os.chmod(tensor_path, 0o600)
+        else:
+            temporary.replace(tensor_path)
+            temporary = None
+            ArtifactStore._fsync_directory(target)
+    except (OSError, TypeError, ValueError, RuntimeError, safetensors.SafetensorError) as error:
+        raise ArtifactError("failed to write deferred reload tensor artifact") from error
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+    body = _deferred_reload_body(request, probe_input_names, tensor_digest)
+    document = {**body, "content_sha256": object_sha256(body)}
+    request_path = target / _DEFERRED_RELOAD_REQUEST_NAME
+    ArtifactStore.write_json(request_path, document, private=True)
+    return request_path
+
+
+def load_deferred_reload(directory: str | Path) -> DeferredReload:
+    target = Path(directory)
+    request_path = target / _DEFERRED_RELOAD_REQUEST_NAME
+    if target.is_symlink() or not target.is_dir() or target.stat().st_mode & 0o077:
+        raise ArtifactError(f"deferred reload directory is invalid: {target}")
+    if request_path.is_symlink() or not request_path.is_file() or request_path.stat().st_mode & 0o077:
+        raise ArtifactError(f"deferred reload request artifact is invalid: {request_path}")
+    try:
+        encoded = request_path.read_bytes()
+        raw = json.loads(encoded)
+        if not isinstance(raw, dict) or canonical_json_bytes(raw) + b"\n" != encoded:
+            raise TypeError
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise ArtifactError(f"deferred reload request artifact is invalid: {request_path}") from error
+    if set(raw) != _DEFERRED_RELOAD_BODY_KEYS | {"content_sha256"}:
+        raise ArtifactError("deferred reload request fields are invalid")
+    content_digest = raw.pop("content_sha256")
+    if not _is_sha256(content_digest) or object_sha256(raw) != content_digest:
+        raise ArtifactError("deferred reload request content hash does not match")
+    tensor_digest = raw["tensor_sha256"]
+    if not _is_sha256(tensor_digest):
+        raise ArtifactError("deferred reload tensor content hash is invalid")
+    tensor_path = target / f"{_DEFERRED_RELOAD_TENSOR_PREFIX}{tensor_digest}{_DEFERRED_RELOAD_TENSOR_SUFFIX}"
+    if tensor_path.is_symlink() or not tensor_path.is_file() or tensor_path.stat().st_mode & 0o077:
+        raise ArtifactError(f"deferred reload tensor artifact is invalid: {tensor_path}")
+    if file_sha256(tensor_path) != tensor_digest:
+        raise ArtifactError("deferred reload tensor content hash does not match")
+    try:
+        stored = load_file(tensor_path, device="cpu")
+        request = _deferred_reload_from_artifacts(raw, stored)
+        _validate_deferred_reload(request)
+    except (KeyError, TypeError, ValueError, RuntimeError, safetensors.SafetensorError, InvariantError) as error:
+        raise ArtifactError("deferred reload request contents are invalid") from error
+    return request
+
+
+def complete_persisted_deferred_reload(directory: str | Path) -> ReloadCheckReport:
+    return _run_deferred_reload(load_deferred_reload(directory))
+
+
+def _deferred_reload_body(
+    request: DeferredReload,
+    probe_input_names: list[str],
+    tensor_digest: str,
+) -> dict[str, Any]:
+    return {
+        "model_dir": request.model_dir,
+        "probe_input_names": probe_input_names,
+        "expected_parameter_shapes": {
+            name: list(shape) for name, shape in sorted(request.expected_parameter_shapes.items())
+        },
+        "expected_parameter_count": request.expected_parameter_count,
+        "tied_parameter_pairs": [list(pair) for pair in sorted(request.tied_parameter_pairs)],
+        "device_map": request.device_map,
+        "dtype": request.dtype,
+        "attention_implementation": request.attention_implementation,
+        "atol": request.atol,
+        "rtol": request.rtol,
+        "timeout_seconds": request.timeout_seconds,
+        "processor_fingerprints": dict(request.processor_fingerprints),
+        "verify_target_trajectory": request.verify_target_trajectory,
+        "target_trajectory_max_new_tokens": request.target_trajectory_max_new_tokens,
+        "target_generation": asdict(request.target_generation),
+        "expected_generation_config_hash": request.expected_generation_config_hash,
+        "export_implementation_hash": request.export_implementation_hash,
+        "seed": request.seed,
+        "revision": request.revision,
+        "tensor_sha256": tensor_digest,
+    }
+
+
+def _deferred_reload_from_artifacts(
+    raw: dict[str, Any],
+    stored: dict[str, torch.Tensor],
+) -> DeferredReload:
+    probe_input_names = raw["probe_input_names"]
+    if (
+        not isinstance(probe_input_names, list)
+        or not probe_input_names
+        or any(not isinstance(name, str) or not name for name in probe_input_names)
+        or probe_input_names != sorted(set(probe_input_names))
+    ):
+        raise TypeError
+    expected_tensor_keys = {"expected_logits"} | {f"probe.{index}" for index in range(len(probe_input_names))}
+    if set(stored) != expected_tensor_keys:
+        raise TypeError
+
+    raw_shapes = raw["expected_parameter_shapes"]
+    if not isinstance(raw_shapes, dict):
+        raise TypeError
+    expected_parameter_shapes: dict[str, tuple[int, ...]] = {}
+    for name, shape in raw_shapes.items():
+        if not isinstance(name, str) or not isinstance(shape, list):
+            raise TypeError
+        expected_parameter_shapes[name] = tuple(shape)
+
+    raw_pairs = raw["tied_parameter_pairs"]
+    if not isinstance(raw_pairs, list) or any(not isinstance(pair, list) or len(pair) != 2 for pair in raw_pairs):
+        raise TypeError
+    tied_parameter_pairs = tuple(tuple(pair) for pair in raw_pairs)
+
+    raw_fingerprints = raw["processor_fingerprints"]
+    if not isinstance(raw_fingerprints, dict):
+        raise TypeError
+    processor_fingerprints = dict(raw_fingerprints)
+
+    raw_generation = raw["target_generation"]
+    if not isinstance(raw_generation, dict) or set(raw_generation) != {
+        field.name for field in fields(TargetGenerationConfig)
+    }:
+        raise TypeError
+    target_generation = TargetGenerationConfig(**raw_generation)
+
+    return DeferredReload(
+        model_dir=raw["model_dir"],
+        probe_inputs={name: stored[f"probe.{index}"] for index, name in enumerate(probe_input_names)},
+        expected_logits=stored["expected_logits"],
+        expected_parameter_shapes=expected_parameter_shapes,
+        expected_parameter_count=raw["expected_parameter_count"],
+        tied_parameter_pairs=tied_parameter_pairs,
+        device_map=raw["device_map"],
+        dtype=raw["dtype"],
+        attention_implementation=raw["attention_implementation"],
+        atol=raw["atol"],
+        rtol=raw["rtol"],
+        timeout_seconds=raw["timeout_seconds"],
+        processor_fingerprints=processor_fingerprints,
+        verify_target_trajectory=raw["verify_target_trajectory"],
+        target_trajectory_max_new_tokens=raw["target_trajectory_max_new_tokens"],
+        target_generation=target_generation,
+        expected_generation_config_hash=raw["expected_generation_config_hash"],
+        export_implementation_hash=raw["export_implementation_hash"],
+        seed=raw["seed"],
+        revision=raw["revision"],
+    )
+
+
+def _validate_deferred_reload(request: DeferredReload) -> None:
+    if not isinstance(request, DeferredReload):
+        raise InvariantError("deferred reload request is invalid")
+    if (
+        not isinstance(request.model_dir, str)
+        or not request.model_dir
+        or not Path(request.model_dir).is_absolute()
+        or str(Path(request.model_dir).resolve()) != request.model_dir
+        or not Path(request.model_dir).is_dir()
+    ):
+        raise InvariantError("deferred reload model directory is invalid")
+    if (
+        not isinstance(request.probe_inputs, dict)
+        or not request.probe_inputs
+        or any(not isinstance(name, str) or not name for name in request.probe_inputs)
+        or any(not _persistable_tensor(value) for value in request.probe_inputs.values())
+    ):
+        raise InvariantError("deferred reload probe inputs are invalid")
+    if (
+        not _persistable_tensor(request.expected_logits)
+        or not request.expected_logits.dtype.is_floating_point
+        or request.expected_logits.numel() == 0
+        or not bool(torch.isfinite(request.expected_logits).all())
+    ):
+        raise InvariantError("deferred reload expected logits are invalid")
+    if not isinstance(request.expected_parameter_shapes, dict) or not request.expected_parameter_shapes:
+        raise InvariantError("deferred reload parameter shapes are invalid")
+    for name, shape in request.expected_parameter_shapes.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(shape, tuple)
+            or any(not isinstance(size, int) or isinstance(size, bool) or size < 0 for size in shape)
+        ):
+            raise InvariantError("deferred reload parameter shapes are invalid")
+    if (
+        not isinstance(request.expected_parameter_count, int)
+        or isinstance(request.expected_parameter_count, bool)
+        or request.expected_parameter_count < 1
+    ):
+        raise InvariantError("deferred reload parameter count is invalid")
+    if not isinstance(request.tied_parameter_pairs, tuple):
+        raise InvariantError("deferred reload tied parameter pairs are invalid")
+    for pair in request.tied_parameter_pairs:
+        if (
+            not isinstance(pair, tuple)
+            or len(pair) != 2
+            or any(not isinstance(name, str) or name not in request.expected_parameter_shapes for name in pair)
+            or pair[0] == pair[1]
+            or request.expected_parameter_shapes[pair[0]] != request.expected_parameter_shapes[pair[1]]
+        ):
+            raise InvariantError("deferred reload tied parameter pairs are invalid")
+    if len(set(request.tied_parameter_pairs)) != len(request.tied_parameter_pairs):
+        raise InvariantError("deferred reload tied parameter pairs are invalid")
+    device_map = request.device_map
+    dtype_name = request.dtype
+    attention_implementation = request.attention_implementation
+    if not isinstance(device_map, str) or not device_map:
+        raise InvariantError("deferred reload model configuration is invalid")
+    if not isinstance(dtype_name, str) or not dtype_name:
+        raise InvariantError("deferred reload model configuration is invalid")
+    if not isinstance(attention_implementation, str) or not attention_implementation:
+        raise InvariantError("deferred reload model configuration is invalid")
+    dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
+        raise InvariantError("deferred reload dtype is invalid")
+    for value in (request.atol, request.rtol):
+        if not _finite_number(value) or value < 0:
+            raise InvariantError("deferred reload probe tolerances are invalid")
+    if not _finite_number(request.timeout_seconds) or request.timeout_seconds <= 0:
+        raise InvariantError("deferred reload timeout is invalid")
+    if (
+        not isinstance(request.processor_fingerprints, dict)
+        or set(request.processor_fingerprints) != {"processor_sha256", "tokenizer_sha256"}
+        or any(not _is_sha256(value) for value in request.processor_fingerprints.values())
+    ):
+        raise InvariantError("deferred reload processor fingerprints are invalid")
+    if not isinstance(request.verify_target_trajectory, bool):
+        raise InvariantError("deferred reload target trajectory setting is invalid")
+    if (
+        not isinstance(request.target_trajectory_max_new_tokens, int)
+        or isinstance(request.target_trajectory_max_new_tokens, bool)
+        or request.target_trajectory_max_new_tokens < 1
+    ):
+        raise InvariantError("deferred reload target trajectory length is invalid")
+    if not _is_sha256(request.expected_generation_config_hash):
+        raise InvariantError("deferred reload generation configuration hash is invalid")
+    if (
+        not _is_sha256(request.export_implementation_hash)
+        or request.export_implementation_hash != export_implementation_hash()
+    ):
+        raise InvariantError("deferred reload implementation hash is invalid")
+    if not isinstance(request.seed, int) or isinstance(request.seed, bool):
+        raise InvariantError("deferred reload seed is invalid")
+    if not isinstance(request.target_generation, TargetGenerationConfig):
+        raise InvariantError("deferred reload target generation configuration is invalid")
+    try:
+        ProjectConfig(
+            run=RunConfig(seed=request.seed, output_dir=request.model_dir),
+            model=ModelConfig(
+                id=request.model_dir,
+                revision=request.revision,
+                dtype=dtype_name,
+                device_map=device_map,
+                attention_implementation=attention_implementation,
+            ),
+            target_generation=request.target_generation,
+        ).validate()
+    except (ConfigurationError, AttributeError, TypeError, ValueError) as error:
+        raise InvariantError("deferred reload configuration is invalid") from error
+
+
+def _persistable_tensor(value: Any) -> bool:
+    return (
+        isinstance(value, torch.Tensor)
+        and value.layout is torch.strided
+        and value.device.type != "meta"
+        and not value.is_quantized
+        and not value.is_complex()
+    )
+
+
+def _finite_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
 def _run_deferred_reload(request: DeferredReload) -> ReloadCheckReport:
@@ -255,6 +609,17 @@ def _run_deferred_reload(request: DeferredReload) -> ReloadCheckReport:
         seed=request.seed,
         revision=request.revision,
     )
+
+
+def export_implementation_hash() -> str:
+    sources: dict[str, str] = {}
+    for value in (export_edited_model, WeightEditPlan, run_fresh_reload_check):
+        module = inspect.getmodule(value)
+        source = inspect.getsourcefile(value)
+        if module is None or source is None:
+            raise InvariantError("export implementation source is unavailable")
+        sources[module.__name__] = file_sha256(source)
+    return object_sha256(sources)
 
 
 def verify_plan_orthogonality(
@@ -502,6 +867,7 @@ def _build_manifest(
         "base_model_id": config.model.id,
         "base_revision": config.model.revision,
         "config_hash": config.config_hash,
+        "export_implementation_hash": export_implementation_hash(),
         "target_generation_config_hash": config.target_generation_config_hash,
         "effective_generation_config_hash": effective_generation_config_hash,
         "target_thinking_enabled": config.target_generation.thinking_enabled,
@@ -539,26 +905,27 @@ def _build_manifest(
 def write_export_manifest(output_dir: str | Path, manifest: Mapping[str, Any]) -> None:
     target = Path(output_dir) / "edit_manifest.json"
     value = dict(manifest)
+    value.pop("manifest_sha256", None)
+    value["manifest_sha256"] = object_sha256(value)
     ArtifactStore.write_json(target, value, private=False)
+
+
+def load_export_manifest(output_dir: str | Path) -> dict[str, Any]:
+    target = Path(output_dir) / "edit_manifest.json"
+    if target.is_symlink() or not target.is_file():
+        raise ArtifactError(f"export manifest does not exist: {target}")
     try:
-        profile = ArtifactProfile(
-            model_id=str(value["base_model_id"]),
-            model_revision=str(value["base_revision"]),
-            config_hash=str(value["config_hash"]),
-            target_generation_config_hash=str(value["target_generation_config_hash"]),
-            chat_template_hash=str(value["chat_template_hash"]),
-            judge_profile_hash=str(value["judge_profile_hash"]),
-            judge_validation_hash=str(value["judge_validation_hash"]),
-        )
-    except KeyError as error:
-        raise InvariantError(f"export manifest profile field is missing: {error.args[0]}") from error
-    metadata = ArtifactMetadata(
-        artifact_type="edit_manifest",
-        private=False,
-        content_sha256=file_sha256(target),
-        profile=profile,
-    )
-    ArtifactStore.write_json(ArtifactStore.metadata_path(target), metadata.as_dict(), private=False)
+        encoded = target.read_bytes()
+        value = json.loads(encoded)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ArtifactError(f"export manifest is invalid: {target}") from error
+    if not isinstance(value, dict) or canonical_json_bytes(value) + b"\n" != encoded:
+        raise ArtifactError(f"export manifest is invalid: {target}")
+    body = dict(value)
+    digest = body.pop("manifest_sha256", None)
+    if not _is_sha256(digest) or object_sha256(body) != digest:
+        raise ArtifactError("export manifest content hash does not match")
+    return value
 
 
 def _readme(config: ProjectConfig) -> str:
@@ -598,7 +965,12 @@ __all__ = [
     "OrthogonalityCheck",
     "ProbeEquivalence",
     "complete_deferred_reload",
+    "complete_persisted_deferred_reload",
     "export_edited_model",
+    "export_implementation_hash",
+    "load_deferred_reload",
+    "load_export_manifest",
+    "save_deferred_reload",
     "verify_plan_orthogonality",
     "write_export_manifest",
 ]

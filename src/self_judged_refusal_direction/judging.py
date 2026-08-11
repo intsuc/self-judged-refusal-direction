@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import weakref
+from subprocess import SubprocessError
 from typing import Any, Literal, Protocol, cast
 
 import torch
@@ -37,7 +38,8 @@ class TrajectoryJudge:
 
     def classify(self, trajectory: TargetTrajectory) -> JudgeResult:
         if trajectory.parser_status != "OK":
-            return self._error(trajectory.trajectory_hash, "INVALID_TRAJECTORY")
+            error_code = trajectory.error_code if trajectory.error_code is not None else "INVALID_TRAJECTORY"
+            return self._error(trajectory.trajectory_hash, error_code)
         return self.classify_input(
             JudgeInput(
                 original_prompt=trajectory.original_prompt,
@@ -65,15 +67,7 @@ class TrajectoryJudge:
             )
             self._validate_context(model, input_ids.shape[-1], decoder.max_new_tokens)
             generation_inputs = dict(rendered)
-            with torch.inference_mode():
-                output = model.generate(
-                    **generation_inputs,
-                    **JUDGE_GENERATION_OPTIONS,
-                    max_new_tokens=decoder.max_new_tokens,
-                    prefix_allowed_tokens_fn=decoder.prefix_allowed_tokens_fn,
-                    eos_token_id=decoder.eos_token_id,
-                    pad_token_id=processor.tokenizer.pad_token_id,
-                )
+            output = self._generate(model, processor, generation_inputs, decoder)
             sequences = output.sequences if hasattr(output, "sequences") else output
             suffix = sequences[0, input_ids.shape[-1] :]
             label, raw_output = decoder.parse_suffix(suffix)
@@ -86,6 +80,8 @@ class TrajectoryJudge:
                 raw_output=raw_output,
                 trajectory_hash=judge_input.input_hash,
             )
+        except ImportError, MemoryError, OSError, RuntimeError, SubprocessError:
+            raise
         except Exception as error:
             return self._error(judge_input.input_hash, type(error).__name__)
 
@@ -95,6 +91,26 @@ class TrajectoryJudge:
         if model is None or processor is None:
             raise InvariantError("judge resources are no longer available")
         return model, processor
+
+    @staticmethod
+    def _generate(
+        model: Any,
+        processor: Any,
+        generation_inputs: dict[str, Any],
+        decoder: EnumTrieConstrainedDecoder,
+    ) -> Any:
+        try:
+            with torch.inference_mode():
+                return model.generate(
+                    **generation_inputs,
+                    **JUDGE_GENERATION_OPTIONS,
+                    max_new_tokens=decoder.max_new_tokens,
+                    prefix_allowed_tokens_fn=decoder.prefix_allowed_tokens_fn,
+                    eos_token_id=decoder.eos_token_id,
+                    pad_token_id=processor.tokenizer.pad_token_id,
+                )
+        except Exception as error:
+            raise RuntimeError(f"judge generation failed: {error}") from error
 
     def _validate_context(self, model: Any, input_tokens: int, output_tokens: int) -> None:
         context = self.adapter.context_window(model)

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from subprocess import SubprocessError
 from typing import Any, Literal, Protocol, Self
 
 import torch
 
 from self_judged_refusal_direction.config import ProjectConfig, TargetGenerationConfig
-from self_judged_refusal_direction.errors import InvariantError
+from self_judged_refusal_direction.errors import InvariantError, TargetParseError, TargetParseErrorCode
 from self_judged_refusal_direction.hashing import object_sha256
 from self_judged_refusal_direction.models.base import ArchitectureAdapter, ParsedTargetOutput
 from self_judged_refusal_direction.schema import PromptRecord, TargetTrajectory
@@ -77,13 +78,18 @@ def _generated_sequence(output: Any) -> Any:
 
 def _safe_decode(processor: Any, tokens: Sequence[int]) -> str:
     try:
-        value = processor.decode(
-            list(tokens),
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-    except TypeError:
-        value = processor.decode(list(tokens), skip_special_tokens=False)
+        try:
+            value = processor.decode(
+                list(tokens),
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        except TypeError:
+            value = processor.decode(list(tokens), skip_special_tokens=False)
+    except ImportError, MemoryError, OSError, RuntimeError, SubprocessError:
+        raise
+    except Exception:
+        return ""
     return value if isinstance(value, str) else ""
 
 
@@ -220,6 +226,8 @@ class TargetTrajectoryGenerator:
                 prefix_ids=prefix_ids,
                 thinking_enabled=generation.thinking_enabled,
             )
+        except ImportError, MemoryError, OSError, RuntimeError, SubprocessError:
+            raise
         except Exception as error:
             return self._parser_error_trajectory(
                 prompt_id=resolved_prompt_id,
@@ -268,6 +276,7 @@ class TargetTrajectoryGenerator:
             "split": split,
             "seed": seed,
             "error_code": None,
+            "error_detail": None,
         }
         return TargetTrajectory(trajectory_hash=_trajectory_hash(values), **values)
 
@@ -283,7 +292,12 @@ class TargetTrajectoryGenerator:
         seed: int,
         error: Exception,
     ) -> TargetTrajectory:
-        error_code = f"TARGET_PARSE_{type(error).__name__.upper()}"
+        if isinstance(error, TargetParseError):
+            error_code = error.code.value
+            error_detail = error.detail
+        else:
+            error_code = TargetParseErrorCode.INTERNAL.value
+            error_detail = f"{type(error).__name__}: {error}"
         values = {
             "prompt_id": prompt_id,
             "original_prompt": original_prompt,
@@ -302,6 +316,7 @@ class TargetTrajectoryGenerator:
             "split": split,
             "seed": seed,
             "error_code": error_code,
+            "error_detail": error_detail,
         }
         return TargetTrajectory(trajectory_hash=_trajectory_hash(values), **values)
 

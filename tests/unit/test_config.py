@@ -56,7 +56,6 @@ def test_sampling_parameters_require_sampling() -> None:
             ProjectConfig(run=RunConfig(output_dir=OUTPUT_DIR), model=ModelConfig(revision=REVISION)),
             r"model\.id",
         ),
-        (replace(valid_config(), run=replace(valid_config().run, max_infrastructure_errors=-1)), "max_infrastructure"),
         (replace(valid_config(), model=replace(valid_config().model, revision="main")), "commit SHA"),
         (
             replace(
@@ -148,7 +147,7 @@ def test_experiment_hash_boundary() -> None:
     config = valid_config()
     operational = replace(
         config,
-        run=replace(config.run, output_dir="another-run", max_infrastructure_errors=7),
+        run=replace(config.run, output_dir="another-run"),
         export=replace(config.export, max_shard_size="1GB", edit_chunk_rows=128),
     )
 
@@ -163,6 +162,9 @@ def test_experiment_hash_boundary() -> None:
         assert changed.config_hash != config.config_hash
         assert changed.target_generation_config_hash != config.target_generation_config_hash
     assert replace(config, run=replace(config.run, seed=43)).config_hash != config.config_hash
+    error_rate_changed = replace(config, acceptance=replace(config.acceptance, max_error_rate=0.2))
+    assert error_rate_changed.config_hash == config.config_hash
+    assert error_rate_changed.target_generation_config_hash == config.target_generation_config_hash
     acceptance_changed = replace(config, acceptance=replace(config.acceptance, max_mean_kl=0.2))
     assert acceptance_changed.config_hash != config.config_hash
     assert acceptance_changed.target_generation_config_hash == config.target_generation_config_hash

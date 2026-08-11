@@ -1,7 +1,6 @@
 run:
   seed: 42
   output_dir: runs/gemma4_31b_it
-  max_infrastructure_errors: 0
 
 model:
   id: google/gemma-4-31B-it
@@ -43,7 +42,7 @@ search:
 
 acceptance:
   max_uncertain_rate: 0.05
-  max_error_rate: 0.0
+  max_error_rate: 0.05
   min_non_refusal_retention: 0.95
   max_mean_kl: 0.10
   max_ce_loss_delta: 0.10

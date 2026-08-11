@@ -10,7 +10,14 @@ import torch
 from transformers import Gemma4Config, Gemma4ForConditionalGeneration, Gemma4TextConfig
 
 from self_judged_refusal_direction.config import ExportConfig, ModelConfig, ProjectConfig, RunConfig
-from self_judged_refusal_direction.exporting import complete_deferred_reload, export_edited_model
+from self_judged_refusal_direction.errors import ArtifactError
+from self_judged_refusal_direction.exporting import (
+    complete_persisted_deferred_reload,
+    export_edited_model,
+    export_implementation_hash,
+    write_export_manifest,
+)
+from self_judged_refusal_direction.hashing import object_sha256
 from self_judged_refusal_direction.models.gemma4 import Gemma4Adapter
 from self_judged_refusal_direction.pipeline import _mean_ce_loss
 from self_judged_refusal_direction.prompting import judge_profile_hash
@@ -110,6 +117,7 @@ def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
         "attention_mask": torch.ones(2, 4, dtype=torch.long),
     }
     output_dir = tmp_path / "exported_model"
+    deferred_reload_dir = tmp_path / "deferred_reload"
     validation_hash = "judge-validation-a"
     expected_parameter_count = sum(parameter.numel() for parameter in model.parameters())
 
@@ -128,31 +136,43 @@ def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
         probe_rtol=3e-5,
         orthogonality_atol=3e-5,
         reload_timeout_seconds=60,
+        deferred_reload_directory=deferred_reload_dir,
         verify_reload_target_trajectory=False,
     )
     assert result.reload is None
     assert result.deferred_reload is not None
     assert model.model.language_model.embed_tokens.weight is model.lm_head.weight
+    assert deferred_reload_dir.stat().st_mode & 0o077 == 0
+    assert all(path.stat().st_mode & 0o077 == 0 for path in deferred_reload_dir.iterdir())
     del model
-    result = complete_deferred_reload(result)
+    report = complete_persisted_deferred_reload(deferred_reload_dir)
+    completed_manifest = {**result.manifest, "fresh_reload": report.as_dict()}
+    write_export_manifest(output_dir, completed_manifest)
 
     manifest = json.loads((output_dir / "edit_manifest.json").read_text(encoding="utf-8"))
-    manifest_metadata = json.loads((output_dir / "edit_manifest.json.meta.json").read_text(encoding="utf-8"))
+    manifest_body = dict(manifest)
+    manifest_digest = manifest_body.pop("manifest_sha256")
 
-    assert result.reload is not None
-    assert result.reload.model_module.startswith("transformers.")
-    assert result.reload.parameter_count == expected_parameter_count
-    assert result.reload.tied_weights_preserved
+    assert report.model_module.startswith("transformers.")
+    assert report.parameter_count == expected_parameter_count
+    assert report.tied_weights_preserved
     assert tuple(output_dir.glob("*.safetensors"))
     assert not tuple(output_dir.glob("*.bin"))
     assert (output_dir / "processor_config.json").is_file()
     assert manifest["base_revision"] == "a" * 40
+    assert manifest["export_implementation_hash"] == export_implementation_hash()
     assert manifest["judge_profile_hash"] == judge_profile_hash()
     assert manifest["judge_validation_hash"] == validation_hash
-    assert manifest_metadata["profile"]["judge_profile_hash"] == judge_profile_hash()
-    assert manifest_metadata["profile"]["judge_validation_hash"] == validation_hash
+    assert manifest_digest == object_sha256(manifest_body)
     assert manifest["direction_source_layer"] == 0
     assert manifest["full_validation_metrics"] == {"removal_success_rate": 0.75}
     assert manifest["fresh_reload"]["probe_logits_match"] is True
     assert manifest["temporary_permanent_equivalence"]["passed"] is True
     assert not tuple(output_dir.glob("*.private.jsonl"))
+
+    tensor_path = next(deferred_reload_dir.glob("*.private.safetensors"))
+    corrupted = bytearray(tensor_path.read_bytes())
+    corrupted[-1] ^= 1
+    tensor_path.write_bytes(corrupted)
+    with pytest.raises(ArtifactError, match="content hash"):
+        complete_persisted_deferred_reload(deferred_reload_dir)

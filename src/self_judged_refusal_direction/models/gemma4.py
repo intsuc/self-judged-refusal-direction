@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from subprocess import SubprocessError
 from typing import Any
 
 import torch
@@ -9,7 +10,12 @@ from torch import nn
 from transformers import AutoModelForMultimodalLM, AutoProcessor
 
 from self_judged_refusal_direction.config import ModelConfig, TargetGenerationConfig
-from self_judged_refusal_direction.errors import CompatibilityError, InvariantError
+from self_judged_refusal_direction.errors import (
+    CompatibilityError,
+    InvariantError,
+    TargetParseError,
+    TargetParseErrorCode,
+)
 from self_judged_refusal_direction.hashing import object_sha256
 from self_judged_refusal_direction.models.base import (
     ArchitectureAdapter,
@@ -215,23 +221,51 @@ class Gemma4Adapter(ArchitectureAdapter):
         thinking_enabled: bool = True,
     ) -> ParsedTargetOutput:
         if not isinstance(thinking_enabled, bool):
-            raise InvariantError("target thinking mode must be a boolean")
-        tokens = _token_ids(generated_ids, "generated_ids")
-        prefix = _token_ids(prefix_ids, "prefix_ids")
-        grammar = self.response_token_grammar(processor)
+            raise TargetParseError(TargetParseErrorCode.INVALID_MODE, "target thinking mode must be a boolean")
+        try:
+            tokens = _token_ids(generated_ids, "generated_ids")
+            prefix = _token_ids(prefix_ids, "prefix_ids")
+        except ImportError, MemoryError, OSError, RuntimeError, SubprocessError:
+            raise
+        except Exception as error:
+            raise TargetParseError(
+                TargetParseErrorCode.INVALID_INPUT,
+                f"{type(error).__name__}: {error}",
+            ) from error
+        try:
+            grammar = self.response_token_grammar(processor)
+        except ImportError, MemoryError, OSError, RuntimeError, SubprocessError:
+            raise
+        except Exception as error:
+            raise TargetParseError(
+                TargetParseErrorCode.INVALID_GRAMMAR,
+                f"{type(error).__name__}: {error}",
+            ) from error
         if thinking_enabled:
             if tokens[: len(grammar.thinking_open)] != grammar.thinking_open:
-                raise InvariantError("thinking output does not start with the official response delimiter")
+                raise TargetParseError(
+                    TargetParseErrorCode.THINKING_OPEN_MISSING,
+                    "thinking output does not start with the official response delimiter",
+                )
             thinking_start = len(grammar.thinking_open)
             thinking_end = _find_sequence(tokens, grammar.thinking_close, thinking_start)
             if thinking_end is None:
-                raise InvariantError("thinking output has no official closing delimiter")
+                raise TargetParseError(
+                    TargetParseErrorCode.THINKING_CLOSE_MISSING,
+                    "thinking output has no official closing delimiter",
+                )
             final_start = thinking_end + len(grammar.thinking_close)
         else:
             if _find_sequence(tokens, grammar.thinking_open, 0) is not None:
-                raise InvariantError("content-only output contains a thinking opening delimiter")
+                raise TargetParseError(
+                    TargetParseErrorCode.THINKING_DELIMITER_IN_CONTENT,
+                    "content-only output contains a thinking opening delimiter",
+                )
             if _find_sequence(tokens, grammar.thinking_close, 0) is not None:
-                raise InvariantError("content-only output contains a thinking closing delimiter")
+                raise TargetParseError(
+                    TargetParseErrorCode.THINKING_DELIMITER_IN_CONTENT,
+                    "content-only output contains a thinking closing delimiter",
+                )
             thinking_start = 0
             thinking_end = 0
             final_start = 0
@@ -247,41 +281,73 @@ class Gemma4Adapter(ArchitectureAdapter):
             pad_token_id = getattr(getattr(processor, "tokenizer", None), "pad_token_id", None)
             trailing = tokens[terminal_end:]
             if trailing and (pad_token_id is None or any(token != pad_token_id for token in trailing)):
-                raise InvariantError("generated output continues after its terminal delimiter")
+                raise TargetParseError(
+                    TargetParseErrorCode.TRAILING_TOKENS,
+                    "generated output continues after its terminal delimiter",
+                )
             final_end = terminal_start
             terminal_found = True
         else:
             if not thinking_enabled:
-                raise InvariantError("content-only output has no official terminal delimiter")
+                raise TargetParseError(
+                    TargetParseErrorCode.TERMINAL_MISSING,
+                    "content-only output has no official terminal delimiter",
+                )
             final_end = len(tokens)
             terminal_found = False
 
         try:
             parsed = processor.parse_response(list(tokens), prefix=list(prefix))
+        except ImportError, MemoryError, OSError, RuntimeError, SubprocessError:
+            raise
         except Exception as error:
-            raise InvariantError("official response parser rejected generated output") from error
+            raise TargetParseError(
+                TargetParseErrorCode.OFFICIAL_PARSER_REJECTED,
+                f"official response parser rejected generated output: {type(error).__name__}: {error}",
+            ) from error
         if isinstance(parsed, list) and len(parsed) == 1:
             parsed = parsed[0]
         if not isinstance(parsed, Mapping):
-            raise InvariantError("official response parser did not return one message")
+            raise TargetParseError(
+                TargetParseErrorCode.OFFICIAL_RESPONSE_INVALID,
+                "official response parser did not return one message",
+            )
         thinking_text = parsed.get("thinking", "")
         final_answer = parsed.get("content", "")
         if not isinstance(thinking_text, str) or not isinstance(final_answer, str):
-            raise InvariantError("official response parser returned non-text response fields")
+            raise TargetParseError(
+                TargetParseErrorCode.RESPONSE_FIELDS_INVALID,
+                "official response parser returned non-text response fields",
+            )
         if not thinking_enabled and thinking_text:
-            raise InvariantError("official response parser found thinking in content-only output")
-        decoded_final = _decode(processor, tokens[final_start:final_end])
-        if thinking_enabled:
-            decoded_thinking = _decode(processor, tokens[thinking_start:thinking_end])
-            parser_disagrees = decoded_thinking.strip() != thinking_text or decoded_final.strip() != final_answer
-        else:
-            parser_disagrees = decoded_final.strip() != final_answer
+            raise TargetParseError(
+                TargetParseErrorCode.UNEXPECTED_THINKING,
+                "official response parser found thinking in content-only output",
+            )
+        try:
+            raw_decoded_output = _decode(processor, tokens)
+            decoded_final = _decode(processor, tokens[final_start:final_end])
+            if thinking_enabled:
+                decoded_thinking = _decode(processor, tokens[thinking_start:thinking_end])
+                parser_disagrees = decoded_thinking.strip() != thinking_text or decoded_final.strip() != final_answer
+            else:
+                parser_disagrees = decoded_final.strip() != final_answer
+        except ImportError, MemoryError, OSError, RuntimeError, SubprocessError:
+            raise
+        except Exception as error:
+            raise TargetParseError(
+                TargetParseErrorCode.DECODE_FAILED,
+                f"{type(error).__name__}: {error}",
+            ) from error
         if parser_disagrees:
-            raise InvariantError("official response parser disagrees with token grammar boundaries")
+            raise TargetParseError(
+                TargetParseErrorCode.BOUNDARY_MISMATCH,
+                "official response parser disagrees with token grammar boundaries",
+            )
 
         return ParsedTargetOutput(
             raw_generated_token_ids=tokens,
-            raw_decoded_output=_decode(processor, tokens),
+            raw_decoded_output=raw_decoded_output,
             thinking_text=thinking_text,
             final_answer=final_answer,
             thinking_token_start=thinking_start,

@@ -15,7 +15,7 @@ from self_judged_refusal_direction.config import (
     RunConfig,
     TargetGenerationConfig,
 )
-from self_judged_refusal_direction.errors import InvariantError
+from self_judged_refusal_direction.errors import InvariantError, TargetParseError, TargetParseErrorCode
 from self_judged_refusal_direction.generation import TargetTrajectoryGenerator, resolved_generation_kwargs
 from self_judged_refusal_direction.hashing import object_sha256
 from self_judged_refusal_direction.models.base import ParsedTargetOutput
@@ -36,6 +36,12 @@ class ProcessorSpy:
     def decode(self, tokens: list[int], **kwargs: Any) -> str:
         del kwargs
         return " ".join(str(token) for token in tokens)
+
+
+class BrokenDecoderProcessor(ProcessorSpy):
+    def decode(self, tokens: list[int], **kwargs: Any) -> str:
+        del tokens, kwargs
+        raise ValueError("decoder failure")
 
 
 class ModelSpy:
@@ -121,6 +127,32 @@ class AdapterSpy:
             final_token_end=1,
             terminal_found=True,
         )
+
+
+class FailingAdapterSpy(AdapterSpy):
+    def parse_target_trajectory(
+        self,
+        processor: Any,
+        generated_ids: tuple[int, ...],
+        *,
+        prefix_ids: tuple[int, ...],
+        thinking_enabled: bool,
+    ) -> ParsedTargetOutput:
+        del processor, generated_ids, prefix_ids, thinking_enabled
+        raise TargetParseError(TargetParseErrorCode.TERMINAL_MISSING, "private parser detail")
+
+
+class RuntimeFailingAdapterSpy(AdapterSpy):
+    def parse_target_trajectory(
+        self,
+        processor: Any,
+        generated_ids: tuple[int, ...],
+        *,
+        prefix_ids: tuple[int, ...],
+        thinking_enabled: bool,
+    ) -> ParsedTargetOutput:
+        del processor, generated_ids, prefix_ids, thinking_enabled
+        raise RuntimeError("parser runtime failed")
 
 
 class RuntimeSpy:
@@ -211,6 +243,32 @@ def test_generation_uses_target_profile_and_hashes_resolved_model_defaults() -> 
         }
     )
     assert trajectory.parser_status == "OK"
+
+
+def test_generation_preserves_structured_parser_diagnostics() -> None:
+    config = ProjectConfig(
+        run=RunConfig(seed=17),
+        model=ModelConfig(revision="a" * 40),
+        target_generation=TargetGenerationConfig(thinking_enabled=False, max_new_tokens=24),
+        data=DataConfig(max_text_tokens=32),
+    )
+    runtime = RuntimeSpy(config)
+    runtime.adapter = FailingAdapterSpy()
+    runtime.processor = BrokenDecoderProcessor()
+
+    trajectory = TargetTrajectoryGenerator(cast(Any, runtime)).generate("request", prompt_id="prompt")
+
+    assert trajectory.parser_status == "ERROR"
+    assert trajectory.error_code == TargetParseErrorCode.TERMINAL_MISSING.value
+    assert trajectory.error_detail == "private parser detail"
+    assert trajectory.raw_generated_token_ids == (9, 3)
+    assert trajectory.raw_decoded_output == ""
+    assert trajectory.thinking_text == ""
+    assert trajectory.final_answer == ""
+
+    runtime.adapter = RuntimeFailingAdapterSpy()
+    with pytest.raises(RuntimeError, match="parser runtime failed"):
+        TargetTrajectoryGenerator(cast(Any, runtime)).generate("request", prompt_id="prompt")
 
 
 def test_resolved_generation_kwargs_rejects_explicit_sampling_controls_for_effective_greedy() -> None:

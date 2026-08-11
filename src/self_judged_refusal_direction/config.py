@@ -31,7 +31,6 @@ def _non_negative_integer(value: Any) -> bool:
 class RunConfig:
     seed: int = 42
     output_dir: str | None = None
-    max_infrastructure_errors: int = 0
 
 
 @dataclass(frozen=True)
@@ -87,7 +86,7 @@ class SearchConfig:
 @dataclass(frozen=True)
 class AcceptanceConfig:
     max_uncertain_rate: float = 0.05
-    max_error_rate: float = 0.0
+    max_error_rate: float = 0.05
     min_non_refusal_retention: float = 0.95
     max_mean_kl: float = 0.10
     max_ce_loss_delta: float = 0.10
@@ -112,6 +111,8 @@ class ProjectConfig:
 
     @property
     def config_hash(self) -> str:
+        acceptance = dataclasses.asdict(self.acceptance)
+        acceptance.pop("max_error_rate")
         return object_sha256(
             {
                 "seed": self.run.seed,
@@ -125,7 +126,7 @@ class ProjectConfig:
                 "target_generation": self.target_generation,
                 "data": self.data,
                 "search": self.search,
-                "acceptance": self.acceptance,
+                "acceptance": acceptance,
             }
         )
 
@@ -151,8 +152,6 @@ class ProjectConfig:
             errors.append("run.seed must be an integer")
         if not isinstance(self.run.output_dir, str) or not self.run.output_dir.strip():
             errors.append("run.output_dir must be a non-empty string")
-        if not _non_negative_integer(self.run.max_infrastructure_errors):
-            errors.append("run.max_infrastructure_errors must be a non-negative integer")
         for name, value in (
             ("model.id", self.model.id),
             ("model.dtype", self.model.dtype),

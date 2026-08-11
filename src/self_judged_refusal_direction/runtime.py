@@ -324,6 +324,10 @@ class IntervenedModelRuntime(_ModelRuntime):
             raise InvariantError("intervened runtime has no weight edit plan")
         return self._weight_edit_plan
 
+    @property
+    def checkpoint_checksum(self) -> str:
+        return _checkpoint_checksum(self.config, self.adapter, self.model)
+
     def load(self) -> Self:
         if self.loaded:
             return self

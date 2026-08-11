@@ -54,6 +54,7 @@ class TargetTrajectory:
     split: Literal["train", "validation", "test"] | None = None
     seed: int = 42
     error_code: str | None = None
+    error_detail: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -215,6 +216,7 @@ class CandidateMetrics:
     mean_final_tokens_delta: float
     task_completion_proxy: float
     activation_addition_induction_rate: float | None = None
+    activation_addition_error_rate: float | None = None
     hard_filter_passed: bool = False
     rejection_reasons: tuple[str, ...] = ()
 

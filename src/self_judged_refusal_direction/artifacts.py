@@ -31,6 +31,8 @@ class ArtifactProfile:
     judge_profile_hash: str | None = None
     judge_fixture_hash: str | None = None
     judge_validation_hash: str | None = None
+    baseline_generation_hash: str | None = None
+    baseline_judgment_hash: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -82,20 +84,36 @@ class ArtifactPaths:
         return self.preflight / "judge_results.jsonl"
 
     @property
-    def splits(self) -> Path:
-        return self.data / "splits.jsonl"
+    def baseline_generation(self) -> Path:
+        return self.data / "baseline_generation.json"
 
     @property
-    def test_prompts(self) -> Path:
-        return self.data / "test_prompts.jsonl"
+    def baseline_generation_attempt(self) -> Path:
+        return self.data / "baseline_generation_attempt.json"
 
     @property
-    def baseline_trajectories(self) -> Path:
-        return self.data / "baseline_trajectories.private.jsonl"
+    def baseline_generation_errors(self) -> Path:
+        return self.data / "baseline_generation_errors.private.jsonl"
 
     @property
-    def baseline_judgments(self) -> Path:
-        return self.data / "baseline_judgments.jsonl"
+    def baseline_generation_checkpoint(self) -> Path:
+        return self.data / ".baseline-generation-checkpoint"
+
+    @property
+    def baseline_judgment(self) -> Path:
+        return self.data / "baseline_judgment.json"
+
+    @property
+    def baseline_judgment_attempt(self) -> Path:
+        return self.data / "baseline_judgment_attempt.json"
+
+    @property
+    def baseline_judgment_errors(self) -> Path:
+        return self.data / "baseline_judgment_errors.private.jsonl"
+
+    @property
+    def baseline_judgment_checkpoint(self) -> Path:
+        return self.data / ".baseline-judgment-checkpoint"
 
     @property
     def labeled_train(self) -> Path:
@@ -182,6 +200,8 @@ class ArtifactStore:
         judge_profile_hash: str | None = None,
         judge_fixture_hash: str | None = None,
         judge_validation_hash: str | None = None,
+        baseline_generation_hash: str | None = None,
+        baseline_judgment_hash: str | None = None,
     ) -> ArtifactProfile:
         if self.config.model.id is None:
             raise ArtifactError("model ID is required")
@@ -194,6 +214,8 @@ class ArtifactStore:
             judge_profile_hash=judge_profile_hash,
             judge_fixture_hash=judge_fixture_hash,
             judge_validation_hash=judge_validation_hash,
+            baseline_generation_hash=baseline_generation_hash,
+            baseline_judgment_hash=baseline_judgment_hash,
         )
 
     def initialize_run(self) -> None:
@@ -252,15 +274,23 @@ class ArtifactStore:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         count = 0
-        with tempfile.NamedTemporaryFile("wb", dir=target.parent, delete=False) as stream:
-            temporary = Path(stream.name)
-            for record in records:
-                as_dict = getattr(record, "as_dict", None)
-                value = as_dict() if callable(as_dict) else asdict(record) if is_dataclass(record) else record
-                stream.write(canonical_json_bytes(value) + b"\n")
-                count += 1
-        os.chmod(temporary, 0o600 if private else 0o644)
-        temporary.replace(target)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile("wb", dir=target.parent, delete=False) as stream:
+                temporary = Path(stream.name)
+                for record in records:
+                    as_dict = getattr(record, "as_dict", None)
+                    value = as_dict() if callable(as_dict) else asdict(record) if is_dataclass(record) else record
+                    stream.write(canonical_json_bytes(value) + b"\n")
+                    count += 1
+                os.chmod(temporary, 0o600 if private else 0o644)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(target)
+            self._fsync_directory(target.parent)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         metadata = ArtifactMetadata(
             artifact_type=artifact_type,
             private=private,
@@ -361,8 +391,26 @@ class ArtifactStore:
     @staticmethod
     def _atomic_write(path: Path, content: bytes, private: bool) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as stream:
-            temporary = Path(stream.name)
-            stream.write(content)
-        os.chmod(temporary, 0o600 if private else 0o644)
-        temporary.replace(path)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
+                os.chmod(temporary, 0o600 if private else 0o644)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+            ArtifactStore._fsync_directory(path.parent)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        if os.name == "nt":
+            return
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)

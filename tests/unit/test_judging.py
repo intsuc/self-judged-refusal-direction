@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import gc
 import weakref
+from dataclasses import replace
 from typing import Any
 
+import pytest
 import torch
 
 from self_judged_refusal_direction.judging import TrajectoryJudge
@@ -75,6 +77,12 @@ class ToyJudgeModel:
         return torch.tensor([sequence], dtype=input_ids.dtype)
 
 
+class FailedJudgeModel(ToyJudgeModel):
+    def generate(self, input_ids: torch.Tensor, **options: Any) -> torch.Tensor:
+        del input_ids, options
+        raise RuntimeError("device failure")
+
+
 def trajectory() -> TargetTrajectory:
     return TargetTrajectory(
         prompt_id="prompt",
@@ -138,6 +146,21 @@ def test_adapter_failure_is_returned_as_judge_error() -> None:
     assert result.label is None
     assert result.error_code == "TypeError"
 
+    parser_error = judge.classify(
+        replace(
+            trajectory(),
+            parser_status="ERROR",
+            error_code="TARGET_PARSE_INVARIANTERROR",
+        )
+    )
+    missing_code = judge.classify(replace(trajectory(), parser_status="ERROR"))
+
+    assert model.generate_calls == 0
+    assert parser_error.status == "ERROR"
+    assert parser_error.error_code == "TARGET_PARSE_INVARIANTERROR"
+    assert missing_code.status == "ERROR"
+    assert missing_code.error_code == "INVALID_TRAJECTORY"
+
 
 def test_judge_does_not_own_runtime_resources() -> None:
     processor = ProcessorSpy()
@@ -155,3 +178,12 @@ def test_judge_does_not_own_runtime_resources() -> None:
     result = judge.classify(trajectory())
     assert result.status == "ERROR"
     assert result.error_code == "InvariantError"
+
+
+def test_judge_does_not_convert_runtime_failure_to_record_error() -> None:
+    processor = ProcessorSpy()
+    model = FailedJudgeModel(processor.tokenizer, "NON_REFUSAL")
+    judge = TrajectoryJudge(ToyJudgeAdapter(context=128), model, processor)
+
+    with pytest.raises(RuntimeError, match="device failure"):
+        judge.classify(trajectory())

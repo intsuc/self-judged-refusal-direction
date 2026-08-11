@@ -11,7 +11,6 @@ from typing import Literal
 
 from tqdm import tqdm
 
-from self_judged_refusal_direction.artifacts import ArtifactProfile, ArtifactStore
 from self_judged_refusal_direction.config import DataConfig, ProjectConfig
 from self_judged_refusal_direction.errors import ArtifactError, ConfigurationError, InvariantError
 from self_judged_refusal_direction.hashing import object_sha256
@@ -296,25 +295,3 @@ def records_by_split(records: Iterable[PromptRecord]) -> dict[SplitName, list[Pr
     for record in records:
         result[record.split].append(record)
     return result
-
-
-def write_prompt_split_artifacts(
-    store: ArtifactStore,
-    records: Sequence[PromptRecord],
-    *,
-    profile: ArtifactProfile,
-) -> None:
-    store.write_jsonl(
-        store.paths.splits,
-        records,
-        artifact_type="prompt_splits",
-        profile=profile,
-        private=False,
-    )
-    store.write_jsonl(
-        store.paths.test_prompts,
-        (record for record in records if record.split == "test"),
-        artifact_type="test_prompts",
-        profile=profile,
-        private=False,
-    )

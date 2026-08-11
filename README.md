@@ -60,11 +60,15 @@ The preflight checks and pipeline stages can also be run separately:
 
 `null` decoding parameters inherit the loaded model's generation configuration.
 
+`acceptance.max_error_rate` limits `ERROR` records divided by input records for each generation and judging stage and
+for each candidate. Changing only this threshold reuses completed model calls and recomputes candidate selection. Use
+a new output directory if that changes the selected export after independent test evaluation begins. Judge validation
+requires every packaged case to match.
+
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `run.seed` | `42` | Seed used for dataset splitting and target generation. |
 | `run.output_dir` | required | Directory for run artifacts and the exported checkpoint. |
-| `run.max_infrastructure_errors` | `0` | Maximum parser or infrastructure errors allowed before a pipeline step fails. |
 | `model.id` | required | Hugging Face model ID or local checkpoint path. |
 | `model.revision` | required | Base checkpoint commit SHA. |
 | `model.dtype` | `bfloat16` | Floating-point dtype used to load the model. |
@@ -96,7 +100,7 @@ The preflight checks and pipeline stages can also be run separately:
 | `search.pilot_evaluation_keep` | `5` | Maximum directions retained after the pilot evaluation. |
 | `search.pilot_prompts_per_class` | `16` | Validation prompts per refusal class used by the pilot evaluation. |
 | `acceptance.max_uncertain_rate` | `0.05` | Largest allowed semantic-uncertainty rate for a candidate. |
-| `acceptance.max_error_rate` | `0.0` | Largest allowed parser or infrastructure error rate for a candidate. |
+| `acceptance.max_error_rate` | `0.05` | Largest allowed parser or judge `ERROR` rate for each stage and candidate. |
 | `acceptance.min_non_refusal_retention` | `0.95` | Smallest allowed fraction of baseline non-refusals that remain non-refusals. |
 | `acceptance.max_mean_kl` | `0.10` | Largest allowed mean next-token KL divergence on baseline non-refusal prompts. |
 | `acceptance.max_ce_loss_delta` | `0.10` | Largest allowed increase in mean CE loss on reference text. |
@@ -111,10 +115,11 @@ The adapter is selected from the pinned checkpoint's `model_type`. The included 
 
 ## Artifacts and privacy
 
-Artifacts are content-hashed and tied to the pinned checkpoint, target-generation settings, and tokenizer/chat-template
-fingerprints before reuse. Raw parsed trajectories can contain model thinking and are written with owner-only
-permissions. They are never copied into the exported checkpoint. The pipeline does not push models or artifacts to a
-Hub or expose a public endpoint.
+Artifacts are content-hashed and tied to their model, inputs, runtime profiles, and upstream results. Each completed
+generation or judgment is saved before the next input, and rerunning the same stage resumes its matching checkpoint.
+Error summaries show stable reason codes and point to owner-only diagnostics. Prompt text, generated tokens, parsed
+responses, and private checkpoints use owner-only permissions and are not copied into the exported checkpoint. The
+pipeline does not publish models or artifacts.
 
 ## References
 

@@ -43,6 +43,25 @@ def test_private_artifact_permissions_fail_closed(tmp_path) -> None:
         list(store.read_jsonl(path, artifact_type="trajectories", expected_profile=profile))
 
 
+def test_failed_jsonl_serialization_leaves_no_partial_file(tmp_path) -> None:
+    config = ProjectConfig(run=RunConfig(output_dir=str(tmp_path)), model=ModelConfig(id="model", revision="a" * 40))
+    store = ArtifactStore(config)
+    path = tmp_path / "rows.jsonl"
+    existing = set(tmp_path.iterdir())
+
+    with pytest.raises(TypeError):
+        store.write_jsonl(
+            path,
+            [{"value": 1}, {"value": object()}],
+            artifact_type="rows",
+            profile=store.profile(),
+            private=True,
+        )
+
+    assert set(tmp_path.iterdir()) == existing
+    assert not path.exists()
+
+
 def test_environment_extensions_survive_and_identity_changes_fail_closed(tmp_path) -> None:
     config = ProjectConfig(run=RunConfig(output_dir=str(tmp_path)), model=ModelConfig(id="model", revision="a" * 40))
     store = ArtifactStore(config)
