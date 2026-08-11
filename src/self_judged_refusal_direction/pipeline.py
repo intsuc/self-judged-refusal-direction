@@ -3,12 +3,13 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, cast
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from self_judged_refusal_direction.activations import (
     ActivationCollector,
@@ -70,6 +71,25 @@ from self_judged_refusal_direction.schema import (
     PromptRecord,
     TargetTrajectory,
 )
+
+
+def _progress[T](
+    values: Iterable[T],
+    *,
+    desc: str,
+    unit: str,
+    total: int | None = None,
+    leave: bool = True,
+) -> Iterable[T]:
+    return tqdm(
+        values,
+        desc=desc,
+        unit=unit,
+        total=total,
+        leave=leave,
+        dynamic_ncols=True,
+        disable=None,
+    )
 
 
 def _load(
@@ -425,7 +445,14 @@ def generate_baseline_trajectories(config_path: str) -> None:
             records = [item for item in records if item.split != "test"] + retained_test
         write_prompt_split_artifacts(store, records, profile=_profile(store))
         baseline_records = [item for item in records if item.split in {"train", "validation"}]
-        trajectories = [runtime.generate_target(record) for record in baseline_records]
+        trajectories = [
+            runtime.generate_target(record)
+            for record in _progress(
+                baseline_records,
+                desc="Generating baseline trajectories",
+                unit="prompt",
+            )
+        ]
         errors = sum(item.parser_status == "ERROR" for item in trajectories)
         _check_error_budget(errors, config, "baseline trajectory generation")
         store.write_jsonl(
@@ -443,7 +470,14 @@ def judge_baseline_trajectories(config_path: str) -> None:
         validation_hash = _require_judge_validation(store, runtime)
         trajectories = _load_baseline_trajectories(store, runtime.chat_template_hash)
         judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
-        judgments = [judge.classify(trajectory) for trajectory in trajectories]
+        judgments = [
+            judge.classify(trajectory)
+            for trajectory in _progress(
+                trajectories,
+                desc="Judging baseline trajectories",
+                unit="trajectory",
+            )
+        ]
         errors = sum(item.status == "ERROR" for item in judgments)
         _check_error_budget(errors, config, "baseline trajectory judging")
         judgment_profile = _profile(
@@ -541,7 +575,11 @@ def _collect_activation_statistics(
         layers=layers,
         dtype=config.search.accumulator_dtype,
     )
-    for item in labeled:
+    for item in _progress(
+        labeled,
+        desc="Collecting activations",
+        unit="trajectory",
+    ):
         trajectory = trajectory_by_hash[item.trajectory_hash]
         rendered = runtime.adapter.render_target_chat(
             runtime.processor,
@@ -753,6 +791,7 @@ def _evaluate_candidates_phase(
     artifact_profile: ArtifactProfile,
     evaluation_phase: Literal["pilot_evaluation", "full_validation"],
 ) -> tuple[list[CandidateMetrics], dict[str, Any]]:
+    phase_desc = "Pilot evaluation" if evaluation_phase == "pilot_evaluation" else "Full validation"
     labels = {item.prompt_id: item.label for item in labeled}
     prompts = [prompt_records[item.prompt_id] for item in labeled]
     non_refusal_prompts = [prompt_records[item.prompt_id] for item in labeled if item.label == "NON_REFUSAL"]
@@ -760,16 +799,52 @@ def _evaluate_candidates_phase(
     quality: dict[str, tuple[float, float]] = {}
     with IntervenedModelRuntime(config) as runtime:
         _validate_activation_chat_profile(artifact_profile, runtime.chat_template_hash)
-        base_logits = [_next_token_logits(runtime, prompt) for prompt in non_refusal_prompts]
+        base_logits = [
+            _next_token_logits(runtime, prompt)
+            for prompt in _progress(
+                non_refusal_prompts,
+                desc=f"{phase_desc}: baseline logits",
+                unit="prompt",
+            )
+        ]
         reference_texts, reference_corpus = _resolve_reference_texts(config, runtime, reference_fallback)
-        base_ce = _mean_ce_loss(runtime, reference_texts)
-        for candidate in candidates:
+        base_ce = _mean_ce_loss(
+            runtime,
+            reference_texts,
+            desc=f"{phase_desc}: baseline CE loss",
+        )
+        for candidate in _progress(
+            candidates,
+            desc=f"{phase_desc}: candidates",
+            unit="candidate",
+        ):
             direction = bundle.direction(candidate)
             plan = runtime.adapter.build_weight_edit_plan(runtime.model, direction)
             with plan.temporary(runtime.model):
-                trajectories = [runtime.generate_target(prompt) for prompt in prompts]
-                intervention_logits = [_next_token_logits(runtime, prompt) for prompt in non_refusal_prompts]
-                intervention_ce = _mean_ce_loss(runtime, reference_texts)
+                trajectories = [
+                    runtime.generate_target(prompt)
+                    for prompt in _progress(
+                        prompts,
+                        desc=f"{phase_desc}: generating interventions",
+                        unit="prompt",
+                        leave=False,
+                    )
+                ]
+                intervention_logits = [
+                    _next_token_logits(runtime, prompt)
+                    for prompt in _progress(
+                        non_refusal_prompts,
+                        desc=f"{phase_desc}: intervention logits",
+                        unit="prompt",
+                        leave=False,
+                    )
+                ]
+                intervention_ce = _mean_ce_loss(
+                    runtime,
+                    reference_texts,
+                    desc=f"{phase_desc}: intervention CE loss",
+                    leave=False,
+                )
             mean_kl = mean_next_token_kl(base_logits, intervention_logits) if base_logits else 0.0
             quality[candidate.candidate_id] = (mean_kl, intervention_ce - base_ce)
             trajectory_rows.extend(
@@ -785,7 +860,15 @@ def _evaluate_candidates_phase(
                 block_name = _transformer_block_name(runtime, candidate.layer)
                 coefficient = beta * candidate.norm
                 with plan.activation_addition(runtime.model, block_name, coefficient):
-                    additions = [runtime.generate_target(prompt) for prompt in non_refusal_prompts]
+                    additions = [
+                        runtime.generate_target(prompt)
+                        for prompt in _progress(
+                            non_refusal_prompts,
+                            desc=f"{phase_desc}: addition diagnostic",
+                            unit="prompt",
+                            leave=False,
+                        )
+                    ]
                 trajectory_rows.extend(
                     {
                         "candidate_id": candidate.candidate_id,
@@ -813,7 +896,11 @@ def _evaluate_candidates_phase(
         _require_judge_validation(store, runtime)
         _validate_activation_chat_profile(artifact_profile, runtime.chat_template_hash)
         judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
-        for row in trajectory_rows:
+        for row in _progress(
+            trajectory_rows,
+            desc=f"{phase_desc}: judging trajectories",
+            unit="trajectory",
+        ):
             trajectory = TargetTrajectory.from_dict(row["trajectory"])
             result = judge.classify(trajectory)
             judgment_rows.append(
@@ -901,7 +988,13 @@ def _next_token_logits(
     return output.logits[0, -1].detach().float().cpu()
 
 
-def _mean_ce_loss(runtime: BaseModelRuntime | IntervenedModelRuntime, texts: Sequence[str]) -> float:
+def _mean_ce_loss(
+    runtime: BaseModelRuntime | IntervenedModelRuntime,
+    texts: Sequence[str],
+    *,
+    desc: str = "Evaluating CE loss",
+    leave: bool = True,
+) -> float:
     if not texts:
         return 0.0
     losses: list[float] = []
@@ -913,7 +1006,12 @@ def _mean_ce_loss(runtime: BaseModelRuntime | IntervenedModelRuntime, texts: Seq
     if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
         raise InvariantError("CE-loss evaluation LM head has no matrix weight")
     chunk_positions = max(1, 1_048_576 // weight.shape[0])
-    for text in texts:
+    for text in _progress(
+        texts,
+        desc=desc,
+        unit="text",
+        leave=leave,
+    ):
         encoded = runtime.processor.tokenizer(text, return_tensors="pt", add_special_tokens=True)
         inputs = _move_inputs(dict(encoded), device)
         input_ids = inputs["input_ids"]
@@ -931,7 +1029,13 @@ def _mean_ce_loss(runtime: BaseModelRuntime | IntervenedModelRuntime, texts: Seq
                 shifted_targets.masked_fill_(attention_mask[:, 1:] == 0, -100)
             total_loss = 0.0
             token_count = 0
-            for start in range(0, shifted_states.shape[1], chunk_positions):
+            chunks = range(0, shifted_states.shape[1], chunk_positions)
+            for start in _progress(
+                chunks,
+                desc=f"{desc}: chunks",
+                unit="chunk",
+                leave=False,
+            ):
                 stop = min(start + chunk_positions, shifted_states.shape[1])
                 logits = head(shifted_states[:, start:stop, :])
                 logits = _apply_final_logit_softcap(model, logits)
@@ -1173,9 +1277,23 @@ def evaluate_export(config_path: str) -> None:
         prompts = [PromptRecord.from_dict(row) for row in test_prompt_rows]
         if not prompts or any(prompt.split != "test" for prompt in prompts):
             raise PipelineError("independent test artifact must contain only test prompts")
-        baseline_trajectories = [runtime.generate_target(prompt) for prompt in prompts]
+        baseline_trajectories = [
+            runtime.generate_target(prompt)
+            for prompt in _progress(
+                prompts,
+                desc="Generating test baseline",
+                unit="prompt",
+            )
+        ]
         judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
-        baseline_judgments = [judge.classify(trajectory) for trajectory in baseline_trajectories]
+        baseline_judgments = [
+            judge.classify(trajectory)
+            for trajectory in _progress(
+                baseline_trajectories,
+                desc="Judging test baseline",
+                unit="trajectory",
+            )
+        ]
         chat_template_hash = runtime.chat_template_hash
         base_checkpoint_checksum = runtime.checkpoint_checksum
         baseline_by_hash = {item.trajectory_hash: item for item in baseline_judgments}
@@ -1185,13 +1303,20 @@ def evaluate_export(config_path: str) -> None:
             if result.status == "OK" and result.label in {"REFUSAL", "NON_REFUSAL"}:
                 baseline_labels[trajectory.prompt_id] = result.label
         non_refusal_prompts = [prompt for prompt in prompts if baseline_labels.get(prompt.prompt_id) == "NON_REFUSAL"]
-        base_logits = [_next_token_logits(runtime, prompt) for prompt in non_refusal_prompts]
+        base_logits = [
+            _next_token_logits(runtime, prompt)
+            for prompt in _progress(
+                non_refusal_prompts,
+                desc="Computing test baseline logits",
+                unit="prompt",
+            )
+        ]
         reference_texts, reference_corpus = _resolve_reference_texts(
             config,
             runtime,
             [prompt.original_prompt for prompt in non_refusal_prompts],
         )
-        base_ce = _mean_ce_loss(runtime, reference_texts)
+        base_ce = _mean_ce_loss(runtime, reference_texts, desc="Computing test baseline CE loss")
         del judge
     baseline_errors = sum(item.status == "ERROR" for item in baseline_judgments)
     _check_error_budget(baseline_errors, config, "test baseline judging")
@@ -1225,9 +1350,23 @@ def evaluate_export(config_path: str) -> None:
         fingerprints = runtime.adapter.processor_fingerprints(runtime.processor)
         if any(manifest.get(name) != value for name, value in fingerprints.items()):
             raise InvariantError("exported processor fingerprint differs from the export manifest")
-        export_trajectories = [runtime.generate_target(prompt) for prompt in prompts]
-        export_logits = [_next_token_logits(runtime, prompt) for prompt in non_refusal_prompts]
-        export_ce = _mean_ce_loss(runtime, reference_texts)
+        export_trajectories = [
+            runtime.generate_target(prompt)
+            for prompt in _progress(
+                prompts,
+                desc="Generating test export",
+                unit="prompt",
+            )
+        ]
+        export_logits = [
+            _next_token_logits(runtime, prompt)
+            for prompt in _progress(
+                non_refusal_prompts,
+                desc="Computing test export logits",
+                unit="prompt",
+            )
+        ]
+        export_ce = _mean_ce_loss(runtime, reference_texts, desc="Computing test export CE loss")
     export_generation_errors = sum(item.parser_status == "ERROR" for item in export_trajectories)
     _check_error_budget(export_generation_errors, config, "test export trajectory generation")
     with BaseModelRuntime(config) as runtime:
@@ -1235,7 +1374,14 @@ def evaluate_export(config_path: str) -> None:
         if runtime.checkpoint_checksum != base_checkpoint_checksum:
             raise InvariantError("test judges did not use the same immutable base checkpoint")
         judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
-        export_judgments = [judge.classify(trajectory) for trajectory in export_trajectories]
+        export_judgments = [
+            judge.classify(trajectory)
+            for trajectory in _progress(
+                export_trajectories,
+                desc="Judging test export",
+                unit="trajectory",
+            )
+        ]
         del judge
     export_judge_errors = sum(item.status == "ERROR" for item in export_judgments)
     _check_error_budget(export_judge_errors, config, "test export trajectory judging")
@@ -1378,12 +1524,24 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def run_pipeline(config_path: str) -> None:
-    inspect_model(config_path)
-    _ensure_judge_validation(config_path)
-    generate_baseline_trajectories(config_path)
-    judge_baseline_trajectories(config_path)
-    collect_activations(config_path)
-    build_direction_candidates(config_path)
-    evaluate_candidates(config_path)
-    export_model(config_path)
-    evaluate_export(config_path)
+    stages = (
+        ("inspect model", inspect_model),
+        ("validate judge", _ensure_judge_validation),
+        ("generate baselines", generate_baseline_trajectories),
+        ("judge baselines", judge_baseline_trajectories),
+        ("collect activations", collect_activations),
+        ("build candidates", build_direction_candidates),
+        ("evaluate candidates", evaluate_candidates),
+        ("export model", export_model),
+        ("evaluate export", evaluate_export),
+    )
+    progress = tqdm(
+        stages,
+        desc="Pipeline",
+        unit="stage",
+        dynamic_ncols=True,
+        disable=None,
+    )
+    for name, stage in progress:
+        progress.set_postfix_str(name)
+        stage(config_path)

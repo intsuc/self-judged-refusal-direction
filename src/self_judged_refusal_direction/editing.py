@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from tqdm import tqdm
 
 from self_judged_refusal_direction.errors import InvariantError
 from self_judged_refusal_direction.hashing import object_sha256, tensor_sha256
@@ -238,7 +239,13 @@ class WeightEditPlan:
         edited: list[str] = []
         seen: dict[tuple[Any, ...], tuple[ProjectionKind, str]] = {}
         with torch.no_grad():
-            for operation in self.operations:
+            for operation in tqdm(
+                self.operations,
+                desc="Applying weight edits",
+                unit="parameter",
+                dynamic_ncols=True,
+                disable=None,
+            ):
                 parameter = _get_parameter(model, operation.parameter_name)
                 identity = _alias_identity(parameter)
                 signature = (operation.projection_kind, operation.vector_key)
@@ -535,7 +542,14 @@ def _apply_projection(
 ) -> None:
     direction = vector.to(device=parameter.device, dtype=torch.float32)
     if kind is ProjectionKind.RIGHT:
-        for start in range(0, parameter.shape[0], chunk_size):
+        for start in tqdm(
+            range(0, parameter.shape[0], chunk_size),
+            desc="Applying weight edit chunks",
+            unit="chunk",
+            leave=False,
+            dynamic_ncols=True,
+            disable=None,
+        ):
             stop = min(start + chunk_size, parameter.shape[0])
             block = parameter[start:stop].float()
             coefficients = torch.sum(block * direction.unsqueeze(0), dim=1, keepdim=True)
@@ -543,7 +557,14 @@ def _apply_projection(
             parameter[start:stop].copy_(block.to(dtype=parameter.dtype))
         return
     if kind is ProjectionKind.LEFT:
-        for start in range(0, parameter.shape[1], chunk_size):
+        for start in tqdm(
+            range(0, parameter.shape[1], chunk_size),
+            desc="Applying weight edit chunks",
+            unit="chunk",
+            leave=False,
+            dynamic_ncols=True,
+            disable=None,
+        ):
             stop = min(start + chunk_size, parameter.shape[1])
             block = parameter[:, start:stop].float()
             coefficients = torch.sum(direction.unsqueeze(1) * block, dim=0, keepdim=True)

@@ -5,6 +5,8 @@ from collections.abc import Sequence
 from importlib.resources import files
 from typing import Any
 
+from tqdm import tqdm
+
 from self_judged_refusal_direction.errors import ArtifactError, ConfigurationError, InvariantError
 from self_judged_refusal_direction.hashing import object_sha256
 from self_judged_refusal_direction.judging import TrajectoryJudge
@@ -109,7 +111,13 @@ def run_judge_validation(
 ) -> tuple[JudgeValidationResult, ...]:
     judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
     results: list[JudgeValidationResult] = []
-    for case in cases:
+    for case in tqdm(
+        cases,
+        desc="Validating judge",
+        unit="case",
+        dynamic_ncols=True,
+        disable=None,
+    ):
         input_hash = object_sha256(
             {
                 "case_id": case.case_id,

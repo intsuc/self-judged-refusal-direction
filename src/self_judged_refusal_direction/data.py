@@ -5,8 +5,11 @@ import re
 import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from itertools import combinations
 from pathlib import Path
 from typing import Literal
+
+from tqdm import tqdm
 
 from self_judged_refusal_direction.artifacts import ArtifactProfile, ArtifactStore
 from self_judged_refusal_direction.config import DataConfig, ProjectConfig
@@ -124,18 +127,26 @@ def assign_template_family_groups(prompts: Sequence[str], threshold: float = 0.9
     for index, signature in enumerate(signatures):
         previous = exact.setdefault(signature, index)
         disjoint.union(index, previous)
-    for left in range(len(normalized)):
-        for right in range(left + 1, len(normalized)):
-            if disjoint.find(left) == disjoint.find(right):
-                continue
-            smaller = min(len(features[left]), len(features[right]))
-            larger = max(len(features[left]), len(features[right]))
-            if larger and smaller / larger < threshold:
-                continue
-            union = features[left] | features[right]
-            similarity = len(features[left] & features[right]) / len(union) if union else 1.0
-            if similarity >= threshold:
-                disjoint.union(left, right)
+    pair_count = len(normalized) * (len(normalized) - 1) // 2
+    pairs = combinations(range(len(normalized)), 2)
+    for left, right in tqdm(
+        pairs,
+        total=pair_count,
+        desc="Grouping prompts",
+        unit="pair",
+        dynamic_ncols=True,
+        disable=None,
+    ):
+        if disjoint.find(left) == disjoint.find(right):
+            continue
+        smaller = min(len(features[left]), len(features[right]))
+        larger = max(len(features[left]), len(features[right]))
+        if larger and smaller / larger < threshold:
+            continue
+        union = features[left] | features[right]
+        similarity = len(features[left] & features[right]) / len(union) if union else 1.0
+        if similarity >= threshold:
+            disjoint.union(left, right)
     members: dict[int, list[str]] = defaultdict(list)
     for index, prompt in enumerate(normalized):
         members[disjoint.find(index)].append(prompt_deduplication_key(prompt))
@@ -170,7 +181,17 @@ def ingest_texts(
     normalized = deduplicate_prompts(texts)
     normalized = [text for text in normalized if text]
     if token_counter is not None and max_text_tokens is not None:
-        normalized = [text for text in normalized if token_counter(text) <= max_text_tokens]
+        normalized = [
+            text
+            for text in tqdm(
+                normalized,
+                desc="Filtering input text",
+                unit="text",
+                dynamic_ncols=True,
+                disable=None,
+            )
+            if token_counter(text) <= max_text_tokens
+        ]
     return normalized
 
 

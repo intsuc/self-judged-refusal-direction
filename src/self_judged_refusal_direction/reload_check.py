@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 from safetensors.torch import load_file, save_file
+from tqdm import tqdm
 
 from self_judged_refusal_direction.config import ModelConfig, TargetGenerationConfig
 from self_judged_refusal_direction.errors import InvariantError
@@ -128,21 +129,24 @@ def run_fresh_reload_check(
             "--response",
             str(response_path),
         ]
+        stream_output = sys.stderr.isatty()
         completed = subprocess.run(
             command,
+            capture_output=not stream_output,
             check=False,
-            capture_output=True,
-            text=True,
             env=environment,
+            text=True,
             timeout=timeout_seconds,
         )
         if not response_path.is_file():
-            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+            detail = (completed.stderr or completed.stdout or "").strip()
+            if not detail:
+                detail = f"exit code {completed.returncode}"
             raise InvariantError(f"fresh reload did not produce a report: {detail}")
         response = json.loads(response_path.read_text(encoding="utf-8"))
         report = ReloadCheckReport.from_dict(response)
         if completed.returncode != 0 or not report.passed:
-            detail = report.error or completed.stderr.strip() or "fresh reload verification failed"
+            detail = report.error or "fresh reload verification failed"
             raise InvariantError(detail)
         return report
 
@@ -160,7 +164,15 @@ def perform_reload_check(request: dict[str, Any]) -> ReloadCheckReport:
         attention_implementation=attention_implementation,
     )
     adapter = adapter_for_config(model_config)
-    model = adapter.load_model(model_config)
+    with tqdm(
+        total=1,
+        desc="Reloading exported model",
+        unit="model",
+        dynamic_ncols=True,
+        disable=None,
+    ) as progress:
+        model = adapter.load_model(model_config)
+        progress.update()
     model.eval()
     model.requires_grad_(False)
     actual_shapes = parameter_shapes(model)
@@ -184,8 +196,16 @@ def perform_reload_check(request: dict[str, Any]) -> ReloadCheckReport:
     expected_logits = stored["expected_logits"].float()
     input_device = _input_device(model)
     inputs = {name: value.to(input_device) for name, value in inputs.items()}
-    with torch.inference_mode():
-        output = model(**inputs, use_cache=False, logits_to_keep=1, return_dict=True)
+    with tqdm(
+        total=1,
+        desc="Probing reloaded model",
+        unit="probe",
+        dynamic_ncols=True,
+        disable=None,
+    ) as progress:
+        with torch.inference_mode():
+            output = model(**inputs, use_cache=False, logits_to_keep=1, return_dict=True)
+        progress.update()
     logits = _extract_logits(output).detach().to(device="cpu", dtype=torch.float32)
     if logits.shape != expected_logits.shape:
         raise InvariantError("fresh reload probe logits shape does not match")
@@ -230,14 +250,22 @@ def perform_reload_check(request: dict[str, Any]) -> ReloadCheckReport:
         if actual_fingerprints != expected_fingerprints:
             raise InvariantError("fresh reload processor or tokenizer fingerprint does not match")
         processor_reload_verified = True
-        target_trajectory_passed = _run_target_trajectory_probe(
-            model,
-            processor,
-            adapter,
-            int(request["target_trajectory_max_new_tokens"]),
-            target_generation,
-            int(request["seed"]),
-        )
+        with tqdm(
+            total=1,
+            desc="Generating reload trajectory",
+            unit="trajectory",
+            dynamic_ncols=True,
+            disable=None,
+        ) as progress:
+            target_trajectory_passed = _run_target_trajectory_probe(
+                model,
+                processor,
+                adapter,
+                int(request["target_trajectory_max_new_tokens"]),
+                target_generation,
+                int(request["seed"]),
+            )
+            progress.update()
     return ReloadCheckReport(
         status="OK",
         model_class=model_type.__name__,

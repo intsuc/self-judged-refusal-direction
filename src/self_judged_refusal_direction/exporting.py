@@ -13,6 +13,7 @@ import safetensors
 import torch
 import transformers
 from torch import nn
+from tqdm import tqdm
 
 from self_judged_refusal_direction.artifacts import ArtifactMetadata, ArtifactPaths, ArtifactProfile, ArtifactStore
 from self_judged_refusal_direction.config import ProjectConfig, TargetGenerationConfig
@@ -267,7 +268,13 @@ def verify_plan_orthogonality(
         raise InvariantError("orthogonality tolerance and chunk size must be valid")
     results: list[OrthogonalityCheck] = []
     seen: set[tuple[Any, ...]] = set()
-    for operation in plan.operations:
+    for operation in tqdm(
+        plan.operations,
+        desc="Verifying weight edits",
+        unit="parameter",
+        dynamic_ncols=True,
+        disable=None,
+    ):
         parameter = model.get_parameter(operation.parameter_name)
         identity = _storage_identity(parameter)
         if identity in seen:
@@ -363,13 +370,27 @@ def _maximum_projection(
     maximum = 0.0
     with torch.inference_mode():
         if kind is ProjectionKind.RIGHT:
-            for start in range(0, parameter.shape[0], chunk_size):
+            for start in tqdm(
+                range(0, parameter.shape[0], chunk_size),
+                desc="Verifying weight edit chunks",
+                unit="chunk",
+                leave=False,
+                dynamic_ncols=True,
+                disable=None,
+            ):
                 block = parameter[start : start + chunk_size].float()
                 value = torch.sum(block * direction.unsqueeze(0), dim=1)
                 maximum = max(maximum, float(torch.max(torch.abs(value)).item()))
             return maximum
         if kind is ProjectionKind.LEFT:
-            for start in range(0, parameter.shape[1], chunk_size):
+            for start in tqdm(
+                range(0, parameter.shape[1], chunk_size),
+                desc="Verifying weight edit chunks",
+                unit="chunk",
+                leave=False,
+                dynamic_ncols=True,
+                disable=None,
+            ):
                 block = parameter[:, start : start + chunk_size].float()
                 value = torch.sum(direction.unsqueeze(1) * block, dim=0)
                 maximum = max(maximum, float(torch.max(torch.abs(value)).item()))
@@ -399,18 +420,36 @@ def _untouched_hashes(model: nn.Module, plan: WeightEditPlan) -> dict[str, str]:
     edited_identities = {
         _storage_identity(model.get_parameter(operation.parameter_name)) for operation in plan.operations
     }
-    return {
-        name: tensor_sha256(parameter)
-        for name, parameter in parameters.items()
-        if _storage_identity(parameter) not in edited_identities
-    }
+    result: dict[str, str] = {}
+    for name, parameter in tqdm(
+        parameters.items(),
+        total=len(parameters),
+        desc="Hashing untouched parameters",
+        unit="parameter",
+        dynamic_ncols=True,
+        disable=None,
+    ):
+        if _storage_identity(parameter) not in edited_identities:
+            result[name] = tensor_sha256(parameter)
+    return result
 
 
 def _verify_untouched_hashes(model: nn.Module, expected: Mapping[str, str]) -> None:
     parameters = _all_named_parameters(model)
     if not set(expected) <= set(parameters):
         raise InvariantError("permanent edit removed an unedited parameter")
-    changed = [name for name, digest in expected.items() if tensor_sha256(parameters[name]) != digest]
+    changed = [
+        name
+        for name, digest in tqdm(
+            expected.items(),
+            total=len(expected),
+            desc="Verifying untouched parameters",
+            unit="parameter",
+            dynamic_ncols=True,
+            disable=None,
+        )
+        if tensor_sha256(parameters[name]) != digest
+    ]
     if changed:
         raise InvariantError(f"permanent edit changed unplanned parameters: {changed}")
 
