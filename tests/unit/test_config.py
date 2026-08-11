@@ -73,14 +73,14 @@ def test_schema_contains_only_supported_sections_and_fields() -> None:
         "repetition_penalty",
     )
     assert tuple(item.name for item in fields(DataConfig)) == (
-        "raw_prompt_files",
-        "quality_text_files",
+        "prompt_files",
+        "reference_files",
         "train_fraction",
         "validation_fraction",
         "train_per_class",
         "validation_per_class",
-        "test_raw_count",
-        "max_prompt_tokens",
+        "max_test_prompts",
+        "max_text_tokens",
         "template_similarity_threshold",
     )
     assert tuple(item.name for item in fields(SearchConfig)) == (
@@ -132,7 +132,7 @@ def test_structured_prompt_files_are_rejected() -> None:
     config = valid_config()
 
     with pytest.raises(ConfigurationError, match=r"\.txt extension"):
-        replace(config, data=replace(config.data, raw_prompt_files=("prompts.jsonl",))).validate()
+        replace(config, data=replace(config.data, prompt_files=("prompts.jsonl",))).validate()
 
 
 def test_sampling_parameters_require_sampling() -> None:

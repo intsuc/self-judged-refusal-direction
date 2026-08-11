@@ -24,14 +24,14 @@ target_generation:
   repetition_penalty: null
 
 data:
-  raw_prompt_files: []
-  quality_text_files: []
+  prompt_files: []
+  reference_files: []
   train_fraction: 0.6
   validation_fraction: 0.2
   train_per_class: 128
   validation_per_class: 64
-  test_raw_count: 256
-  max_prompt_tokens: 8192
+  max_test_prompts: 256
+  max_text_tokens: 8192
   template_similarity_threshold: 0.9
 
 search:

@@ -19,7 +19,7 @@ from self_judged_refusal_direction.artifacts import ArtifactMetadata, ArtifactPr
 from self_judged_refusal_direction.config import ProjectConfig, load_config
 from self_judged_refusal_direction.data import (
     ingest_and_split_prompts,
-    ingest_prompts,
+    ingest_texts,
     records_by_split,
     write_prompt_split_artifacts,
 )
@@ -161,10 +161,7 @@ def _validate_static_context_budget(config: ProjectConfig, runtime: BaseModelRun
     )
     context_window = runtime.adapter.context_window(runtime.model)
     judge_required = (
-        len(judge_ids)
-        + config.data.max_prompt_tokens
-        + config.target_generation.max_new_tokens
-        + decoder.max_new_tokens
+        len(judge_ids) + config.data.max_text_tokens + config.target_generation.max_new_tokens + decoder.max_new_tokens
     )
     target_rendered = runtime.adapter.render_target_chat(
         runtime.processor,
@@ -173,7 +170,7 @@ def _validate_static_context_budget(config: ProjectConfig, runtime: BaseModelRun
     )
     target_required = (
         int(target_rendered["input_ids"].shape[-1])
-        + config.data.max_prompt_tokens
+        + config.data.max_text_tokens
         + config.target_generation.max_new_tokens
     )
     if target_required > context_window:
@@ -280,10 +277,10 @@ def generate_baseline_trajectories(config_path: str) -> None:
             token_counter=lambda prompt: len(tokenizer.encode(prompt, add_special_tokens=False)),
         )
         if not records:
-            raise PipelineError("no prompts were ingested from data.raw_prompt_files")
+            raise PipelineError("no prompts were ingested from data.prompt_files")
         grouped = records_by_split(records)
-        if len(grouped["test"]) > config.data.test_raw_count:
-            retained_test = sorted(grouped["test"], key=lambda item: item.prompt_id)[: config.data.test_raw_count]
+        if len(grouped["test"]) > config.data.max_test_prompts:
+            retained_test = sorted(grouped["test"], key=lambda item: item.prompt_id)[: config.data.max_test_prompts]
             records = [item for item in records if item.split != "test"] + retained_test
         write_prompt_split_artifacts(store, records, profile=_profile(store))
         baseline_records = [item for item in records if item.split in {"train", "validation"}]
@@ -484,7 +481,7 @@ def evaluate_candidates(config_path: str) -> None:
     trajectories = _load_baseline_trajectories(store, chat_template_hash)
     baseline_trajectories = {item.prompt_id: item for item in trajectories}
     records = {item.prompt_id: item for item in _load_prompt_records(store, config)}
-    quality_fallback = [records[item.prompt_id].original_prompt for item in validation if item.label == "NON_REFUSAL"]
+    reference_fallback = [records[item.prompt_id].original_prompt for item in validation if item.label == "NON_REFUSAL"]
     pilot_labels = _balanced_subset(validation, config.search.pilot_prompts_per_class)
     pilot_metrics, _ = _evaluate_candidates_phase(
         config,
@@ -494,7 +491,7 @@ def evaluate_candidates(config_path: str) -> None:
         pilot_labels,
         records,
         baseline_trajectories,
-        quality_fallback,
+        reference_fallback,
         evaluation_phase="pilot_evaluation",
     )
     pilot_eligible = [item for item in pilot_metrics if item.hard_filter_passed]
@@ -505,7 +502,7 @@ def evaluate_candidates(config_path: str) -> None:
         for item in sorted(pilot_eligible, key=_pilot_ranking_key, reverse=True)[: config.search.pilot_evaluation_keep]
     ]
     full_validation_candidates = [by_id[candidate_id] for candidate_id in full_validation_ids]
-    full_validation_metrics, quality_evaluation = _evaluate_candidates_phase(
+    full_validation_metrics, reference_corpus = _evaluate_candidates_phase(
         config,
         store,
         bundle,
@@ -513,7 +510,7 @@ def evaluate_candidates(config_path: str) -> None:
         validation,
         records,
         baseline_trajectories,
-        quality_fallback,
+        reference_fallback,
         evaluation_phase="full_validation",
     )
     selected_metrics, selected_candidate = select_candidate(full_validation_metrics, by_id)
@@ -556,7 +553,7 @@ def evaluate_candidates(config_path: str) -> None:
             "activation_screening_count": len(ranking),
             "full_validation_count": len(full_validation_candidates),
         },
-        "quality_evaluation": quality_evaluation,
+        "reference_corpus": reference_corpus,
         "selected_candidate": selected_metadata,
     }
     _write_json_artifact(
@@ -593,7 +590,7 @@ def _evaluate_candidates_phase(
     labeled: Sequence[LabeledTrajectory],
     prompt_records: Mapping[str, PromptRecord],
     baseline_trajectories: Mapping[str, TargetTrajectory],
-    quality_fallback: Sequence[str],
+    reference_fallback: Sequence[str],
     *,
     evaluation_phase: Literal["pilot_evaluation", "full_validation"],
 ) -> tuple[list[CandidateMetrics], dict[str, Any]]:
@@ -604,15 +601,15 @@ def _evaluate_candidates_phase(
     quality: dict[str, tuple[float, float]] = {}
     with IntervenedModelRuntime(config) as runtime:
         base_logits = [_next_token_logits(runtime, prompt) for prompt in non_refusal_prompts]
-        quality_texts, quality_evaluation = _resolve_quality_texts(config, runtime, quality_fallback)
-        base_ce = _mean_ce_loss(runtime, quality_texts)
+        reference_texts, reference_corpus = _resolve_reference_texts(config, runtime, reference_fallback)
+        base_ce = _mean_ce_loss(runtime, reference_texts)
         for candidate in candidates:
             direction = bundle.direction(candidate)
             plan = runtime.adapter.build_weight_edit_plan(runtime.model, direction)
             with plan.temporary(runtime.model):
                 trajectories = [runtime.generate_target(prompt) for prompt in prompts]
                 intervention_logits = [_next_token_logits(runtime, prompt) for prompt in non_refusal_prompts]
-                intervention_ce = _mean_ce_loss(runtime, quality_texts)
+                intervention_ce = _mean_ce_loss(runtime, reference_texts)
             mean_kl = mean_next_token_kl(base_logits, intervention_logits) if base_logits else 0.0
             quality[candidate.candidate_id] = (mean_kl, intervention_ce - base_ce)
             trajectory_rows.extend(
@@ -734,7 +731,7 @@ def _evaluate_candidates_phase(
         ),
         private=False,
     )
-    return metrics, quality_evaluation
+    return metrics, reference_corpus
 
 
 def _transformer_block_name(runtime: IntervenedModelRuntime, layer: int) -> str:
@@ -768,7 +765,7 @@ def _mean_ce_loss(runtime: BaseModelRuntime | IntervenedModelRuntime, texts: Seq
     head = runtime.adapter.lm_head(model).module
     weight = getattr(head, "weight", None)
     if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
-        raise InvariantError("quality evaluation LM head has no matrix weight")
+        raise InvariantError("CE-loss evaluation LM head has no matrix weight")
     chunk_positions = max(1, 1_048_576 // weight.shape[0])
     for text in texts:
         encoded = runtime.processor.tokenizer(text, return_tensors="pt", add_special_tokens=True)
@@ -780,7 +777,7 @@ def _mean_ce_loss(runtime: BaseModelRuntime | IntervenedModelRuntime, texts: Seq
             output = backbone(**inputs, use_cache=False, return_dict=True)
             hidden_states = getattr(output, "last_hidden_state", None)
             if not isinstance(hidden_states, torch.Tensor):
-                raise InvariantError("quality evaluation text backbone returned no hidden states")
+                raise InvariantError("CE-loss evaluation text backbone returned no hidden states")
             shifted_states = hidden_states[:, :-1, :]
             shifted_targets = input_ids[:, 1:].clone()
             attention_mask = inputs.get("attention_mask")
@@ -822,30 +819,30 @@ def _apply_final_logit_softcap(model: torch.nn.Module, logits: torch.Tensor) -> 
     return torch.tanh(logits / softcap) * softcap
 
 
-def _resolve_quality_texts(
+def _resolve_reference_texts(
     config: ProjectConfig,
     runtime: BaseModelRuntime | IntervenedModelRuntime,
     fallback: Sequence[str],
 ) -> tuple[list[str], dict[str, Any]]:
-    if config.data.quality_text_files:
+    if config.data.reference_files:
         tokenizer = runtime.processor.tokenizer
-        texts = ingest_prompts(
-            config.data.quality_text_files,
+        texts = ingest_texts(
+            config.data.reference_files,
             token_counter=lambda text: len(tokenizer.encode(text, add_special_tokens=True)),
-            max_prompt_tokens=config.data.max_prompt_tokens,
+            max_text_tokens=config.data.max_text_tokens,
         )
         if not texts:
-            raise PipelineError("configured quality text files produced no usable texts")
+            raise PipelineError("configured reference files produced no usable texts")
         return texts, {
-            "source": "configured_quality_text_files",
+            "source": "reference_files",
             "text_count": len(texts),
-            "source_sha256": [file_sha256(Path(path).resolve()) for path in config.data.quality_text_files],
+            "source_sha256": [file_sha256(Path(path).resolve()) for path in config.data.reference_files],
         }
     texts = list(dict.fromkeys(text for text in fallback if text))
     if not texts:
-        raise PipelineError("quality evaluation requires configured texts or baseline NON_REFUSAL prompts")
+        raise PipelineError("CE-loss evaluation requires reference files or baseline NON_REFUSAL prompts")
     return texts, {
-        "source": "baseline_non_refusal_prompt_fallback",
+        "source": "baseline_non_refusal_prompts",
         "text_count": len(texts),
         "source_sha256": [object_sha256({"text": text}) for text in texts],
     }
@@ -1013,12 +1010,12 @@ def evaluate_export(config_path: str) -> None:
             artifact_type="test_evaluation_started",
             profile=profile,
         )
-        raw_test_rows = store.read_jsonl(
-            store.paths.raw_test,
-            artifact_type="raw_test_prompts",
+        test_prompt_rows = store.read_jsonl(
+            store.paths.test_prompts,
+            artifact_type="test_prompts",
             expected_profile=_profile(store),
         )
-        prompts = [PromptRecord.from_dict(row) for row in raw_test_rows]
+        prompts = [PromptRecord.from_dict(row) for row in test_prompt_rows]
         if not prompts or any(prompt.split != "test" for prompt in prompts):
             raise PipelineError("independent test artifact must contain only test prompts")
         baseline_trajectories = [runtime.generate_target(prompt) for prompt in prompts]
@@ -1034,12 +1031,12 @@ def evaluate_export(config_path: str) -> None:
                 baseline_labels[trajectory.prompt_id] = result.label
         non_refusal_prompts = [prompt for prompt in prompts if baseline_labels.get(prompt.prompt_id) == "NON_REFUSAL"]
         base_logits = [_next_token_logits(runtime, prompt) for prompt in non_refusal_prompts]
-        quality_texts, quality_evaluation = _resolve_quality_texts(
+        reference_texts, reference_corpus = _resolve_reference_texts(
             config,
             runtime,
             [prompt.original_prompt for prompt in non_refusal_prompts],
         )
-        base_ce = _mean_ce_loss(runtime, quality_texts)
+        base_ce = _mean_ce_loss(runtime, reference_texts)
         del judge
     baseline_errors = sum(item.status == "ERROR" for item in baseline_judgments)
     _check_error_budget(baseline_errors, config, "test baseline judging")
@@ -1074,7 +1071,7 @@ def evaluate_export(config_path: str) -> None:
             raise InvariantError("exported processor fingerprint differs from the export manifest")
         export_trajectories = [runtime.generate_target(prompt) for prompt in prompts]
         export_logits = [_next_token_logits(runtime, prompt) for prompt in non_refusal_prompts]
-        export_ce = _mean_ce_loss(runtime, quality_texts)
+        export_ce = _mean_ce_loss(runtime, reference_texts)
     export_generation_errors = sum(item.parser_status == "ERROR" for item in export_trajectories)
     _check_error_budget(export_generation_errors, config, "test export trajectory generation")
     with BaseModelRuntime(config) as runtime:
@@ -1115,7 +1112,7 @@ def evaluate_export(config_path: str) -> None:
         "baseline_parser": parser_statistics(baseline_trajectories),
         "export_parser": parser_statistics(export_trajectories),
         "test_metrics": test_metrics,
-        "quality_evaluation": quality_evaluation,
+        "reference_corpus": reference_corpus,
         "export_manifest_sha256": manifest_hash,
     }
     store.write_jsonl(
@@ -1156,7 +1153,7 @@ def evaluate_export(config_path: str) -> None:
         store,
         store.paths.quality_metrics,
         {
-            "quality_evaluation": quality_evaluation,
+            "reference_corpus": reference_corpus,
             "full_validation_metrics": full_validation_report["selected_candidate"]["full_validation_metrics"],
             "test_metrics": test_metrics,
         },

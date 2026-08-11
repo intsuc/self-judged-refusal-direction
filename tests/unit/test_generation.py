@@ -156,7 +156,7 @@ def test_generation_uses_target_profile_and_hashes_resolved_model_defaults() -> 
         run=RunConfig(seed=17),
         model=ModelConfig(revision="a" * 40),
         target_generation=generation,
-        data=DataConfig(max_prompt_tokens=32),
+        data=DataConfig(max_text_tokens=32),
     )
     runtime = RuntimeSpy(config)
 

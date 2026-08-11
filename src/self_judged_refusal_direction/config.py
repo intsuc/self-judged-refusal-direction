@@ -60,14 +60,14 @@ class TargetGenerationConfig:
 
 @dataclass(frozen=True)
 class DataConfig:
-    raw_prompt_files: tuple[str, ...] = ()
-    quality_text_files: tuple[str, ...] = ()
+    prompt_files: tuple[str, ...] = ()
+    reference_files: tuple[str, ...] = ()
     train_fraction: float = 0.6
     validation_fraction: float = 0.2
     train_per_class: int = 128
     validation_per_class: int = 64
-    test_raw_count: int = 256
-    max_prompt_tokens: int = 8192
+    max_test_prompts: int = 256
+    max_text_tokens: int = 8192
     template_similarity_threshold: float = 0.9
 
     @property
@@ -204,17 +204,17 @@ class ProjectConfig:
             errors.append("target generation sampling parameters require do_sample=true or null")
         if not all(
             isinstance(paths, tuple) and all(isinstance(path, str) for path in paths)
-            for paths in (self.data.raw_prompt_files, self.data.quality_text_files)
+            for paths in (self.data.prompt_files, self.data.reference_files)
         ):
-            errors.append("data prompt file collections must contain strings")
+            errors.append("data file collections must contain strings")
         elif any(
             Path(path).suffix.casefold() != ".txt"
-            for paths in (self.data.raw_prompt_files, self.data.quality_text_files)
+            for paths in (self.data.prompt_files, self.data.reference_files)
             for path in paths
         ):
-            errors.append("data prompt files must use the .txt extension")
-        if not _positive_integer(self.data.max_prompt_tokens):
-            errors.append("data.max_prompt_tokens must be a positive integer")
+            errors.append("data files must use the .txt extension")
+        if not _positive_integer(self.data.max_text_tokens):
+            errors.append("data.max_text_tokens must be a positive integer")
         if not _finite_number(self.data.train_fraction) or not _finite_number(self.data.validation_fraction):
             errors.append("data train and validation fractions must be finite numbers")
         else:
@@ -223,7 +223,7 @@ class ProjectConfig:
         for name, value in (
             ("data.train_per_class", self.data.train_per_class),
             ("data.validation_per_class", self.data.validation_per_class),
-            ("data.test_raw_count", self.data.test_raw_count),
+            ("data.max_test_prompts", self.data.max_test_prompts),
         ):
             if not _positive_integer(value):
                 errors.append(f"{name} must be a positive integer")
@@ -298,7 +298,7 @@ class ProjectConfig:
             unexpected = set(values) - fields
             if unexpected:
                 raise ConfigurationError(f"unknown {name} config keys: {sorted(unexpected, key=str)}")
-            for key in ("raw_prompt_files", "quality_text_files"):
+            for key in ("prompt_files", "reference_files"):
                 if key in values and isinstance(values[key], list):
                     values[key] = tuple(values[key])
             if name == "search" and isinstance(values.get("layers"), list):

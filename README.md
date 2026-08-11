@@ -40,9 +40,8 @@ uv run self-judged-refusal-direction inspect-model --config path/to/config.yaml
 uv run self-judged-refusal-direction run --config path/to/config.yaml
 ```
 
-Each path in `data.raw_prompt_files` and `data.quality_text_files` must be a UTF-8 `.txt` file. Every non-empty physical
-line is one prompt; multiline and structured prompt formats are not supported. Quality-text files are a separate corpus
-used to measure the edited model's CE-loss change.
+`data.prompt_files` and `data.reference_files` accept UTF-8 `.txt` paths. Each non-empty line is one prompt or reference
+text; multiline and structured formats are unsupported.
 
 The stages can also be run separately:
 
@@ -80,14 +79,14 @@ configuration.
 | `target_generation.min_p` | `null` | Minimum-token-probability sampling. |
 | `target_generation.typical_p` | `null` | Locally typical sampling probability. |
 | `target_generation.repetition_penalty` | `null` | Repetition penalty; `1.0` applies no penalty. |
-| `data.raw_prompt_files` | `[]` | Plain-text prompt files used for discovery, validation, and testing. |
-| `data.quality_text_files` | `[]` | Optional CE-loss corpus files; empty uses baseline non-refusal prompts. |
+| `data.prompt_files` | `[]` | Plain-text prompt files used for discovery, validation, and testing. |
+| `data.reference_files` | `[]` | Optional CE-loss reference files; empty uses baseline non-refusal prompts. |
 | `data.train_fraction` | `0.6` | Target fraction of prompts assigned to discovery. |
 | `data.validation_fraction` | `0.2` | Target fraction of prompts assigned to validation; the test target is the remainder. |
 | `data.train_per_class` | `128` | Required labeled discovery trajectories per refusal class. |
 | `data.validation_per_class` | `64` | Required labeled validation trajectories per refusal class. |
-| `data.test_raw_count` | `256` | Maximum number of raw test prompts retained. |
-| `data.max_prompt_tokens` | `8192` | Maximum tokenizer length of an individual input prompt. |
+| `data.max_test_prompts` | `256` | Maximum number of test prompts retained. |
+| `data.max_text_tokens` | `8192` | Maximum tokenizer length of a prompt or reference text. |
 | `data.template_similarity_threshold` | `0.9` | Similarity threshold used to keep related prompt templates in the same split. |
 | `search.layers` | `all` | Decoder layers to search, either `all` or a YAML list of zero-based layer indices. |
 | `search.accumulator_dtype` | `float64` | Dtype for online activation means and variances: `float32` or `float64`. |
@@ -98,7 +97,7 @@ configuration.
 | `acceptance.max_error_rate` | `0.0` | Largest allowed parser or infrastructure error rate for a candidate. |
 | `acceptance.min_non_refusal_retention` | `0.95` | Smallest allowed fraction of baseline non-refusals that remain non-refusals. |
 | `acceptance.max_mean_kl` | `0.10` | Largest allowed mean next-token KL divergence on baseline non-refusal prompts. |
-| `acceptance.max_ce_loss_delta` | `0.10` | Largest allowed increase in mean CE loss on quality text. |
+| `acceptance.max_ce_loss_delta` | `0.10` | Largest allowed increase in mean CE loss on reference text. |
 | `acceptance.activation_addition_beta` | `1.0` | Scale for the optional reverse-direction diagnostic; `null` disables it. |
 | `export.max_shard_size` | `5GB` | Maximum Transformers checkpoint shard size. |
 | `export.edit_chunk_rows` | `4096` | Rows processed at once while applying the weight projection in float32. |

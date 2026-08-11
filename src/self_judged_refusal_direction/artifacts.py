@@ -72,8 +72,8 @@ class ArtifactPaths:
         return self.data / "splits.jsonl"
 
     @property
-    def raw_test(self) -> Path:
-        return self.data / "raw_test.jsonl"
+    def test_prompts(self) -> Path:
+        return self.data / "test_prompts.jsonl"
 
     @property
     def baseline_trajectories(self) -> Path:

@@ -143,34 +143,34 @@ def assign_template_family_groups(prompts: Sequence[str], threshold: float = 0.9
     return {prompt: group_ids[disjoint.find(index)] for index, prompt in enumerate(normalized)}
 
 
-def _read_prompt_file(path: Path) -> Iterator[str]:
+def _read_text_file(path: Path) -> Iterator[str]:
     if path.suffix.casefold() != ".txt":
-        raise ArtifactError(f"prompt files must use the .txt extension: {path}")
+        raise ArtifactError(f"text files must use the .txt extension: {path}")
     try:
         with path.open(encoding="utf-8") as stream:
             for line in stream:
                 if line.strip():
                     yield line
     except (OSError, UnicodeError) as error:
-        raise ArtifactError(f"failed to read prompt file: {path}") from error
+        raise ArtifactError(f"failed to read text file: {path}") from error
 
 
-def ingest_prompts(
+def ingest_texts(
     paths: Iterable[str | Path],
     *,
     token_counter: Callable[[str], int] | None = None,
-    max_prompt_tokens: int | None = None,
+    max_text_tokens: int | None = None,
 ) -> list[str]:
-    prompts: list[str] = []
+    texts: list[str] = []
     for value in paths:
         path = Path(value).resolve()
         if not path.is_file():
-            raise ArtifactError(f"prompt file does not exist: {path}")
-        prompts.extend(_read_prompt_file(path))
-    normalized = deduplicate_prompts(prompts)
-    normalized = [prompt for prompt in normalized if prompt]
-    if token_counter is not None and max_prompt_tokens is not None:
-        normalized = [prompt for prompt in normalized if token_counter(prompt) <= max_prompt_tokens]
+            raise ArtifactError(f"text file does not exist: {path}")
+        texts.extend(_read_text_file(path))
+    normalized = deduplicate_prompts(texts)
+    normalized = [text for text in normalized if text]
+    if token_counter is not None and max_text_tokens is not None:
+        normalized = [text for text in normalized if token_counter(text) <= max_text_tokens]
     return normalized
 
 
@@ -244,10 +244,10 @@ def prepare_prompt_records(
     seed: int,
     token_counter: Callable[[str], int] | None = None,
 ) -> list[PromptRecord]:
-    prompts = ingest_prompts(
-        data_config.raw_prompt_files,
+    prompts = ingest_texts(
+        data_config.prompt_files,
         token_counter=token_counter,
-        max_prompt_tokens=data_config.max_prompt_tokens,
+        max_text_tokens=data_config.max_text_tokens,
     )
     if not prompts:
         raise InvariantError("no prompts remain after ingestion and normalization")
@@ -291,9 +291,9 @@ def write_prompt_split_artifacts(
         private=False,
     )
     store.write_jsonl(
-        store.paths.raw_test,
+        store.paths.test_prompts,
         (record for record in records if record.split == "test"),
-        artifact_type="raw_test_prompts",
+        artifact_type="test_prompts",
         profile=profile,
         private=False,
     )
