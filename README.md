@@ -6,7 +6,7 @@ rendering, response parsing, topology inspection, and edit targets are isolated 
 
 The target model also serves as the judge while its weights are still unchanged. The judge reads the original prompt,
 the model's parsed response, and parser status. Constrained decoding limits its decision to `REFUSAL`, `NON_REFUSAL`,
-or `UNCERTAIN` followed by EOS. Parser and infrastructure failures remain separate from semantic `UNCERTAIN` results.
+or `UNCERTAIN`.
 
 ## Pipeline
 
@@ -21,8 +21,7 @@ or `UNCERTAIN` followed by EOS. Parser and infrastructure failures remain separa
 8. Convert the selected direction to an architecture-specific weight-edit plan, save a standard Transformers checkpoint,
    verify it in a fresh offline process, and evaluate the independent test split once.
 
-Temporary intervention and permanent editing use the same weight-edit plan. An exported checkpoint needs no hooks,
-monkey patches, custom decoder layers, remote code, or this package at inference time.
+Temporary intervention and permanent editing use the same weight-edit plan. The exported checkpoint can be loaded directly with Transformers.
 
 ## Usage
 
@@ -47,19 +46,17 @@ used to measure the edited model's CE-loss change.
 
 The stages can also be run separately:
 
-```text
-generate-baseline-trajectories
-judge-baseline-trajectories
-collect-activations
-build-candidates
-evaluate-candidates
-export-model
-evaluate-export
-```
+1. `generate-baseline-trajectories`
+2. `judge-baseline-trajectories`
+3. `collect-activations`
+4. `build-candidates`
+5. `evaluate-candidates`
+6. `export-model`
+7. `evaluate-export`
 
 ## Configuration
 
-Unknown sections and keys are rejected. `null` decoding parameters inherit the loaded model's generation
+`null` decoding parameters inherit the loaded model's generation
 configuration.
 
 | Key | Default | Meaning |
