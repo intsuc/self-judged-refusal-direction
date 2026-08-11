@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from transformers import AutoConfig
+
 from self_judged_refusal_direction.config import ModelConfig, ProjectConfig
 from self_judged_refusal_direction.errors import ConfigurationError
 from self_judged_refusal_direction.models.base import ArchitectureAdapter
@@ -46,11 +48,20 @@ def create_adapter(name: str) -> ArchitectureAdapter:
 
 def adapter_for_config(config: ModelConfig | ProjectConfig) -> ArchitectureAdapter:
     model_config = config.model if isinstance(config, ProjectConfig) else config
-    return create_adapter(model_config.adapter)
+    if not isinstance(model_config.id, str) or not model_config.id:
+        raise ConfigurationError("model.id is required")
+    loaded = AutoConfig.from_pretrained(
+        model_config.id,
+        revision=model_config.revision,
+        trust_remote_code=False,
+    )
+    model_type = getattr(loaded, "model_type", None)
+    if not isinstance(model_type, str) or not model_type:
+        raise ConfigurationError("model configuration has no model_type")
+    return create_adapter(model_type)
 
 
 register_adapter("gemma4", Gemma4Adapter)
-register_adapter("gemma4adapter", Gemma4Adapter)
 
 __all__ = [
     "adapter_for_config",

@@ -9,10 +9,10 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import nn
 
-from self_judged_refusal_direction.config import ModelConfig, ProjectConfig
+from self_judged_refusal_direction.config import ModelConfig, ProjectConfig, TargetGenerationConfig
 from self_judged_refusal_direction.errors import CompatibilityError, InvariantError
 from self_judged_refusal_direction.hashing import object_sha256
-from self_judged_refusal_direction.schema import CompatibilityReport, TargetTrajectory
+from self_judged_refusal_direction.schema import CompatibilityReport
 
 if TYPE_CHECKING:
     from self_judged_refusal_direction.editing import WeightEditPlan
@@ -41,7 +41,6 @@ class ResponseTokenGrammar:
 class ParsedTargetOutput:
     raw_generated_token_ids: tuple[int, ...]
     raw_decoded_output: str
-    thinking_segments: tuple[str, ...]
     thinking_text: str
     final_answer: str
     thinking_token_start: int
@@ -95,6 +94,9 @@ class ArchitectureAdapter(ABC):
         self,
         processor: Any,
         messages: Sequence[Mapping[str, Any]],
+        config: TargetGenerationConfig | None = None,
+        *,
+        thinking_enabled: bool | None = None,
         **kwargs: Any,
     ) -> Any:
         raise NotImplementedError
@@ -119,20 +121,8 @@ class ArchitectureAdapter(ABC):
         generated_ids: Sequence[int] | torch.Tensor,
         *,
         prefix_ids: Sequence[int] | torch.Tensor = (),
+        thinking_enabled: bool = True,
     ) -> ParsedTargetOutput:
-        raise NotImplementedError
-
-    @abstractmethod
-    def discover_pre_thinking_positions(self, processor: Any, config: ProjectConfig) -> list[int]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def discover_pre_final_positions(
-        self,
-        processor: Any,
-        trajectory: TargetTrajectory,
-        config: ProjectConfig,
-    ) -> list[int]:
         raise NotImplementedError
 
     def activation_read_points(self, model: nn.Module) -> Sequence[nn.Module]:
@@ -200,12 +190,15 @@ class ArchitectureAdapter(ABC):
                 {
                     "class": type(tokenizer).__name__,
                     "backend": serialize_backend(),
+                    "chat_template": getattr(tokenizer, "chat_template", None),
+                    "response_template": getattr(tokenizer, "response_template", None),
                 }
             ),
             "processor_sha256": object_sha256(
                 {
                     "class": type(processor).__name__,
                     "config": processor_config,
+                    "chat_template": getattr(processor, "chat_template", None),
                 }
             ),
         }
@@ -223,11 +216,10 @@ class ArchitectureAdapter(ABC):
             raise InvariantError("model does not support save_pretrained")
         save_model(
             target,
-            safe_serialization=config.export.safe_serialization,
+            safe_serialization=True,
             max_shard_size=config.export.max_shard_size,
         )
-        if config.export.include_processor:
-            save_processor = getattr(processor, "save_pretrained", None)
-            if not callable(save_processor):
-                raise InvariantError("processor does not support save_pretrained")
-            save_processor(target)
+        save_processor = getattr(processor, "save_pretrained", None)
+        if not callable(save_processor):
+            raise InvariantError("processor does not support save_pretrained")
+        save_processor(target)

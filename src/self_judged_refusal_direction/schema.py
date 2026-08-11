@@ -5,16 +5,6 @@ from enum import StrEnum
 from typing import Any, Literal
 
 
-class TrajectoryStatus(StrEnum):
-    OK = "OK"
-    ERROR = "ERROR"
-
-
-class JudgeStatus(StrEnum):
-    OK = "OK"
-    ERROR = "ERROR"
-
-
 class JudgeLabel(StrEnum):
     REFUSAL = "REFUSAL"
     NON_REFUSAL = "NON_REFUSAL"
@@ -39,7 +29,6 @@ class TargetTrajectory:
     original_prompt: str
     raw_generated_token_ids: tuple[int, ...]
     raw_decoded_output: str
-    thinking_segments: tuple[str, ...]
     thinking_text: str
     final_answer: str
     thinking_token_start: int
@@ -51,35 +40,30 @@ class TargetTrajectory:
     model_revision: str
     generation_config_hash: str
     trajectory_hash: str
-    trajectory_status: Literal["OK", "ERROR"] = "OK"
     split: Literal["train", "validation", "test"] | None = None
     seed: int = 42
     error_code: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {key: value for key, value in asdict(self).items() if value is not None}
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> TargetTrajectory:
         data = dict(value)
         data["raw_generated_token_ids"] = tuple(data["raw_generated_token_ids"])
-        data["thinking_segments"] = tuple(data["thinking_segments"])
         return cls(**data)
 
 
 @dataclass(frozen=True)
 class JudgeResult:
     status: Literal["OK", "ERROR"]
-    label: Literal["REFUSAL", "NON_REFUSAL", "UNCERTAIN"] | None
-    raw_output: str | None
-    label_logprobs: dict[str, float] | None
-    calibrated_margin: float | None
     trajectory_hash: str
-    judge_profile_hash: str
+    label: Literal["REFUSAL", "NON_REFUSAL", "UNCERTAIN"] | None = None
+    raw_output: str | None = None
     error_code: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {key: value for key, value in asdict(self).items() if value is not None}
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> JudgeResult:
@@ -89,36 +73,27 @@ class JudgeResult:
 @dataclass(frozen=True)
 class LabeledTrajectory:
     prompt_id: str
-    split: Literal["train", "validation"]
     label: Literal["REFUSAL", "NON_REFUSAL"]
     trajectory_hash: str
 
 
 @dataclass(frozen=True)
 class ActivationKey:
-    phase: Literal["pre_thinking", "pre_final"]
     layer: int
-    relative_position: int
 
     @property
     def storage_key(self) -> str:
-        return f"{self.phase}:{self.layer}:{self.relative_position}"
+        return str(self.layer)
 
     @classmethod
     def parse(cls, value: str) -> ActivationKey:
-        phase, layer, position = value.split(":", maxsplit=2)
-        if phase not in {"pre_thinking", "pre_final"}:
-            raise ValueError(f"unsupported activation phase: {phase}")
-        return cls(phase=phase, layer=int(layer), relative_position=int(position))
+        return cls(layer=int(value))
 
 
 @dataclass(frozen=True)
 class DirectionCandidate:
     candidate_id: str
-    phase: Literal["pre_thinking", "pre_final"]
     layer: int
-    relative_position: int
-    direction_index: int
     norm: float
     refusal_count: int
     non_refusal_count: int
@@ -127,14 +102,12 @@ class DirectionCandidate:
     non_refusal_projected_mean: float
     refusal_projected_variance_diagonal: float
     non_refusal_projected_variance_diagonal: float
-    boundary_token: str
     finite: bool
 
 
 @dataclass(frozen=True)
 class CandidateMetrics:
     candidate_id: str
-    stage: Literal["B", "C"]
     baseline_refusal_count: int
     baseline_non_refusal_count: int
     intervention_non_refusal_from_refusal: int
@@ -160,6 +133,9 @@ class CandidateMetrics:
     hard_filter_passed: bool = False
     rejection_reasons: tuple[str, ...] = ()
 
+    def as_dict(self) -> dict[str, Any]:
+        return {key: value for key, value in asdict(self).items() if value is not None}
+
 
 @dataclass(frozen=True)
 class CompatibilityReport:
@@ -171,13 +147,6 @@ class CompatibilityReport:
     vocab_size: int
     parameter_count: int
     parameter_shapes_hash: str
-    supports_thinking_parse: bool
-    supports_pre_final_activation: bool
-    supports_dense_export: bool
-    supports_moe_export: bool
-    supports_ple_export: bool
-    supports_multimodal_projection_export: bool
-    supports_tied_weight_export: bool
     compatible: bool
     errors: tuple[str, ...] = ()
     topology: dict[str, Any] = field(default_factory=dict)

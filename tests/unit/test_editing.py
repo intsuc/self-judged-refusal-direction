@@ -79,7 +79,7 @@ def build_plan(model: ToyModel, direction: torch.Tensor) -> WeightEditPlan:
         .add_lm_head("lm_head")
         .add_multimodal_projection("multimodal")
         .add_residual_writer("writer", effective_scale_name="post_norm.weight")
-        .build({"adapter": "toy"})
+        .build()
     )
 
 
@@ -95,7 +95,7 @@ def test_temporary_and_permanent_logits_match(tied: bool, direction: torch.Tenso
     with plan.install_export_equivalent_hooks(temporary_model):
         temporary_logits = temporary_model(token_ids, multimodal)
 
-    plan.apply_in_place(permanent_model, chunk_size=2)
+    plan.apply_in_place(permanent_model, chunk_rows=2)
     permanent_logits = permanent_model(token_ids, multimodal)
 
     torch.testing.assert_close(temporary_logits, permanent_logits, atol=2e-5, rtol=2e-5)
@@ -107,7 +107,7 @@ def test_dual_rmsnorm_projection_is_orthogonal(direction: torch.Tensor) -> None:
     torch.manual_seed(4)
     model = ToyModel(tied=False)
     plan = build_plan(model, direction)
-    plan.apply_in_place(model, chunk_size=2)
+    plan.apply_in_place(model, chunk_rows=2)
     values = torch.randn(5, 6)
     contribution = model.post_norm(model.writer(values))
     unit_direction = plan.direction.to(contribution)
@@ -121,8 +121,8 @@ def test_chunked_and_unchunked_edits_match(direction: torch.Tensor) -> None:
     large_chunks = copy.deepcopy(small_chunks)
     plan = build_plan(small_chunks, direction)
 
-    plan.apply_in_place(small_chunks, chunk_size=1)
-    plan.apply_in_place(large_chunks, chunk_size=10_000)
+    plan.apply_in_place(small_chunks, chunk_rows=1)
+    plan.apply_in_place(large_chunks, chunk_rows=10_000)
 
     for name, value in small_chunks.state_dict().items():
         torch.testing.assert_close(value, large_chunks.state_dict()[name], atol=2e-7, rtol=2e-6)
@@ -144,7 +144,7 @@ def test_tied_embedding_is_one_permanent_operation(direction: torch.Tensor) -> N
         ("lm_head", HookKind.INPUT),
     }
 
-    edited = plan.apply_in_place(model, chunk_size=2)
+    edited = plan.apply_in_place(model, chunk_rows=2)
     unit_direction = plan.direction
     expected = original - (original @ unit_direction).unsqueeze(1) * unit_direction.unsqueeze(0)
 
@@ -157,7 +157,7 @@ def test_bias_and_multimodal_projection_are_orthogonal(direction: torch.Tensor) 
     torch.manual_seed(7)
     model = ToyModel(tied=False)
     plan = build_plan(model, direction)
-    plan.apply_in_place(model, chunk_size=2)
+    plan.apply_in_place(model, chunk_rows=2)
     unit_direction = plan.direction
     dual_direction = plan.vector("dual:writer")
 
@@ -225,7 +225,7 @@ def test_from_adapter_builds_export_equivalent_plan(direction: torch.Tensor) -> 
 
     with plan.temporary(temporary_model):
         temporary_logits = temporary_model(token_ids, multimodal)
-    plan.apply_in_place(permanent_model, chunk_size=2)
+    plan.apply_in_place(permanent_model, chunk_rows=2)
 
     torch.testing.assert_close(
         temporary_logits,
@@ -233,4 +233,4 @@ def test_from_adapter_builds_export_equivalent_plan(direction: torch.Tensor) -> 
         atol=2e-5,
         rtol=2e-5,
     )
-    assert plan.metadata == {"adapter": "ToyAdapter"}
+    assert plan.operations

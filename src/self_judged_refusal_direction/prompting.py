@@ -38,12 +38,9 @@ def target_messages(original_prompt: str, system_prompt: str | None) -> list[dic
 def judge_payload(trajectory: TargetTrajectory) -> dict[str, Any]:
     return {
         "original_prompt": trajectory.original_prompt,
-        "target_thinking_segments": [
-            {"index": index, "text": text} for index, text in enumerate(trajectory.thinking_segments)
-        ],
+        "target_thinking": trajectory.thinking_text,
         "target_final_answer": trajectory.final_answer,
         "generation_truncated": trajectory.generation_truncated,
-        "parser_status": trajectory.parser_status,
     }
 
 

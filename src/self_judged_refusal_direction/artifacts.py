@@ -18,7 +18,7 @@ import yaml
 
 from self_judged_refusal_direction.config import ProjectConfig, resolved_config_mapping
 from self_judged_refusal_direction.errors import ArtifactError
-from self_judged_refusal_direction.hashing import canonical_json_bytes, file_sha256, object_sha256
+from self_judged_refusal_direction.hashing import canonical_json_bytes, file_sha256
 
 
 @dataclass(frozen=True)
@@ -26,19 +26,32 @@ class ArtifactProfile:
     model_id: str
     model_revision: str
     config_hash: str
-    target_profile_hash: str | None = None
-    judge_profile_hash: str | None = None
+    target_generation_config_hash: str | None = None
     chat_template_hash: str | None = None
+    judge_template_hash: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {key: value for key, value in asdict(self).items() if value is not None}
 
 
 @dataclass(frozen=True)
 class ArtifactMetadata:
-    schema_version: int
     artifact_type: str
     private: bool
-    record_count: int
     content_sha256: str
     profile: ArtifactProfile
+    record_count: int | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "artifact_type": self.artifact_type,
+            "private": self.private,
+            "content_sha256": self.content_sha256,
+            "profile": self.profile.as_dict(),
+        }
+        if self.record_count is not None:
+            value["record_count"] = self.record_count
+        return value
 
 
 class ArtifactPaths:
@@ -79,18 +92,6 @@ class ArtifactPaths:
         return self.data / "labeled_validation.jsonl"
 
     @property
-    def activation_means(self) -> Path:
-        return self.activations / "means.pt"
-
-    @property
-    def activation_variances(self) -> Path:
-        return self.activations / "variances.pt"
-
-    @property
-    def activation_metadata(self) -> Path:
-        return self.activations / "position_metadata.json"
-
-    @property
     def activation_statistics(self) -> Path:
         return self.activations / "statistics.safetensors"
 
@@ -103,32 +104,32 @@ class ArtifactPaths:
         return self.directions / "candidate_metadata.jsonl"
 
     @property
-    def stage_a_ranking(self) -> Path:
-        return self.directions / "stage_a_ranking.json"
+    def activation_screening_ranking(self) -> Path:
+        return self.directions / "activation_screening_ranking.json"
 
     @property
-    def stage_b_results(self) -> Path:
-        return self.directions / "stage_b_results.jsonl"
+    def pilot_evaluation_results(self) -> Path:
+        return self.directions / "pilot_evaluation_results.jsonl"
 
     @property
-    def stage_c_results(self) -> Path:
-        return self.directions / "stage_c_results.jsonl"
+    def full_validation_results(self) -> Path:
+        return self.directions / "full_validation_results.jsonl"
 
     @property
-    def stage_b_trajectories(self) -> Path:
-        return self.directions / "stage_b_trajectories.private.jsonl"
+    def pilot_evaluation_trajectories(self) -> Path:
+        return self.directions / "pilot_evaluation_trajectories.private.jsonl"
 
     @property
-    def stage_b_judgments(self) -> Path:
-        return self.directions / "stage_b_judgments.jsonl"
+    def pilot_evaluation_judgments(self) -> Path:
+        return self.directions / "pilot_evaluation_judgments.jsonl"
 
     @property
-    def stage_c_trajectories(self) -> Path:
-        return self.directions / "stage_c_trajectories.private.jsonl"
+    def full_validation_trajectories(self) -> Path:
+        return self.directions / "full_validation_trajectories.private.jsonl"
 
     @property
-    def stage_c_judgments(self) -> Path:
-        return self.directions / "stage_c_judgments.jsonl"
+    def full_validation_judgments(self) -> Path:
+        return self.directions / "full_validation_judgments.jsonl"
 
     @property
     def final_selection(self) -> Path:
@@ -139,8 +140,8 @@ class ArtifactPaths:
         return self.directions / "selected_direction.safetensors"
 
     @property
-    def validation_report(self) -> Path:
-        return self.evaluation / "validation_report.json"
+    def full_validation_report(self) -> Path:
+        return self.evaluation / "full_validation_report.json"
 
     @property
     def test_report(self) -> Path:
@@ -153,6 +154,8 @@ class ArtifactPaths:
 
 class ArtifactStore:
     def __init__(self, config: ProjectConfig):
+        if config.run.output_dir is None:
+            raise ArtifactError("run output directory is required")
         self.config = config
         self.paths = ArtifactPaths(config.run.output_dir)
         self.paths.create()
@@ -161,21 +164,37 @@ class ArtifactStore:
         self,
         *,
         target: bool = False,
-        judge: bool = False,
         chat_template_hash: str | None = None,
+        judge_template_hash: str | None = None,
     ) -> ArtifactProfile:
+        if self.config.model.id is None:
+            raise ArtifactError("model ID is required")
         return ArtifactProfile(
             model_id=self.config.model.id,
             model_revision=self.config.model.revision,
             config_hash=self.config.config_hash,
-            target_profile_hash=self.config.target_profile_hash if target else None,
-            judge_profile_hash=self.config.judge_profile_hash if judge else None,
+            target_generation_config_hash=self.config.target_generation_config_hash if target else None,
             chat_template_hash=chat_template_hash,
+            judge_template_hash=judge_template_hash,
         )
 
     def initialize_run(self) -> None:
-        self.write_yaml(self.paths.root / "resolved_config.yaml", resolved_config_mapping(self.config), private=False)
         environment_path = self.paths.root / "environment.json"
+        run_outputs = (
+            self.paths.root / "resolved_config.yaml",
+            self.paths.root / "model_compatibility.json",
+            self.paths.data,
+            self.paths.activations,
+            self.paths.directions,
+            self.paths.evaluation,
+            self.paths.exported_model,
+        )
+        has_run_outputs = any(
+            path.is_file() or (path.is_dir() and any(child.is_file() for child in path.rglob("*")))
+            for path in run_outputs
+        )
+        if not environment_path.exists() and has_run_outputs:
+            raise ArtifactError("existing run environment is missing")
         environment = {
             "model_id": self.config.model.id,
             "model_revision": self.config.model.revision,
@@ -191,13 +210,15 @@ class ArtifactStore:
             "attention_implementation": self.config.model.attention_implementation,
             "device_map": self.config.model.device_map,
         }
-        try:
-            existing = json.loads(environment_path.read_text(encoding="utf-8"))
-        except OSError, UnicodeError, json.JSONDecodeError:
-            existing = None
-        identity = tuple(environment)
-        if isinstance(existing, dict) and all(existing.get(key) == environment[key] for key in identity):
+        if environment_path.exists():
+            try:
+                existing = json.loads(environment_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise ArtifactError("existing run environment is invalid") from error
+            if not isinstance(existing, dict) or any(existing.get(key) != value for key, value in environment.items()):
+                raise ArtifactError("existing run environment does not match")
             environment = {**existing, **environment}
+        self.write_yaml(self.paths.root / "resolved_config.yaml", resolved_config_mapping(self.config), private=False)
         self.write_json(environment_path, environment, private=False)
 
     def write_jsonl(
@@ -215,20 +236,20 @@ class ArtifactStore:
         with tempfile.NamedTemporaryFile("wb", dir=target.parent, delete=False) as stream:
             temporary = Path(stream.name)
             for record in records:
-                value = asdict(record) if is_dataclass(record) else record
+                as_dict = getattr(record, "as_dict", None)
+                value = as_dict() if callable(as_dict) else asdict(record) if is_dataclass(record) else record
                 stream.write(canonical_json_bytes(value) + b"\n")
                 count += 1
         os.chmod(temporary, 0o600 if private else 0o644)
         temporary.replace(target)
         metadata = ArtifactMetadata(
-            schema_version=1,
             artifact_type=artifact_type,
             private=private,
             record_count=count,
             content_sha256=file_sha256(target),
             profile=profile,
         )
-        self.write_json(self.metadata_path(target), asdict(metadata), private=private)
+        self.write_json(self.metadata_path(target), metadata.as_dict(), private=private)
         return metadata
 
     def read_jsonl(
@@ -240,6 +261,8 @@ class ArtifactStore:
     ) -> Iterator[dict[str, Any]]:
         target = Path(path)
         metadata = self.validate(target, artifact_type=artifact_type, expected_profile=expected_profile)
+        if metadata.record_count is None:
+            raise ArtifactError(f"JSONL artifact record count is missing for {target}")
         seen = 0
         with target.open(encoding="utf-8") as stream:
             for line_number, line in enumerate(stream, start=1):
@@ -276,15 +299,9 @@ class ArtifactStore:
             metadata = ArtifactMetadata(**raw)
         except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             raise ArtifactError(f"invalid artifact metadata: {metadata_path}") from error
-        if (
-            not isinstance(metadata.schema_version, int)
-            or isinstance(metadata.schema_version, bool)
-            or metadata.schema_version != 1
-        ):
-            raise ArtifactError(f"unsupported artifact schema version for {target}")
         if not isinstance(metadata.private, bool):
             raise ArtifactError(f"artifact privacy flag is invalid for {target}")
-        if (
+        if metadata.record_count is not None and (
             not isinstance(metadata.record_count, int)
             or isinstance(metadata.record_count, bool)
             or metadata.record_count < 0
@@ -301,9 +318,9 @@ class ArtifactStore:
             raise ArtifactError(f"artifact type mismatch for {target}")
         if metadata.content_sha256 != file_sha256(target):
             raise ArtifactError(f"artifact content hash mismatch for {target}")
-        expected = asdict(expected_profile)
-        actual = asdict(metadata.profile)
-        mismatches = [key for key, value in expected.items() if value is not None and actual.get(key) != value]
+        expected = expected_profile.as_dict()
+        actual = metadata.profile.as_dict()
+        mismatches = [key for key, value in expected.items() if actual.get(key) != value]
         if mismatches:
             raise ArtifactError(f"artifact profile mismatch for {target}: {mismatches}")
         return metadata
@@ -330,7 +347,3 @@ class ArtifactStore:
             stream.write(content)
         os.chmod(temporary, 0o600 if private else 0o644)
         temporary.replace(path)
-
-
-def artifact_key_hash(profile: ArtifactProfile, artifact_type: str) -> str:
-    return object_sha256({"profile": profile, "artifact_type": artifact_type})

@@ -6,11 +6,12 @@ import pytest
 from self_judged_refusal_direction.artifacts import ArtifactProfile, ArtifactStore
 from self_judged_refusal_direction.config import ModelConfig, ProjectConfig, RunConfig
 from self_judged_refusal_direction.errors import ArtifactError
-from self_judged_refusal_direction.pipeline import _judge_chat_hash, _validate_activation_chat_profile
+from self_judged_refusal_direction.pipeline import _validate_activation_chat_profile
+from self_judged_refusal_direction.prompting import judge_template_hash
 
 
 def test_artifact_reuse_requires_matching_profile_and_content(tmp_path) -> None:
-    config = ProjectConfig(run=RunConfig(output_dir=str(tmp_path)), model=ModelConfig(revision="a" * 40))
+    config = ProjectConfig(run=RunConfig(output_dir=str(tmp_path)), model=ModelConfig(id="model", revision="a" * 40))
     store = ArtifactStore(config)
     path = tmp_path / "rows.jsonl"
     profile = store.profile(target=True, chat_template_hash="chat-a")
@@ -25,7 +26,7 @@ def test_artifact_reuse_requires_matching_profile_and_content(tmp_path) -> None:
 
 
 def test_private_artifact_schema_and_permissions_fail_closed(tmp_path) -> None:
-    config = ProjectConfig(run=RunConfig(output_dir=str(tmp_path)), model=ModelConfig(revision="a" * 40))
+    config = ProjectConfig(run=RunConfig(output_dir=str(tmp_path)), model=ModelConfig(id="model", revision="a" * 40))
     store = ArtifactStore(config)
     path = tmp_path / "trajectories.private.jsonl"
     profile = store.profile(target=True)
@@ -36,6 +37,10 @@ def test_private_artifact_schema_and_permissions_fail_closed(tmp_path) -> None:
     assert metadata_path.stat().st_mode & 0o077 == 0
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["record_count"] == 1
+    assert "schema_version" not in metadata
+    assert "chat_template_hash" not in metadata["profile"]
+    assert "judge_template_hash" not in metadata["profile"]
     metadata["private"] = False
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     with pytest.raises(ArtifactError, match="not marked private"):
@@ -44,12 +49,12 @@ def test_private_artifact_schema_and_permissions_fail_closed(tmp_path) -> None:
     metadata["private"] = True
     metadata["schema_version"] = 2
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-    with pytest.raises(ArtifactError, match="schema version"):
+    with pytest.raises(ArtifactError, match="invalid artifact metadata"):
         list(store.read_jsonl(path, artifact_type="trajectories", expected_profile=profile))
 
 
-def test_environment_extensions_survive_only_for_the_same_run_identity(tmp_path) -> None:
-    config = ProjectConfig(run=RunConfig(output_dir=str(tmp_path)), model=ModelConfig(revision="a" * 40))
+def test_environment_extensions_survive_and_identity_changes_fail_closed(tmp_path) -> None:
+    config = ProjectConfig(run=RunConfig(output_dir=str(tmp_path)), model=ModelConfig(id="model", revision="a" * 40))
     store = ArtifactStore(config)
     store.initialize_run()
     path = store.paths.root / "environment.json"
@@ -60,9 +65,17 @@ def test_environment_extensions_survive_only_for_the_same_run_identity(tmp_path)
     store.initialize_run()
     assert json.loads(path.read_text(encoding="utf-8"))["processor_sha256"] == "processor"
 
-    changed = ProjectConfig(run=config.run, model=ModelConfig(revision="b" * 40))
-    ArtifactStore(changed).initialize_run()
-    assert "processor_sha256" not in json.loads(path.read_text(encoding="utf-8"))
+    changed = ProjectConfig(run=config.run, model=ModelConfig(id="model", revision="b" * 40))
+    resolved_path = store.paths.root / "resolved_config.yaml"
+    resolved = resolved_path.read_bytes()
+    with pytest.raises(ArtifactError, match="environment does not match"):
+        ArtifactStore(changed).initialize_run()
+    assert resolved_path.read_bytes() == resolved
+    assert json.loads(path.read_text(encoding="utf-8"))["processor_sha256"] == "processor"
+
+    path.unlink()
+    with pytest.raises(ArtifactError, match="environment is missing"):
+        store.initialize_run()
 
 
 def test_activation_artifacts_require_the_current_chat_template() -> None:
@@ -70,7 +83,8 @@ def test_activation_artifacts_require_the_current_chat_template() -> None:
         model_id="model",
         model_revision="a" * 40,
         config_hash="config",
-        chat_template_hash=_judge_chat_hash("chat-a"),
+        chat_template_hash="chat-a",
+        judge_template_hash=judge_template_hash(),
     )
 
     _validate_activation_chat_profile(profile, "chat-a")

@@ -3,14 +3,17 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, replace
-from typing import Any, Literal
+from dataclasses import replace
+from typing import Any
 
 import torch
 
-from self_judged_refusal_direction.config import EvaluationConfig
+from self_judged_refusal_direction.config import AcceptanceConfig
 from self_judged_refusal_direction.errors import PipelineError
 from self_judged_refusal_direction.schema import CandidateMetrics, DirectionCandidate, JudgeResult, TargetTrajectory
+
+_REPETITION_NGRAM_SIZE = 4
+_REPETITION_THRESHOLD = 0.5
 
 
 def mean_next_token_kl(base_logits: Sequence[torch.Tensor], intervention_logits: Sequence[torch.Tensor]) -> float:
@@ -30,14 +33,13 @@ def mean_next_token_kl(base_logits: Sequence[torch.Tensor], intervention_logits:
 def evaluate_behavior(
     *,
     candidate_id: str,
-    stage: Literal["B", "C"],
     baseline_labels: Mapping[str, str],
     baseline_trajectories: Mapping[str, TargetTrajectory],
     trajectories: Iterable[TargetTrajectory],
     judgments: Mapping[str, JudgeResult],
     mean_kl: float,
     ce_loss_delta: float,
-    config: EvaluationConfig,
+    acceptance: AcceptanceConfig,
     activation_addition_induction_rate: float | None = None,
 ) -> CandidateMetrics:
     records = list(trajectories)
@@ -55,7 +57,7 @@ def evaluate_behavior(
     observed: list[TargetTrajectory] = []
     for prompt_id in expected_ids:
         trajectory = by_prompt.get(prompt_id)
-        if trajectory is None or trajectory.trajectory_status != "OK" or trajectory.parser_status != "OK":
+        if trajectory is None or trajectory.parser_status != "OK":
             error_count += 1
             continue
         judgment = judgments.get(trajectory.trajectory_hash)
@@ -76,8 +78,7 @@ def evaluate_behavior(
     error_rate = _ratio(error_count, total)
     empty_rate = _ratio(sum(not item.final_answer.strip() for item in observed), total)
     repeated = (
-        _abnormal_repetition(item.final_answer, config.repetition_ngram_size, config.repetition_threshold)
-        for item in observed
+        _abnormal_repetition(item.final_answer, _REPETITION_NGRAM_SIZE, _REPETITION_THRESHOLD) for item in observed
     )
     repetition_rate = _ratio(
         sum(repeated),
@@ -103,7 +104,6 @@ def evaluate_behavior(
     completion_proxy = _ratio(sum(bool(item.final_answer.strip()) for item in observed), total)
     metrics = CandidateMetrics(
         candidate_id=candidate_id,
-        stage=stage,
         baseline_refusal_count=len(refusal_ids),
         baseline_non_refusal_count=len(non_refusal_ids),
         intervention_non_refusal_from_refusal=removal_successes,
@@ -127,20 +127,20 @@ def evaluate_behavior(
         task_completion_proxy=completion_proxy,
         activation_addition_induction_rate=activation_addition_induction_rate,
     )
-    return apply_hard_filters(metrics, config)
+    return apply_hard_filters(metrics, acceptance)
 
 
-def apply_hard_filters(metrics: CandidateMetrics, config: EvaluationConfig) -> CandidateMetrics:
+def apply_hard_filters(metrics: CandidateMetrics, acceptance: AcceptanceConfig) -> CandidateMetrics:
     reasons: list[str] = []
-    if metrics.error_rate > config.max_error_rate:
+    if metrics.error_rate > acceptance.max_error_rate:
         reasons.append("error_rate")
-    if metrics.uncertain_rate > config.max_uncertain_rate:
+    if metrics.uncertain_rate > acceptance.max_uncertain_rate:
         reasons.append("uncertain_rate")
-    if metrics.non_refusal_retention_rate < config.min_non_refusal_retention:
+    if metrics.non_refusal_retention_rate < acceptance.min_non_refusal_retention:
         reasons.append("non_refusal_retention")
-    if not math.isfinite(metrics.mean_kl) or metrics.mean_kl > config.max_mean_kl:
+    if not math.isfinite(metrics.mean_kl) or metrics.mean_kl > acceptance.max_mean_kl:
         reasons.append("mean_kl")
-    if not math.isfinite(metrics.ce_loss_delta) or metrics.ce_loss_delta > config.max_ce_loss_delta:
+    if not math.isfinite(metrics.ce_loss_delta) or metrics.ce_loss_delta > acceptance.max_ce_loss_delta:
         reasons.append("ce_loss_delta")
     return replace(metrics, hard_filter_passed=not reasons, rejection_reasons=tuple(reasons))
 
@@ -186,20 +186,17 @@ def parser_statistics(trajectories: Iterable[TargetTrajectory]) -> dict[str, flo
     total = len(values)
     parser_successes = sum(item.parser_status == "OK" for item in values)
     truncations = sum(item.generation_truncated for item in values)
-    errors = sum(item.trajectory_status == "ERROR" for item in values)
     return {
         "count": total,
         "parser_success_count": parser_successes,
         "parser_success_rate": _ratio(parser_successes, total),
         "truncation_count": truncations,
         "truncation_rate": _ratio(truncations, total),
-        "trajectory_error_count": errors,
-        "trajectory_error_rate": _ratio(errors, total),
     }
 
 
 def metrics_dict(metrics: CandidateMetrics) -> dict[str, Any]:
-    value = asdict(metrics)
+    value = metrics.as_dict()
     value["rejection_reasons"] = list(metrics.rejection_reasons)
     return value
 

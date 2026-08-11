@@ -1,25 +1,27 @@
 # Self-judged refusal direction
 
-`self-judged-refusal-direction` extracts, evaluates, and permanently removes a rank-1 trajectory-level refusal
-direction from instruction models through architecture-specific adapters. The direction represents either refusal
-consideration in generated thinking or actual refusal in the final answer; it is not limited to refusal wording in the
-visible answer.
+`self-judged-refusal-direction` finds a refusal-related direction in an instruction model's hidden states, evaluates
+causal interventions along that direction, and permanently removes it from the model's weights. Model-specific chat
+rendering, response parsing, topology inspection, and edit targets are isolated behind architecture adapters.
 
-For every prompt, the pipeline generates a complete thinking-enabled target trajectory. The same immutable base
-checkpoint then acts as a thinking-disabled judge that reads the original prompt, thinking, final answer, and parser
-metadata. An enum trie restricts its output to exactly `REFUSAL`, `NON_REFUSAL`, or `UNCERTAIN` followed by EOS.
+The target model also serves as the judge while its weights are still unchanged. The judge reads the original prompt,
+the model's parsed response, and parser status. Constrained decoding limits its decision to `REFUSAL`, `NON_REFUSAL`,
+or `UNCERTAIN` followed by EOS. Parser and infrastructure failures remain separate from semantic `UNCERTAIN` results.
 
 ## Pipeline
 
-1. Normalize, deduplicate, group, and split raw prompts before labeling.
-2. Generate baseline thinking and final-answer trajectories.
-3. Classify trajectories with the unchanged base checkpoint.
-4. Collect online activation statistics at adapter-defined boundaries.
-5. Build mean-difference directions and evaluate them through staged causal interventions.
-6. Apply the selected `WeightEditPlan` permanently and save a standard Transformers checkpoint.
-7. Reload the checkpoint in a fresh offline process and evaluate the independent test split once.
+1. Read one prompt per non-empty line, normalize and deduplicate prompts, group related templates, and split them before
+   labeling.
+2. Generate and parse a baseline response for each prompt using the configured target-generation settings.
+3. Label each valid response with the unchanged base checkpoint.
+4. At each selected decoder layer, collect the residual activation at the last token of the rendered assistant prefix.
+5. Rank layer-wise mean-difference directions through `activation_screening`.
+6. Run causal interventions for the survivors on a small balanced subset through `pilot_evaluation`.
+7. Apply the acceptance criteria to the survivors on the full validation set through `full_validation`.
+8. Convert the selected direction to an architecture-specific weight-edit plan, save a standard Transformers checkpoint,
+   verify it in a fresh offline process, and evaluate the independent test split once.
 
-Temporary intervention and permanent editing are derived from the same plan. Exported checkpoints require no hooks,
+Temporary intervention and permanent editing use the same weight-edit plan. An exported checkpoint needs no hooks,
 monkey patches, custom decoder layers, remote code, or this package at inference time.
 
 ## Usage
@@ -30,22 +32,18 @@ Install the locked environment:
 uv sync --locked
 ```
 
-Create or copy a YAML configuration and set at least:
-
-- `model.id`, a 40-character commit `model.revision`, and a registered `model.adapter`
-- `data.raw_prompt_files`, containing one or more UTF-8 `.txt` paths
-- `run.output_dir`
-- dataset sizes and evaluation thresholds appropriate for the run
-
-Each non-empty physical line in a prompt file is one prompt. Multiline prompts and structured input formats are not
-supported. Optional `.txt` files in `data.quality_text_files` provide a separate corpus for CE-loss evaluation.
-
-Inspect compatibility before starting the full run:
+Copy the [reference configuration](configs/gemma4_31b_it.yaml), set an output directory, model ID, pinned model revision,
+and prompt paths, then
+inspect compatibility before starting the full run:
 
 ```bash
 uv run self-judged-refusal-direction inspect-model --config path/to/config.yaml
 uv run self-judged-refusal-direction run --config path/to/config.yaml
 ```
+
+Each path in `data.raw_prompt_files` and `data.quality_text_files` must be a UTF-8 `.txt` file. Every non-empty physical
+line is one prompt; multiline and structured prompt formats are not supported. Quality-text files are a separate corpus
+used to measure the edited model's CE-loss change.
 
 The stages can also be run separately:
 
@@ -59,24 +57,65 @@ export-model
 evaluate-export
 ```
 
-Each stage validates artifact content and provenance, including model revision, generation and judge profiles, and chat
-template hashes. A failed parser, context overflow, incompatible topology, or infrastructure error is kept separate
-from semantic `UNCERTAIN` results and fails closed according to the configuration.
+## Configuration
+
+Unknown sections and keys are rejected. `null` decoding parameters inherit the loaded model's generation
+configuration.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `run.seed` | `42` | Seed used for dataset splitting and target generation. |
+| `run.output_dir` | required | Directory for run artifacts and the exported checkpoint. |
+| `run.max_infrastructure_errors` | `0` | Maximum parser or infrastructure errors allowed before a pipeline step fails. |
+| `model.id` | required | Hugging Face model ID or local checkpoint path. |
+| `model.revision` | required | Base checkpoint commit SHA. |
+| `model.dtype` | `bfloat16` | Floating-point dtype used to load the model. |
+| `model.device_map` | `auto` | Transformers/Accelerate device placement strategy. |
+| `model.attention_implementation` | `sdpa` | Transformers attention implementation used at runtime. |
+| `target_generation.system_prompt` | `null` | Optional system message prepended to every target request. |
+| `target_generation.thinking_enabled` | `true` | Whether the model's official chat template enables its thinking response mode. |
+| `target_generation.max_new_tokens` | `4096` | Maximum generated tokens per target response. |
+| `target_generation.do_sample` | `false` | Sampling mode. |
+| `target_generation.num_beams` | `1` | Beam count. |
+| `target_generation.temperature` | `null` | Sampling temperature. |
+| `target_generation.top_p` | `null` | Nucleus-sampling probability. |
+| `target_generation.top_k` | `null` | Top-k sampling; `0` disables top-k filtering. |
+| `target_generation.min_p` | `null` | Minimum-token-probability sampling. |
+| `target_generation.typical_p` | `null` | Locally typical sampling probability. |
+| `target_generation.repetition_penalty` | `null` | Repetition penalty; `1.0` applies no penalty. |
+| `data.raw_prompt_files` | `[]` | Plain-text prompt files used for discovery, validation, and testing. |
+| `data.quality_text_files` | `[]` | Optional CE-loss corpus files; empty uses baseline non-refusal prompts. |
+| `data.train_fraction` | `0.6` | Target fraction of prompts assigned to discovery. |
+| `data.validation_fraction` | `0.2` | Target fraction of prompts assigned to validation; the test target is the remainder. |
+| `data.train_per_class` | `128` | Required labeled discovery trajectories per refusal class. |
+| `data.validation_per_class` | `64` | Required labeled validation trajectories per refusal class. |
+| `data.test_raw_count` | `256` | Maximum number of raw test prompts retained. |
+| `data.max_prompt_tokens` | `8192` | Maximum tokenizer length of an individual input prompt. |
+| `data.template_similarity_threshold` | `0.9` | Similarity threshold used to keep related prompt templates in the same split. |
+| `search.layers` | `all` | Decoder layers to search, either `all` or a YAML list of zero-based layer indices. |
+| `search.accumulator_dtype` | `float64` | Dtype for online activation means and variances: `float32` or `float64`. |
+| `search.activation_screening_keep` | `32` | Maximum layer directions retained after activation screening. |
+| `search.pilot_evaluation_keep` | `5` | Maximum directions retained after the pilot evaluation. |
+| `search.pilot_prompts_per_class` | `16` | Validation prompts per refusal class used by the pilot evaluation. |
+| `acceptance.max_uncertain_rate` | `0.05` | Largest allowed semantic-uncertainty rate for a candidate. |
+| `acceptance.max_error_rate` | `0.0` | Largest allowed parser or infrastructure error rate for a candidate. |
+| `acceptance.min_non_refusal_retention` | `0.95` | Smallest allowed fraction of baseline non-refusals that remain non-refusals. |
+| `acceptance.max_mean_kl` | `0.10` | Largest allowed mean next-token KL divergence on baseline non-refusal prompts. |
+| `acceptance.max_ce_loss_delta` | `0.10` | Largest allowed increase in mean CE loss on quality text. |
+| `acceptance.activation_addition_beta` | `1.0` | Scale for the optional reverse-direction diagnostic; `null` disables it. |
+| `export.max_shard_size` | `5GB` | Maximum Transformers checkpoint shard size. |
+| `export.edit_chunk_rows` | `4096` | Rows processed at once while applying the weight projection in float32. |
 
 ## Architecture adapters
 
-Model-specific chat rendering, response parsing, activation boundaries, topology discovery, and edit targets are
-contained in `ArchitectureAdapter` implementations registered by name. A new model family can be supported without
-changing the pipeline, judging, evaluation, or export orchestration.
-
-The included `gemma4` adapter and [reference configuration](configs/gemma4_31b_it.yaml) support
-`google/gemma-4-31B-it` at pinned revision `842da3794eaa0b77d5f08bae87a17459d91ff475`. The implementation's
-mean-activation difference and weight-orthogonalization approach builds on
+The adapter is selected from the pinned checkpoint's `model_type`. The included Gemma 4 adapter supports the
+[`google/gemma-4-31B-it`](https://huggingface.co/google/gemma-4-31B-it) reference configuration. Its
+mean-activation-difference and weight-orthogonalization approach builds on
 [`andyrdt/refusal_direction`](https://github.com/andyrdt/refusal_direction/tree/9d852fae1a9121c78b29142de733cb1340770cc3).
 
 ## Artifacts and privacy
 
-Run artifacts and exported model files are written to separate directories. Raw thinking trajectories are
-owner-readable private artifacts and are never included in exported checkpoints. Hub pushes, public endpoints, and
-automatic publication are disabled. Exported weights can be loaded with the model family's standard Transformers auto
-class and `trust_remote_code=False`.
+Artifacts are content-hashed and tied to the pinned checkpoint, target-generation settings, and tokenizer/chat-template
+fingerprints before reuse. Raw parsed trajectories can contain model thinking and are written with owner-only
+permissions. They are never copied into the exported checkpoint. The pipeline does not push models or artifacts to a
+Hub or expose a public endpoint.

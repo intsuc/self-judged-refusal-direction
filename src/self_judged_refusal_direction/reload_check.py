@@ -6,18 +6,19 @@ import os
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import torch
 from safetensors.torch import load_file, save_file
 
-from self_judged_refusal_direction.config import ModelConfig
+from self_judged_refusal_direction.config import ModelConfig, TargetGenerationConfig
 from self_judged_refusal_direction.errors import InvariantError
+from self_judged_refusal_direction.generation import generation_kwargs, resolved_generation_kwargs
 from self_judged_refusal_direction.hashing import canonical_json_bytes, object_sha256
 from self_judged_refusal_direction.models.base import ArchitectureAdapter
-from self_judged_refusal_direction.models.registry import create_adapter
+from self_judged_refusal_direction.models.registry import adapter_for_config
 
 
 @dataclass(frozen=True)
@@ -37,10 +38,13 @@ class ReloadCheckReport:
     target_trajectory_passed: bool
     error: str | None = None
 
+    def as_dict(self) -> dict[str, Any]:
+        return {key: value for key, value in asdict(self).items() if value is not None}
+
     @property
     def passed(self) -> bool:
         trajectory_passed = not self.target_trajectory_required or (
-            self.processor_reload_verified and self.target_thinking_enabled and self.target_trajectory_passed
+            self.processor_reload_verified and self.target_trajectory_passed
         )
         return self.status == "OK" and self.tied_weights_preserved and self.probe_logits_match and trajectory_passed
 
@@ -72,11 +76,12 @@ def run_fresh_reload_check(
     rtol: float,
     timeout_seconds: float = 1800.0,
     expected_processor_fingerprints: dict[str, str],
-    adapter_name: str,
     verify_target_trajectory: bool = True,
     target_trajectory_max_new_tokens: int = 256,
+    target_generation: TargetGenerationConfig,
+    expected_generation_config_hash: str,
+    seed: int,
     revision: str,
-    low_cpu_mem_usage: bool = True,
 ) -> ReloadCheckReport:
     target = Path(model_dir).resolve()
     with tempfile.TemporaryDirectory(prefix="self-judged-refusal-direction-reload-") as temporary_name:
@@ -103,11 +108,12 @@ def run_fresh_reload_check(
             "atol": atol,
             "rtol": rtol,
             "expected_processor_fingerprints": expected_processor_fingerprints,
-            "adapter_name": adapter_name,
             "verify_target_trajectory": verify_target_trajectory,
             "target_trajectory_max_new_tokens": target_trajectory_max_new_tokens,
+            "target_generation": asdict(target_generation),
+            "expected_generation_config_hash": expected_generation_config_hash,
+            "seed": seed,
             "revision": revision,
-            "low_cpu_mem_usage": low_cpu_mem_usage,
         }
         request_path.write_bytes(canonical_json_bytes(request) + b"\n")
         environment = dict(os.environ)
@@ -142,7 +148,6 @@ def run_fresh_reload_check(
 
 
 def perform_reload_check(request: dict[str, Any]) -> ReloadCheckReport:
-    adapter = create_adapter(str(request["adapter_name"]))
     dtype = str(request.get("dtype") or "float32").removeprefix("torch.")
     _torch_dtype(dtype)
     device_map = str(request.get("device_map") or "cpu")
@@ -150,13 +155,11 @@ def perform_reload_check(request: dict[str, Any]) -> ReloadCheckReport:
     model_config = ModelConfig(
         id=str(request["model_dir"]),
         revision=str(request["revision"]),
-        adapter=str(request["adapter_name"]),
         dtype=dtype,
         device_map=device_map,
-        trust_remote_code=False,
         attention_implementation=attention_implementation,
-        low_cpu_mem_usage=bool(request.get("low_cpu_mem_usage", True)),
     )
+    adapter = adapter_for_config(model_config)
     model = adapter.load_model(model_config)
     model.eval()
     model.requires_grad_(False)
@@ -204,9 +207,22 @@ def perform_reload_check(request: dict[str, Any]) -> ReloadCheckReport:
     if not model_type.__module__.startswith("transformers."):
         raise InvariantError("fresh reload used a non-Transformers model implementation")
     processor_reload_verified = False
-    target_thinking_enabled = False
+    raw_target_generation = request.get("target_generation")
+    if not isinstance(raw_target_generation, dict):
+        raise InvariantError("fresh reload target generation config is invalid")
+    target_generation = TargetGenerationConfig(**raw_target_generation)
+    target_thinking_enabled = target_generation.thinking_enabled
     target_trajectory_passed = False
     target_trajectory_required = bool(request.get("verify_target_trajectory", True))
+    actual_generation_config_hash = object_sha256(
+        {
+            "system_prompt": target_generation.system_prompt,
+            "thinking_enabled": target_generation.thinking_enabled,
+            "generate_kwargs": resolved_generation_kwargs(model, target_generation),
+        }
+    )
+    if actual_generation_config_hash != str(request["expected_generation_config_hash"]):
+        raise InvariantError("fresh reload generation configuration does not match")
     if target_trajectory_required:
         processor = adapter.load_processor(model_config)
         actual_fingerprints = adapter.processor_fingerprints(processor)
@@ -214,12 +230,13 @@ def perform_reload_check(request: dict[str, Any]) -> ReloadCheckReport:
         if actual_fingerprints != expected_fingerprints:
             raise InvariantError("fresh reload processor or tokenizer fingerprint does not match")
         processor_reload_verified = True
-        target_thinking_enabled = True
         target_trajectory_passed = _run_target_trajectory_probe(
             model,
             processor,
             adapter,
             int(request["target_trajectory_max_new_tokens"]),
+            target_generation,
+            int(request["seed"]),
         )
     return ReloadCheckReport(
         status="OK",
@@ -243,13 +260,20 @@ def _run_target_trajectory_probe(
     processor: Any,
     adapter: ArchitectureAdapter,
     max_new_tokens: int,
+    target_generation: TargetGenerationConfig,
+    seed: int,
 ) -> bool:
     if max_new_tokens < 1:
         raise InvariantError("fresh reload target trajectory length must be positive")
-    rendered = adapter.render_target_chat(
-        processor,
-        [{"role": "user", "content": "Reply with exactly OK."}],
+    probe_generation = replace(
+        target_generation,
+        max_new_tokens=min(max_new_tokens, target_generation.max_new_tokens),
     )
+    messages: list[dict[str, str]] = []
+    if probe_generation.system_prompt is not None:
+        messages.append({"role": "system", "content": probe_generation.system_prompt})
+    messages.append({"role": "user", "content": "Reply with exactly OK."})
+    rendered = adapter.render_target_chat(processor, messages, config=probe_generation)
     if not isinstance(rendered, dict) and not hasattr(rendered, "items"):
         raise InvariantError("fresh reload target chat did not return model inputs")
     inputs = dict(rendered)
@@ -264,14 +288,12 @@ def _run_target_trajectory_probe(
     generate = getattr(model, "generate", None)
     if not callable(generate):
         raise InvariantError("fresh reload target model does not support generation")
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     with torch.inference_mode():
-        sequences = generate(
-            **inputs,
-            do_sample=False,
-            num_beams=1,
-            max_new_tokens=max_new_tokens,
-            use_cache=True,
-        )
+        output = generate(**inputs, **generation_kwargs(probe_generation))
+    sequences = getattr(output, "sequences", output)
     if not isinstance(sequences, torch.Tensor) or sequences.ndim != 2 or sequences.shape[0] != 1:
         raise InvariantError("fresh reload target generation did not return one token sequence")
     sequence = sequences[0].detach().to(device="cpu")
@@ -281,6 +303,7 @@ def _run_target_trajectory_probe(
         processor,
         sequence[prefix_ids.numel() :],
         prefix_ids=prefix_ids,
+        thinking_enabled=probe_generation.thinking_enabled,
     )
     if not parsed.terminal_found:
         raise InvariantError("fresh reload target trajectory did not reach an official terminal boundary")
@@ -323,7 +346,7 @@ def _same_parameter_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
 
 
 def _write_report(path: Path, value: ReloadCheckReport) -> None:
-    path.write_bytes(canonical_json_bytes(asdict(value)) + b"\n")
+    path.write_bytes(canonical_json_bytes(value.as_dict()) + b"\n")
 
 
 def main(argv: list[str] | None = None) -> int:

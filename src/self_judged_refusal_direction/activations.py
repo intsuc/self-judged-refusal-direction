@@ -18,10 +18,7 @@ from self_judged_refusal_direction.errors import ArtifactError, InvariantError
 from self_judged_refusal_direction.hashing import canonical_json_bytes, object_sha256
 from self_judged_refusal_direction.schema import ActivationKey, JudgeLabel
 
-Phase = Literal["pre_thinking", "pre_final"]
 ClassLabel = Literal["REFUSAL", "NON_REFUSAL"]
-type PositionValues = Sequence[int] | torch.Tensor
-type PositionIndices = Mapping[int, PositionValues] | Sequence[Sequence[int]] | torch.Tensor
 
 _DTYPES: dict[str, torch.dtype] = {
     "float32": torch.float32,
@@ -122,9 +119,6 @@ class OnlineWelford:
         self.m2.add_(incoming_m2 + delta.square() * (self.count * count / total))
         self.count = total
 
-    def merge_moments(self, moments: ActivationMoments) -> None:
-        self.merge(count=moments.count, mean=moments.mean, m2=moments.m2)
-
     def snapshot(self) -> ActivationMoments:
         if self.mean is None or self.m2 is None:
             raise InvariantError("activation accumulator has no observations")
@@ -146,12 +140,7 @@ class ActivationStatistics:
 
     @property
     def keys(self) -> tuple[ActivationKey, ...]:
-        return tuple(
-            sorted(
-                set(self.refusal) | set(self.non_refusal),
-                key=lambda key: (key.phase, key.layer, key.relative_position),
-            )
-        )
+        return tuple(sorted(set(self.refusal) | set(self.non_refusal), key=lambda key: key.layer))
 
     def paired(self, key: ActivationKey) -> tuple[ActivationMoments, ActivationMoments]:
         try:
@@ -163,8 +152,6 @@ class ActivationStatistics:
 @dataclass(frozen=True)
 class _CaptureState:
     labels: tuple[str, ...]
-    boundary_positions: PositionValues | None
-    position_indices: PositionIndices | None
 
 
 class ActivationCollector:
@@ -172,16 +159,9 @@ class ActivationCollector:
         self,
         block_modules: Sequence[nn.Module],
         *,
-        phase: Phase,
-        relative_positions: Sequence[int],
         layers: Literal["all"] | Sequence[int] = "all",
         dtype: str | torch.dtype = torch.float64,
     ):
-        if phase not in {"pre_thinking", "pre_final"}:
-            raise InvariantError("unsupported activation phase")
-        positions = tuple(dict.fromkeys(int(position) for position in relative_positions))
-        if not positions:
-            raise InvariantError("at least one activation position is required")
         blocks = tuple(block_modules)
         selected_layers = (
             tuple(range(len(blocks))) if layers == "all" else tuple(dict.fromkeys(int(layer) for layer in layers))
@@ -189,8 +169,6 @@ class ActivationCollector:
         if not selected_layers or any(layer < 0 or layer >= len(blocks) for layer in selected_layers):
             raise InvariantError("candidate layer index is outside the transformer block sequence")
         self.block_modules = blocks
-        self.phase = phase
-        self.relative_positions = positions
         self.layers = selected_layers
         self.dtype = accumulator_dtype(dtype)
         self._moments: dict[str, dict[ActivationKey, OnlineWelford]] = {
@@ -209,23 +187,14 @@ class ActivationCollector:
     def capture(
         self,
         labels: Sequence[JudgeLabel | str | None],
-        *,
-        boundary_positions: PositionValues | None = None,
-        position_indices: PositionIndices | None = None,
     ) -> Iterator[None]:
         if self._capture is not None:
             raise InvariantError("activation captures cannot be nested")
-        if boundary_positions is not None and position_indices is not None:
-            raise InvariantError("boundary_positions and position_indices are mutually exclusive")
         label_values = tuple(
             label.value if isinstance(label, JudgeLabel) else str(label) if label is not None else ""
             for label in labels
         )
-        self._capture = _CaptureState(
-            labels=label_values,
-            boundary_positions=boundary_positions,
-            position_indices=position_indices,
-        )
+        self._capture = _CaptureState(labels=label_values)
         self._seen_layers = set()
         handles = [self.block_modules[layer].register_forward_pre_hook(self._hook(layer)) for layer in self.layers]
         completed = False
@@ -245,11 +214,8 @@ class ActivationCollector:
         self,
         forward: Callable[[], object],
         labels: Sequence[JudgeLabel | str | None],
-        *,
-        boundary_positions: PositionValues | None = None,
-        position_indices: PositionIndices | None = None,
     ) -> object:
-        with self.capture(labels, boundary_positions=boundary_positions, position_indices=position_indices):
+        with self.capture(labels):
             return forward()
 
     def _hook(self, layer: int):
@@ -264,6 +230,8 @@ class ActivationCollector:
             activation = inputs[0]
             if activation.ndim != 3:
                 raise InvariantError("transformer block activation must have shape [batch, sequence, hidden]")
+            if activation.shape[1] < 1:
+                raise InvariantError("transformer block activation sequence must be non-empty")
             if activation.shape[0] != len(self._capture.labels):
                 raise InvariantError("activation batch size does not match label count")
             accepted = [
@@ -273,61 +241,16 @@ class ActivationCollector:
             ]
             if not accepted:
                 return
-            indices = self._resolve_indices(activation)
-            batch = torch.arange(activation.shape[0], device=activation.device).unsqueeze(1)
-            selected = activation[batch, indices].detach().to(device="cpu", dtype=self.dtype)
-            for position_offset, relative_position in enumerate(self.relative_positions):
-                key = ActivationKey(
-                    phase=self.phase,
-                    layer=layer,
-                    relative_position=relative_position,
-                )
-                for label in (JudgeLabel.REFUSAL.value, JudgeLabel.NON_REFUSAL.value):
-                    label_rows = [index for index in accepted if self._capture.labels[index] == label]
-                    if not label_rows:
-                        continue
-                    accumulator = self._moments[label].setdefault(key, OnlineWelford(dtype=self.dtype))
-                    accumulator.update(selected[label_rows, position_offset, :])
+            selected = activation[:, -1, :].detach().to(device="cpu", dtype=self.dtype)
+            key = ActivationKey(layer=layer)
+            for label in (JudgeLabel.REFUSAL.value, JudgeLabel.NON_REFUSAL.value):
+                label_rows = [index for index in accepted if self._capture.labels[index] == label]
+                if not label_rows:
+                    continue
+                accumulator = self._moments[label].setdefault(key, OnlineWelford(dtype=self.dtype))
+                accumulator.update(selected[label_rows])
 
         return hook
-
-    def _resolve_indices(self, activation: torch.Tensor) -> torch.Tensor:
-        if self._capture is None:
-            raise InvariantError("activation capture state is unavailable")
-        batch_size, sequence_length = activation.shape[:2]
-        explicit = self._capture.position_indices
-        if explicit is not None:
-            if isinstance(explicit, Mapping):
-                columns = []
-                for position in self.relative_positions:
-                    if position not in explicit:
-                        raise InvariantError(f"missing explicit indices for relative position {position}")
-                    column = torch.as_tensor(explicit[position], dtype=torch.long, device=activation.device)
-                    if column.ndim == 0:
-                        column = column.expand(batch_size)
-                    columns.append(column)
-                indices = torch.stack(columns, dim=1)
-            else:
-                indices = torch.as_tensor(explicit, dtype=torch.long, device=activation.device)
-                if indices.ndim == 1 and len(self.relative_positions) == 1:
-                    indices = indices.unsqueeze(1)
-        else:
-            boundary = self._capture.boundary_positions
-            if boundary is None:
-                boundary_tensor = torch.full((batch_size,), sequence_length, dtype=torch.long, device=activation.device)
-            else:
-                boundary_tensor = torch.as_tensor(boundary, dtype=torch.long, device=activation.device)
-                if boundary_tensor.ndim == 0:
-                    boundary_tensor = boundary_tensor.expand(batch_size)
-            indices = boundary_tensor.unsqueeze(1) + torch.tensor(
-                self.relative_positions, dtype=torch.long, device=activation.device
-            ).unsqueeze(0)
-        if indices.shape != (batch_size, len(self.relative_positions)):
-            raise InvariantError("activation position indices have an invalid shape")
-        indices = torch.where(indices < 0, indices + sequence_length, indices)
-        if torch.any(indices < 0) or torch.any(indices >= sequence_length):
-            raise InvariantError("activation position is outside the sequence")
-        return indices
 
     def statistics(self) -> ActivationStatistics:
         def snapshots(label: str) -> dict[ActivationKey, ActivationMoments]:
@@ -337,22 +260,6 @@ class ActivationCollector:
             refusal=snapshots(JudgeLabel.REFUSAL.value),
             non_refusal=snapshots(JudgeLabel.NON_REFUSAL.value),
         )
-
-
-def merge_activation_statistics(statistics: Sequence[ActivationStatistics]) -> ActivationStatistics:
-    merged: dict[str, dict[ActivationKey, OnlineWelford]] = {
-        JudgeLabel.REFUSAL.value: {},
-        JudgeLabel.NON_REFUSAL.value: {},
-    }
-    for item in statistics:
-        for label in (JudgeLabel.REFUSAL.value, JudgeLabel.NON_REFUSAL.value):
-            for key, moments in item.for_label(label).items():
-                accumulator = merged[label].setdefault(key, OnlineWelford(dtype=moments.mean.dtype))
-                accumulator.merge_moments(moments)
-    return ActivationStatistics(
-        refusal={key: value.snapshot() for key, value in merged[JudgeLabel.REFUSAL.value].items()},
-        non_refusal={key: value.snapshot() for key, value in merged[JudgeLabel.NON_REFUSAL.value].items()},
-    )
 
 
 def _atomic_safetensors(path: Path, tensors: dict[str, torch.Tensor], metadata: dict[str, str]) -> None:
@@ -374,13 +281,13 @@ def save_activation_statistics(path: str | Path, statistics: ActivationStatistic
     for label in (JudgeLabel.REFUSAL.value, JudgeLabel.NON_REFUSAL.value):
         for key, moments in sorted(
             statistics.for_label(label).items(),
-            key=lambda item: (item[0].phase, item[0].layer, item[0].relative_position),
+            key=lambda item: item[0].layer,
         ):
             prefix = f"{label}/{key.storage_key}"
             tensors[f"{prefix}/mean"] = moments.mean.contiguous()
             tensors[f"{prefix}/m2"] = moments.m2.contiguous()
             entries.append({"label": label, "key": key.storage_key, "count": moments.count})
-    payload = {"schema_version": 1, "entries": entries}
+    payload = {"entries": entries}
     _atomic_safetensors(
         Path(path),
         tensors,
@@ -406,7 +313,7 @@ def load_activation_statistics(path: str | Path) -> ActivationStatistics:
             if payload_text is None:
                 raise ArtifactError("activation statistics metadata is missing")
             payload = json.loads(payload_text)
-            if payload.get("schema_version") != 1 or object_sha256(payload) != metadata.get("content_profile_sha256"):
+            if object_sha256(payload) != metadata.get("content_profile_sha256"):
                 raise ArtifactError("activation statistics metadata is invalid")
             for entry in payload.get("entries", []):
                 label = entry["label"]

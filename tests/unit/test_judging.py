@@ -6,7 +6,6 @@ from typing import Any
 
 import torch
 
-from self_judged_refusal_direction.config import JudgeConfig, ModelConfig, ProjectConfig
 from self_judged_refusal_direction.judging import TrajectoryJudge
 from self_judged_refusal_direction.models.gemma4 import Gemma4Adapter
 from self_judged_refusal_direction.schema import TargetTrajectory
@@ -82,7 +81,6 @@ def trajectory() -> TargetTrajectory:
         original_prompt="request",
         raw_generated_token_ids=(1, 2),
         raw_decoded_output="thinking answer",
-        thinking_segments=("thinking",),
         thinking_text="thinking",
         final_answer="answer",
         thinking_token_start=0,
@@ -97,18 +95,11 @@ def trajectory() -> TargetTrajectory:
     )
 
 
-def judge_config() -> ProjectConfig:
-    return ProjectConfig(
-        model=ModelConfig(revision="a" * 40),
-        judge=JudgeConfig(score_allowed_labels=False, safety_margin_tokens=0),
-    )
-
-
 def test_judge_uses_thinking_disabled_and_preserves_semantic_uncertain() -> None:
     processor = ProcessorSpy()
     adapter = ToyJudgeAdapter(context=128)
     model = ToyJudgeModel(processor.tokenizer, "UNCERTAIN")
-    judge = TrajectoryJudge(judge_config(), adapter, model, processor, "chat")
+    judge = TrajectoryJudge(adapter, model, processor)
 
     result = judge.classify(trajectory())
 
@@ -124,7 +115,7 @@ def test_context_overflow_is_error_not_uncertain() -> None:
     processor = ProcessorSpy()
     adapter = ToyJudgeAdapter(context=12)
     model = ToyJudgeModel(processor.tokenizer, "UNCERTAIN")
-    judge = TrajectoryJudge(judge_config(), adapter, model, processor, "chat")
+    judge = TrajectoryJudge(adapter, model, processor)
 
     result = judge.classify(trajectory())
 
@@ -140,7 +131,7 @@ def test_adapter_failure_is_returned_as_judge_error() -> None:
     processor = BrokenProcessor()
     adapter = ToyJudgeAdapter(context=128)
     model = ToyJudgeModel(processor.tokenizer, "NON_REFUSAL")
-    judge = TrajectoryJudge(judge_config(), adapter, model, processor, "chat")
+    judge = TrajectoryJudge(adapter, model, processor)
 
     result = judge.classify(trajectory())
 
@@ -154,7 +145,7 @@ def test_judge_does_not_own_runtime_resources() -> None:
     model = ToyJudgeModel(processor.tokenizer, "NON_REFUSAL")
     model_ref = weakref.ref(model)
     processor_ref = weakref.ref(processor)
-    judge = TrajectoryJudge(judge_config(), ToyJudgeAdapter(context=128), model, processor, "chat")
+    judge = TrajectoryJudge(ToyJudgeAdapter(context=128), model, processor)
 
     del model
     del processor

@@ -16,12 +16,13 @@ from self_judged_refusal_direction.activations import ActivationStatistics
 from self_judged_refusal_direction.artifacts import ArtifactMetadata, ArtifactProfile, ArtifactStore
 from self_judged_refusal_direction.errors import ArtifactError, InvariantError
 from self_judged_refusal_direction.hashing import canonical_json_bytes, file_sha256, object_sha256, tensor_sha256
-from self_judged_refusal_direction.schema import ActivationKey, DirectionCandidate
+from self_judged_refusal_direction.schema import DirectionCandidate
 
 _DIRECTION_DTYPES: dict[str, torch.dtype] = {
     "float32": torch.float32,
     "float64": torch.float64,
 }
+_MINIMUM_DIRECTION_NORM = 1e-8
 
 
 @dataclass(frozen=True)
@@ -34,19 +35,14 @@ class CandidateBundle:
             raise InvariantError("candidate directions must be a two-dimensional CPU tensor")
         if self.directions.shape[0] != len(self.candidates):
             raise InvariantError("candidate tensor and metadata counts do not match")
-        for index, candidate in enumerate(self.candidates):
-            if candidate.direction_index != index:
-                raise InvariantError("candidate direction indices must be contiguous and ordered")
-
-    @property
-    def metadata(self) -> tuple[DirectionCandidate, ...]:
-        return self.candidates
+        if len({candidate.candidate_id for candidate in self.candidates}) != len(self.candidates):
+            raise InvariantError("candidate IDs must be unique")
 
     def direction(self, candidate: DirectionCandidate | str) -> torch.Tensor:
         candidate_id = candidate.candidate_id if isinstance(candidate, DirectionCandidate) else candidate
-        for metadata in self.candidates:
+        for index, metadata in enumerate(self.candidates):
             if metadata.candidate_id == candidate_id:
-                return self.directions[metadata.direction_index]
+                return self.directions[index]
         raise KeyError(candidate_id)
 
 
@@ -61,23 +57,11 @@ def _direction_dtype(value: str | torch.dtype) -> torch.dtype:
         raise InvariantError("direction dtype must be float32 or float64") from error
 
 
-def _boundary_token(boundary_tokens: Mapping[ActivationKey | str, str] | None, key: ActivationKey) -> str:
-    if boundary_tokens is None:
-        return ""
-    if key in boundary_tokens:
-        return boundary_tokens[key]
-    return boundary_tokens.get(key.storage_key, "")
-
-
-def build_direction_candidates(
+def build_candidates(
     statistics: ActivationStatistics,
     *,
-    boundary_tokens: Mapping[ActivationKey | str, str] | None = None,
-    minimum_norm: float = 1e-8,
     dtype: str | torch.dtype = torch.float32,
 ) -> CandidateBundle:
-    if minimum_norm <= 0:
-        raise InvariantError("minimum direction norm must be positive")
     output_dtype = _direction_dtype(dtype)
     directions: list[torch.Tensor] = []
     candidates: list[DirectionCandidate] = []
@@ -106,7 +90,7 @@ def build_direction_candidates(
             and torch.isfinite(norm_tensor)
         )
         norm = float(norm_tensor.item()) if numerical_finite else 0.0
-        eligible = numerical_finite and norm >= minimum_norm
+        eligible = numerical_finite and norm >= _MINIMUM_DIRECTION_NORM
         unit_direction = raw_direction / norm_tensor if eligible else torch.zeros_like(raw_direction)
         if eligible:
             refusal_projected_mean = float(torch.dot(refusal_mean, unit_direction).item())
@@ -135,15 +119,11 @@ def build_direction_candidates(
                 "non_refusal_count": non_refusal.count,
             }
         )
-        index = len(directions)
         directions.append(stored_direction)
         candidates.append(
             DirectionCandidate(
                 candidate_id=candidate_id,
-                phase=key.phase,
                 layer=key.layer,
-                relative_position=key.relative_position,
-                direction_index=index,
                 norm=norm,
                 refusal_count=refusal.count,
                 non_refusal_count=non_refusal.count,
@@ -152,7 +132,6 @@ def build_direction_candidates(
                 non_refusal_projected_mean=non_refusal_projected_mean,
                 refusal_projected_variance_diagonal=refusal_projected_variance,
                 non_refusal_projected_variance_diagonal=non_refusal_projected_variance,
-                boundary_token=_boundary_token(boundary_tokens, key),
                 finite=numerical_finite,
             )
         )
@@ -163,37 +142,19 @@ def build_direction_candidates(
     return CandidateBundle(directions=tensor, candidates=tuple(candidates))
 
 
-def build_candidates(
-    statistics: ActivationStatistics,
-    *,
-    boundary_tokens: Mapping[ActivationKey | str, str] | None = None,
-    minimum_norm: float = 1e-8,
-    dtype: str | torch.dtype = torch.float32,
-) -> CandidateBundle:
-    return build_direction_candidates(
-        statistics,
-        boundary_tokens=boundary_tokens,
-        minimum_norm=minimum_norm,
-        dtype=dtype,
-    )
-
-
-def rank_stage_a(
+def rank_activation_screening(
     candidates: CandidateBundle | Sequence[DirectionCandidate],
     *,
-    top_m: int,
-    minimum_norm: float = 1e-8,
+    keep: int,
 ) -> tuple[DirectionCandidate, ...]:
-    if top_m < 1:
-        raise InvariantError("Stage A top_m must be positive")
-    if minimum_norm <= 0:
-        raise InvariantError("minimum direction norm must be positive")
+    if keep < 1:
+        raise InvariantError("activation screening keep count must be positive")
     metadata = candidates.candidates if isinstance(candidates, CandidateBundle) else tuple(candidates)
     eligible = [
         candidate
         for candidate in metadata
         if candidate.finite
-        and candidate.norm >= minimum_norm
+        and candidate.norm >= _MINIMUM_DIRECTION_NORM
         and candidate.refusal_count > 0
         and candidate.non_refusal_count > 0
     ]
@@ -201,13 +162,11 @@ def rank_stage_a(
         key=lambda candidate: (
             -candidate.standardized_separation,
             -candidate.norm,
-            candidate.phase,
             candidate.layer,
-            candidate.relative_position,
             candidate.candidate_id,
         )
     )
-    return tuple(eligible[:top_m])
+    return tuple(eligible[:keep])
 
 
 def _atomic_safetensors(
@@ -231,7 +190,7 @@ def _atomic_safetensors(
 
 def save_candidates(path: str | Path, bundle: CandidateBundle, *, private: bool = False) -> None:
     candidate_values = [asdict(candidate) for candidate in bundle.candidates]
-    payload = {"schema_version": 1, "candidates": candidate_values}
+    payload = {"candidates": candidate_values}
     _atomic_safetensors(
         Path(path),
         {"directions": bundle.directions.contiguous()},
@@ -254,7 +213,7 @@ def load_candidates(path: str | Path) -> CandidateBundle:
             if payload_text is None:
                 raise ArtifactError("candidate bundle metadata is missing")
             payload = json.loads(payload_text)
-            if payload.get("schema_version") != 1 or object_sha256(payload) != metadata.get("candidate_bundle_sha256"):
+            if object_sha256(payload) != metadata.get("candidate_bundle_sha256"):
                 raise ArtifactError("candidate bundle metadata is invalid")
             directions = stream.get_tensor("directions")
         candidates = tuple(DirectionCandidate(**value) for value in payload.get("candidates", []))
@@ -320,14 +279,12 @@ def write_candidate_artifacts(
 ) -> None:
     save_candidates(store.paths.candidates, bundle)
     metadata = ArtifactMetadata(
-        schema_version=1,
         artifact_type="direction_candidates",
         private=False,
-        record_count=len(bundle.candidates),
         content_sha256=file_sha256(store.paths.candidates),
         profile=profile,
     )
-    store.write_json(store.metadata_path(store.paths.candidates), asdict(metadata), private=False)
+    store.write_json(store.metadata_path(store.paths.candidates), metadata.as_dict(), private=False)
     store.write_jsonl(
         store.paths.candidate_metadata,
         bundle.candidates,
@@ -342,7 +299,7 @@ def load_candidate_artifacts(
     *,
     expected_profile: ArtifactProfile,
 ) -> CandidateBundle:
-    binary_metadata = store.validate(
+    store.validate(
         store.paths.candidates,
         artifact_type="direction_candidates",
         expected_profile=expected_profile,
@@ -356,25 +313,6 @@ def load_candidate_artifacts(
         )
     )
     sidecar_candidates = tuple(DirectionCandidate(**row) for row in rows)
-    if binary_metadata.record_count != len(bundle.candidates) or sidecar_candidates != bundle.candidates:
+    if sidecar_candidates != bundle.candidates:
         raise ArtifactError("candidate tensor and metadata artifacts do not match")
     return bundle
-
-
-def write_stage_a_ranking(
-    store: ArtifactStore,
-    ranking: Sequence[DirectionCandidate],
-) -> None:
-    store.write_json(
-        store.paths.stage_a_ranking,
-        [
-            {
-                "rank": rank,
-                "candidate_id": candidate.candidate_id,
-                "standardized_separation": candidate.standardized_separation,
-                "norm": candidate.norm,
-            }
-            for rank, candidate in enumerate(ranking, start=1)
-        ],
-        private=False,
-    )

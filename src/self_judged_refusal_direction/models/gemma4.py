@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from transformers import AutoModelForMultimodalLM, AutoProcessor
 
-from self_judged_refusal_direction.config import ModelConfig, ProjectConfig
+from self_judged_refusal_direction.config import ModelConfig, TargetGenerationConfig
 from self_judged_refusal_direction.errors import CompatibilityError, InvariantError
 from self_judged_refusal_direction.hashing import object_sha256
 from self_judged_refusal_direction.models.base import (
@@ -18,7 +18,7 @@ from self_judged_refusal_direction.models.base import (
     ResidualWriterTarget,
     ResponseTokenGrammar,
 )
-from self_judged_refusal_direction.schema import CompatibilityReport, TargetTrajectory
+from self_judged_refusal_direction.schema import CompatibilityReport
 
 
 @dataclass(frozen=True)
@@ -87,8 +87,8 @@ class Gemma4Adapter(ArchitectureAdapter):
     name = "gemma4"
 
     def load_model(self, config: ModelConfig) -> nn.Module:
-        if config.trust_remote_code:
-            raise InvariantError("Gemma 4 must use the built-in Transformers implementation")
+        if not isinstance(config.id, str) or not config.id:
+            raise InvariantError("model.id is required")
         dtype = getattr(torch, config.dtype, None)
         if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
             raise InvariantError(f"unsupported model dtype: {config.dtype}")
@@ -98,13 +98,13 @@ class Gemma4Adapter(ArchitectureAdapter):
             trust_remote_code=False,
             dtype=dtype,
             device_map=config.device_map,
-            low_cpu_mem_usage=config.low_cpu_mem_usage,
+            low_cpu_mem_usage=True,
             attn_implementation=config.attention_implementation,
         )
 
     def load_processor(self, config: ModelConfig) -> Any:
-        if config.trust_remote_code:
-            raise InvariantError("Gemma 4 must use the built-in Transformers implementation")
+        if not isinstance(config.id, str) or not config.id:
+            raise InvariantError("model.id is required")
         return AutoProcessor.from_pretrained(
             config.id,
             revision=config.revision,
@@ -136,9 +136,23 @@ class Gemma4Adapter(ArchitectureAdapter):
         self,
         processor: Any,
         messages: Sequence[Mapping[str, Any]],
+        config: TargetGenerationConfig | None = None,
+        *,
+        thinking_enabled: bool | None = None,
         **kwargs: Any,
     ) -> Any:
-        return self._render_chat(processor, messages, enable_thinking=True, **kwargs)
+        configured = config.thinking_enabled if config is not None else None
+        if configured is not None and not isinstance(configured, bool):
+            raise InvariantError("target thinking mode must be a boolean")
+        if thinking_enabled is None:
+            resolved = True if configured is None else configured
+        else:
+            if not isinstance(thinking_enabled, bool):
+                raise InvariantError("target thinking mode must be a boolean")
+            if configured is not None and thinking_enabled is not configured:
+                raise InvariantError("explicit target thinking mode conflicts with generation config")
+            resolved = thinking_enabled
+        return self._render_chat(processor, messages, enable_thinking=resolved, **kwargs)
 
     def render_judge_chat(
         self,
@@ -198,17 +212,29 @@ class Gemma4Adapter(ArchitectureAdapter):
         generated_ids: Sequence[int] | torch.Tensor,
         *,
         prefix_ids: Sequence[int] | torch.Tensor = (),
+        thinking_enabled: bool = True,
     ) -> ParsedTargetOutput:
+        if not isinstance(thinking_enabled, bool):
+            raise InvariantError("target thinking mode must be a boolean")
         tokens = _token_ids(generated_ids, "generated_ids")
         prefix = _token_ids(prefix_ids, "prefix_ids")
         grammar = self.response_token_grammar(processor)
-        if tokens[: len(grammar.thinking_open)] != grammar.thinking_open:
-            raise InvariantError("thinking output does not start with the official response delimiter")
-        thinking_start = len(grammar.thinking_open)
-        thinking_end = _find_sequence(tokens, grammar.thinking_close, thinking_start)
-        if thinking_end is None:
-            raise InvariantError("thinking output has no official closing delimiter")
-        final_start = thinking_end + len(grammar.thinking_close)
+        if thinking_enabled:
+            if tokens[: len(grammar.thinking_open)] != grammar.thinking_open:
+                raise InvariantError("thinking output does not start with the official response delimiter")
+            thinking_start = len(grammar.thinking_open)
+            thinking_end = _find_sequence(tokens, grammar.thinking_close, thinking_start)
+            if thinking_end is None:
+                raise InvariantError("thinking output has no official closing delimiter")
+            final_start = thinking_end + len(grammar.thinking_close)
+        else:
+            if _find_sequence(tokens, grammar.thinking_open, 0) is not None:
+                raise InvariantError("content-only output contains a thinking opening delimiter")
+            if _find_sequence(tokens, grammar.thinking_close, 0) is not None:
+                raise InvariantError("content-only output contains a thinking closing delimiter")
+            thinking_start = 0
+            thinking_end = 0
+            final_start = 0
 
         terminal_candidates: list[tuple[int, tuple[int, ...]]] = []
         for pattern in grammar.content_closes:
@@ -225,6 +251,8 @@ class Gemma4Adapter(ArchitectureAdapter):
             final_end = terminal_start
             terminal_found = True
         else:
+            if not thinking_enabled:
+                raise InvariantError("content-only output has no official terminal delimiter")
             final_end = len(tokens)
             terminal_found = False
 
@@ -240,15 +268,20 @@ class Gemma4Adapter(ArchitectureAdapter):
         final_answer = parsed.get("content", "")
         if not isinstance(thinking_text, str) or not isinstance(final_answer, str):
             raise InvariantError("official response parser returned non-text response fields")
-        decoded_thinking = _decode(processor, tokens[thinking_start:thinking_end])
+        if not thinking_enabled and thinking_text:
+            raise InvariantError("official response parser found thinking in content-only output")
         decoded_final = _decode(processor, tokens[final_start:final_end])
-        if decoded_thinking.strip() != thinking_text or decoded_final.strip() != final_answer:
+        if thinking_enabled:
+            decoded_thinking = _decode(processor, tokens[thinking_start:thinking_end])
+            parser_disagrees = decoded_thinking.strip() != thinking_text or decoded_final.strip() != final_answer
+        else:
+            parser_disagrees = decoded_final.strip() != final_answer
+        if parser_disagrees:
             raise InvariantError("official response parser disagrees with token grammar boundaries")
 
         return ParsedTargetOutput(
             raw_generated_token_ids=tokens,
             raw_decoded_output=_decode(processor, tokens),
-            thinking_segments=(thinking_text,),
             thinking_text=thinking_text,
             final_answer=final_answer,
             thinking_token_start=thinking_start,
@@ -257,21 +290,6 @@ class Gemma4Adapter(ArchitectureAdapter):
             final_token_end=final_end,
             terminal_found=terminal_found,
         )
-
-    def discover_pre_thinking_positions(self, processor: Any, config: ProjectConfig) -> list[int]:
-        del processor
-        count = config.direction.max_boundary_positions
-        return list(range(-count, 0))
-
-    def discover_pre_final_positions(
-        self,
-        processor: Any,
-        trajectory: TargetTrajectory,
-        config: ProjectConfig,
-    ) -> list[int]:
-        del processor, trajectory
-        count = config.direction.max_boundary_positions
-        return list(range(-count, 0))
 
     def dual_direction(self, post_norm: nn.Module, direction: torch.Tensor) -> torch.Tensor:
         if direction.ndim != 1:
@@ -300,7 +318,6 @@ class Gemma4Adapter(ArchitectureAdapter):
         if not architecture:
             architecture = (type(model).__name__,)
         errors: list[str] = []
-        supports_thinking_parse = True
         topology_data: dict[str, Any] = {}
         try:
             topology = self._topology(model)
@@ -318,8 +335,12 @@ class Gemma4Adapter(ArchitectureAdapter):
                     raise CompatibilityError("processor has no parse_response method")
                 probe = (*grammar.thinking_open, *grammar.thinking_close, *grammar.content_closes[0])
                 self.parse_target_trajectory(processor, probe)
+                self.parse_target_trajectory(
+                    processor,
+                    grammar.content_closes[0],
+                    thinking_enabled=False,
+                )
             except (CompatibilityError, InvariantError) as error:
-                supports_thinking_parse = False
                 errors.append(str(error))
 
         if topology is not None:
@@ -372,13 +393,6 @@ class Gemma4Adapter(ArchitectureAdapter):
             vocab_size=topology.vocab_size if topology is not None else 0,
             parameter_count=parameter_count,
             parameter_shapes_hash=object_sha256(parameter_shapes),
-            supports_thinking_parse=supports_thinking_parse,
-            supports_pre_final_activation=supports_thinking_parse and topology is not None,
-            supports_dense_export=topology is not None and not topology.moe_enabled and not topology.ple_enabled,
-            supports_moe_export=False,
-            supports_ple_export=False,
-            supports_multimodal_projection_export=bool(topology and topology.multimodal_projections),
-            supports_tied_weight_export=bool(topology and topology.tied_embeddings),
             compatible=not errors,
             errors=tuple(errors),
             topology=topology_data,

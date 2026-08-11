@@ -15,11 +15,13 @@ import transformers
 from torch import nn
 
 from self_judged_refusal_direction.artifacts import ArtifactMetadata, ArtifactPaths, ArtifactProfile, ArtifactStore
-from self_judged_refusal_direction.config import ProjectConfig
+from self_judged_refusal_direction.config import ProjectConfig, TargetGenerationConfig
 from self_judged_refusal_direction.editing import ProjectionKind, WeightEditPlan
 from self_judged_refusal_direction.errors import CompatibilityError, InvariantError
+from self_judged_refusal_direction.generation import resolved_generation_kwargs
 from self_judged_refusal_direction.hashing import file_sha256, object_sha256, tensor_sha256
 from self_judged_refusal_direction.models.base import ArchitectureAdapter
+from self_judged_refusal_direction.prompting import judge_template_hash
 from self_judged_refusal_direction.reload_check import (
     ReloadCheckReport,
     parameter_count,
@@ -72,11 +74,12 @@ class DeferredReload:
     rtol: float
     timeout_seconds: float
     processor_fingerprints: dict[str, str]
-    adapter_name: str
     verify_target_trajectory: bool
     target_trajectory_max_new_tokens: int
+    target_generation: TargetGenerationConfig
+    expected_generation_config_hash: str
+    seed: int
     revision: str
-    low_cpu_mem_usage: bool
 
 
 def export_edited_model(
@@ -88,8 +91,9 @@ def export_edited_model(
     probe_inputs: Mapping[str, torch.Tensor],
     *,
     output_dir: str | Path | None = None,
-    validation_metrics: Mapping[str, Any] | None = None,
+    full_validation_metrics: Mapping[str, Any] | None = None,
     test_metrics: Mapping[str, Any] | None = None,
+    direction_layer: int,
     probe_atol: float | None = None,
     probe_rtol: float | None = None,
     orthogonality_atol: float | None = None,
@@ -100,18 +104,33 @@ def export_edited_model(
     reload_target_trajectory_max_new_tokens: int = 256,
 ) -> ExportResult:
     config.validate()
-    _validate_export_config(config)
+    effective_generation_config_hash = object_sha256(
+        {
+            "system_prompt": config.target_generation.system_prompt,
+            "thinking_enabled": config.target_generation.thinking_enabled,
+            "generate_kwargs": resolved_generation_kwargs(model, config.target_generation),
+        }
+    )
     if not defer_reload:
         raise InvariantError("fresh reload must be deferred until the edited model is released")
     if reload_target_trajectory_max_new_tokens < 1:
         raise InvariantError("fresh reload target trajectory length must be positive")
-    target = Path(output_dir) if output_dir is not None else ArtifactPaths(config.run.output_dir).exported_model
+    if not isinstance(direction_layer, int) or isinstance(direction_layer, bool) or direction_layer < 0:
+        raise InvariantError("direction layer must be a non-negative integer")
+    if output_dir is None:
+        if config.run.output_dir is None:
+            raise InvariantError("run.output_dir is required")
+        target = ArtifactPaths(config.run.output_dir).exported_model
+    else:
+        target = Path(output_dir)
     target = target.resolve()
     if target.exists() and any(target.iterdir()):
         raise InvariantError(f"export directory must be empty: {target}")
     target.mkdir(parents=True, exist_ok=True)
     model.eval()
     model.requires_grad_(False)
+    if direction_layer >= len(adapter.activation_read_points(model)):
+        raise InvariantError("direction layer is outside the model's decoder layers")
     plan.validate_shapes(model)
     compatibility_before = adapter.compatibility_report(model, None)
     if not compatibility_before.compatible:
@@ -161,16 +180,16 @@ def export_edited_model(
         rtol=rtol,
         timeout_seconds=reload_timeout_seconds,
         processor_fingerprints=processor_fingerprints,
-        adapter_name=config.model.adapter,
         verify_target_trajectory=verify_reload_target_trajectory,
         target_trajectory_max_new_tokens=reload_target_trajectory_max_new_tokens,
+        target_generation=config.target_generation,
+        expected_generation_config_hash=effective_generation_config_hash,
+        seed=config.run.seed,
         revision=config.model.revision,
-        low_cpu_mem_usage=config.model.low_cpu_mem_usage,
     )
     reload_report = None if defer_reload else _run_deferred_reload(reload_request)
     manifest = _build_manifest(
         config=config,
-        adapter=adapter,
         plan=plan,
         edited_parameter_names=edited_parameter_names,
         equivalence=equivalence,
@@ -178,11 +197,13 @@ def export_edited_model(
         reload_report=reload_report,
         parameter_shapes_hash=object_sha256(shapes_after),
         parameter_count_value=count_after,
-        validation_metrics=validation_metrics,
+        full_validation_metrics=full_validation_metrics,
         test_metrics=test_metrics,
         chat_template_hash=adapter.chat_template_hash(processor),
         processor_fingerprints=processor_fingerprints,
         untouched_parameters_verified=verify_unchanged_parameters,
+        direction_layer=direction_layer,
+        effective_generation_config_hash=effective_generation_config_hash,
     )
     write_export_manifest(target, manifest)
     _write_public_text(target / "README.md", _readme(config))
@@ -202,7 +223,7 @@ def complete_deferred_reload(result: ExportResult) -> ExportResult:
         raise InvariantError("export result has no pending fresh reload check")
     report = _run_deferred_reload(result.deferred_reload)
     manifest = dict(result.manifest)
-    manifest["fresh_reload"] = asdict(report)
+    manifest["fresh_reload"] = report.as_dict()
     write_export_manifest(result.output_dir, manifest)
     return replace(result, reload=report, deferred_reload=None, manifest=manifest)
 
@@ -222,16 +243,13 @@ def _run_deferred_reload(request: DeferredReload) -> ReloadCheckReport:
         rtol=request.rtol,
         timeout_seconds=request.timeout_seconds,
         expected_processor_fingerprints=request.processor_fingerprints,
-        adapter_name=request.adapter_name,
         verify_target_trajectory=request.verify_target_trajectory,
         target_trajectory_max_new_tokens=request.target_trajectory_max_new_tokens,
+        target_generation=request.target_generation,
+        expected_generation_config_hash=request.expected_generation_config_hash,
+        seed=request.seed,
         revision=request.revision,
-        low_cpu_mem_usage=request.low_cpu_mem_usage,
     )
-
-
-def export_model(*args: Any, **kwargs: Any) -> ExportResult:
-    return export_edited_model(*args, **kwargs)
 
 
 def verify_plan_orthogonality(
@@ -264,21 +282,6 @@ def verify_plan_orthogonality(
             raise InvariantError(f"edited parameter is not orthogonal to its plan vector: {operation.parameter_name}")
         results.append(check)
     return tuple(results)
-
-
-def _validate_export_config(config: ProjectConfig) -> None:
-    if not config.export.safe_serialization:
-        raise InvariantError("model export requires safe serialization")
-    if not config.export.include_processor:
-        raise InvariantError("model export requires processor files")
-    if config.export.include_raw_thinking:
-        raise InvariantError("raw thinking must not be included in model export")
-    if config.export.push_to_hub:
-        raise InvariantError("model export cannot push to the Hub")
-    if not config.export.verify_fresh_process:
-        raise InvariantError("model export requires fresh process verification")
-    if config.export.edit_compute_dtype != "float32":
-        raise InvariantError("model export requires float32 edit compute")
 
 
 def _probe_tolerances(
@@ -431,7 +434,6 @@ def _verify_tied_pairs(model: nn.Module, pairs: tuple[tuple[str, str], ...]) -> 
 def _build_manifest(
     *,
     config: ProjectConfig,
-    adapter: ArchitectureAdapter,
     plan: WeightEditPlan,
     edited_parameter_names: tuple[str, ...],
     equivalence: ProbeEquivalence,
@@ -439,57 +441,39 @@ def _build_manifest(
     reload_report: ReloadCheckReport | None,
     parameter_shapes_hash: str,
     parameter_count_value: int,
-    validation_metrics: Mapping[str, Any] | None,
+    full_validation_metrics: Mapping[str, Any] | None,
     test_metrics: Mapping[str, Any] | None,
     chat_template_hash: str,
     processor_fingerprints: Mapping[str, str],
     untouched_parameters_verified: bool,
+    direction_layer: int,
+    effective_generation_config_hash: str,
 ) -> dict[str, Any]:
     rules = []
     for operation in plan.operations:
         rule = operation.as_dict()
         rule["vector_sha256"] = tensor_sha256(plan.vector(operation.vector_key))
         rules.append(rule)
-    metadata = plan.metadata
-    return {
-        "schema_version": 1,
+    manifest: dict[str, Any] = {
         "base_model_id": config.model.id,
         "base_revision": config.model.revision,
         "config_hash": config.config_hash,
-        "target_profile_hash": config.target_profile_hash,
-        "judge_profile_hash": config.judge_profile_hash,
+        "target_generation_config_hash": config.target_generation_config_hash,
+        "effective_generation_config_hash": effective_generation_config_hash,
+        "target_thinking_enabled": config.target_generation.thinking_enabled,
         "chat_template_hash": chat_template_hash,
+        "judge_template_hash": judge_template_hash(),
         **dict(processor_fingerprints),
-        "adapter": adapter.__class__.__name__,
-        "target_generation": {"thinking_enabled": True},
-        "judge_profile": {
-            "thinking_enabled": False,
-            "backend": "enum_trie",
-            "semantics": "REFUSAL iff thought considers refusal OR final answer refuses",
-        },
-        "direction_semantics": "trajectory-level refusal direction: thinking consideration OR final refusal",
-        "direction_source_phase": metadata.get("phase"),
-        "direction_source_layer": metadata.get("layer"),
-        "direction_source_relative_position": metadata.get("relative_position"),
+        "direction_source_layer": direction_layer,
         "direction_sha256": tensor_sha256(plan.direction),
         "weight_edit_plan_sha256": plan.plan_hash,
-        "selected_projection_rank": 1,
         "edited_parameter_names": list(edited_parameter_names),
         "projection_rules": rules,
         "parameter_shapes_hash": parameter_shapes_hash,
         "parameter_count": parameter_count_value,
         "untouched_parameters_verified": untouched_parameters_verified,
-        "text_only_direction_discovery": bool(metadata.get("text_only_direction_discovery", True)),
-        "multimodal_behavior_validated": bool(metadata.get("multimodal_behavior_validated", False)),
         "temporary_permanent_equivalence": asdict(equivalence),
         "orthogonality": [asdict(value) for value in orthogonality],
-        "fresh_reload": asdict(reload_report) if reload_report is not None else {"status": "PENDING"},
-        "validation_metrics": dict(validation_metrics or {}),
-        "test_metrics": dict(test_metrics or {}),
-        "privacy": {
-            "raw_thinking_included": False,
-            "push_to_hub": False,
-        },
         "software_versions": {
             "python": platform.python_version(),
             "torch": torch.__version__,
@@ -498,6 +482,13 @@ def _build_manifest(
             "safetensors": safetensors.__version__,
         },
     }
+    if reload_report is not None:
+        manifest["fresh_reload"] = reload_report.as_dict()
+    if full_validation_metrics is not None:
+        manifest["full_validation_metrics"] = dict(full_validation_metrics)
+    if test_metrics is not None:
+        manifest["test_metrics"] = dict(test_metrics)
+    return manifest
 
 
 def write_export_manifest(output_dir: str | Path, manifest: Mapping[str, Any]) -> None:
@@ -509,21 +500,19 @@ def write_export_manifest(output_dir: str | Path, manifest: Mapping[str, Any]) -
             model_id=str(value["base_model_id"]),
             model_revision=str(value["base_revision"]),
             config_hash=str(value["config_hash"]),
-            target_profile_hash=str(value["target_profile_hash"]),
-            judge_profile_hash=str(value["judge_profile_hash"]),
+            target_generation_config_hash=str(value["target_generation_config_hash"]),
             chat_template_hash=str(value["chat_template_hash"]),
+            judge_template_hash=str(value["judge_template_hash"]),
         )
     except KeyError as error:
         raise InvariantError(f"export manifest profile field is missing: {error.args[0]}") from error
     metadata = ArtifactMetadata(
-        schema_version=1,
         artifact_type="edit_manifest",
         private=False,
-        record_count=1,
         content_sha256=file_sha256(target),
         profile=profile,
     )
-    ArtifactStore.write_json(ArtifactStore.metadata_path(target), asdict(metadata), private=False)
+    ArtifactStore.write_json(ArtifactStore.metadata_path(target), metadata.as_dict(), private=False)
 
 
 def _readme(config: ProjectConfig) -> str:
@@ -531,10 +520,9 @@ def _readme(config: ProjectConfig) -> str:
 
 Base model: `{config.model.id}` at `{config.model.revision}`.
 
-The removed rank-1 direction is a trajectory-level refusal direction associated
-with either refusal consideration in generated thinking or actual refusal in the
-final answer. Target generations used for discovery and evaluation keep thinking
-enabled. Classification uses the unchanged base checkpoint with thinking disabled.
+The selected refusal-related direction was measured at an assistant-prefix
+activation and removed from the model with a rank-1 weight projection. See
+`edit_manifest.json` for the source layer, content hashes, and verification results.
 
 This directory contains no raw thinking artifacts and is not published automatically.
 
@@ -565,7 +553,6 @@ __all__ = [
     "ProbeEquivalence",
     "complete_deferred_reload",
     "export_edited_model",
-    "export_model",
     "verify_plan_orthogonality",
     "write_export_manifest",
 ]

@@ -100,14 +100,8 @@ def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
             attention_implementation="sdpa",
         ),
         export=ExportConfig(
-            safe_serialization=True,
             max_shard_size="10MB",
-            edit_compute_dtype="float32",
             edit_chunk_rows=3,
-            include_processor=True,
-            include_raw_thinking=False,
-            push_to_hub=False,
-            verify_fresh_process=True,
         ),
     )
     probe = {
@@ -125,8 +119,9 @@ def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
         config,
         probe,
         output_dir=output_dir,
-        validation_metrics={"removal_success_rate": 0.75},
+        full_validation_metrics={"removal_success_rate": 0.75},
         test_metrics={"non_refusal_retention_rate": 1.0},
+        direction_layer=0,
         probe_atol=3e-5,
         probe_rtol=3e-5,
         orthogonality_atol=3e-5,
@@ -153,11 +148,12 @@ def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:
     assert not tuple(output_dir.glob("*.bin"))
     assert (output_dir / "processor_config.json").is_file()
     assert manifest["base_revision"] == "a" * 40
-    assert manifest["selected_projection_rank"] == 1
-    assert manifest["privacy"] == {"push_to_hub": False, "raw_thinking_included": False}
+    assert manifest["direction_source_layer"] == 0
+    assert "selected_projection_rank" not in manifest
+    assert "privacy" not in manifest
     assert manifest["fresh_reload"]["probe_logits_match"] is True
     assert manifest["fresh_reload"]["target_trajectory_required"] is False
     assert manifest["temporary_permanent_equivalence"]["passed"] is True
-    assert "trajectory-level refusal direction" in readme
+    assert "assistant-prefix" in readme
     assert "contains no raw thinking artifacts" in readme
     assert not tuple(output_dir.glob("*.private.jsonl"))

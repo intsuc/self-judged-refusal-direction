@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -51,7 +51,6 @@ class EditOp:
     parameter_name: str
     projection_kind: ProjectionKind
     vector_key: str
-    alias_group: str
     runtime_sites: tuple[RuntimeSite, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
@@ -59,7 +58,6 @@ class EditOp:
             "parameter_name": self.parameter_name,
             "projection_kind": self.projection_kind.value,
             "vector_key": self.vector_key,
-            "alias_group": self.alias_group,
             "runtime_sites": [site.as_dict() for site in self.runtime_sites],
         }
 
@@ -69,7 +67,6 @@ class EditOp:
             parameter_name=str(value["parameter_name"]),
             projection_kind=ProjectionKind(value["projection_kind"]),
             vector_key=str(value["vector_key"]),
-            alias_group=str(value["alias_group"]),
             runtime_sites=tuple(RuntimeSite.from_dict(site) for site in value.get("runtime_sites", ())),
         )
 
@@ -78,8 +75,6 @@ class EditOp:
 class WeightEditPlan:
     vectors: dict[str, torch.Tensor]
     operations: tuple[EditOp, ...]
-    metadata: dict[str, Any] = field(default_factory=dict)
-    schema_version: int = 1
 
     @property
     def direction(self) -> torch.Tensor:
@@ -102,9 +97,7 @@ class WeightEditPlan:
 
     def to_metadata(self) -> dict[str, Any]:
         return {
-            "schema_version": self.schema_version,
             "operations": [operation.as_dict() for operation in self.operations],
-            "metadata": self.metadata,
             "vector_keys": sorted(self.vectors),
         }
 
@@ -120,6 +113,8 @@ class WeightEditPlan:
         metadata: Mapping[str, Any],
         tensors: Mapping[str, torch.Tensor],
     ) -> WeightEditPlan:
+        if set(metadata) != {"operations", "vector_keys"}:
+            raise InvariantError("weight edit plan metadata has unexpected fields")
         expected_keys = {str(key) for key in metadata["vector_keys"]}
         actual_keys = set(tensors)
         if expected_keys != actual_keys:
@@ -127,8 +122,6 @@ class WeightEditPlan:
         return cls(
             vectors={key: tensors[key].detach().to(device="cpu").contiguous().clone() for key in sorted(tensors)},
             operations=tuple(EditOp.from_dict(value) for value in metadata["operations"]),
-            metadata=dict(metadata.get("metadata", {})),
-            schema_version=int(metadata["schema_version"]),
         )
 
     @classmethod
@@ -154,11 +147,9 @@ class WeightEditPlan:
         for projection in adapter.multimodal_projections(model):
             _validate_module_target(model, projection)
             builder.add_multimodal_projection(projection.name)
-        return builder.build({"adapter": adapter.__class__.__name__})
+        return builder.build()
 
     def validate_shapes(self, model: nn.Module) -> None:
-        if self.schema_version != 1:
-            raise InvariantError(f"unsupported weight edit plan schema: {self.schema_version}")
         if "direction" not in self.vectors:
             raise InvariantError("weight edit plan has no direction vector")
         for key, vector in self.vectors.items():
@@ -196,8 +187,6 @@ class WeightEditPlan:
             for site in operation.runtime_sites:
                 _get_module(model, site.module_name)
                 self.vector(site.vector_key)
-
-    validate = validate_shapes
 
     @contextmanager
     def temporary(self, model: nn.Module) -> Iterator[nn.Module]:
@@ -237,27 +226,13 @@ class WeightEditPlan:
         with activation_addition(model, module_name, vector, coefficient):
             yield model
 
-    def activation_addition_context(
-        self,
-        model: nn.Module,
-        module_name: str,
-        coefficient: float,
-        vector_key: str = "direction",
-    ):
-        return self.activation_addition(model, module_name, coefficient, vector_key)
-
     def apply_in_place(
         self,
         model: nn.Module,
-        chunk_size: int = 4096,
         *,
-        chunk_rows: int | None = None,
+        chunk_rows: int = 4096,
     ) -> tuple[str, ...]:
-        if chunk_rows is not None:
-            if chunk_size != 4096:
-                raise InvariantError("specify only one edit chunk size")
-            chunk_size = chunk_rows
-        if chunk_size < 1:
+        if chunk_rows < 1:
             raise InvariantError("edit chunk size must be positive")
         self.validate_shapes(model)
         edited: list[str] = []
@@ -275,7 +250,7 @@ class WeightEditPlan:
                     continue
                 seen[identity] = signature
                 vector = self.vector(operation.vector_key)
-                _apply_projection(parameter, operation.projection_kind, vector, chunk_size)
+                _apply_projection(parameter, operation.projection_kind, vector, chunk_rows)
                 edited.append(operation.parameter_name)
         tie_weights = getattr(model, "tie_weights", None)
         if callable(tie_weights):
@@ -370,11 +345,10 @@ class WeightEditPlanBuilder:
             self._add_operation(bias, ProjectionKind.VECTOR, "direction")
         return self
 
-    def build(self, metadata: Mapping[str, Any] | None = None) -> WeightEditPlan:
+    def build(self) -> WeightEditPlan:
         plan = WeightEditPlan(
             vectors={key: value.clone() for key, value in self.vectors.items()},
             operations=tuple(self.operations),
-            metadata=dict(metadata or {}),
         )
         plan.validate_shapes(self.model)
         return plan
@@ -429,7 +403,6 @@ class WeightEditPlanBuilder:
                 parameter_name=parameter_name,
                 projection_kind=projection_kind,
                 vector_key=vector_key,
-                alias_group=parameter_name,
                 runtime_sites=site_tuple,
             )
         )

@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -13,9 +12,7 @@ import torch.nn.functional as F
 
 from self_judged_refusal_direction.activations import (
     ActivationCollector,
-    ActivationStatistics,
     load_activation_statistics,
-    merge_activation_statistics,
     save_activation_statistics,
 )
 from self_judged_refusal_direction.artifacts import ArtifactMetadata, ArtifactProfile, ArtifactStore
@@ -32,7 +29,7 @@ from self_judged_refusal_direction.directions import (
     build_candidates,
     load_candidate_artifacts,
     load_direction,
-    rank_stage_a,
+    rank_activation_screening,
     save_direction,
     write_candidate_artifacts,
 )
@@ -48,12 +45,18 @@ from self_judged_refusal_direction.evaluation import (
 from self_judged_refusal_direction.hashing import file_sha256, object_sha256, tensor_sha256
 from self_judged_refusal_direction.judging import TrajectoryJudge
 from self_judged_refusal_direction.models.registry import adapter_for_config
-from self_judged_refusal_direction.prompting import judge_messages, judge_template_hash, target_messages
+from self_judged_refusal_direction.prompting import (
+    judge_messages,
+    target_messages,
+)
+from self_judged_refusal_direction.prompting import (
+    judge_template_hash as current_judge_template_hash,
+)
 from self_judged_refusal_direction.runtime import BaseModelRuntime, IntervenedModelRuntime
 from self_judged_refusal_direction.schema import (
-    ActivationKey,
     CandidateMetrics,
     DirectionCandidate,
+    JudgeLabel,
     JudgeResult,
     LabeledTrajectory,
     PromptRecord,
@@ -67,10 +70,10 @@ def _load(path: str | Path) -> tuple[ProjectConfig, ArtifactStore]:
     torch.manual_seed(config.run.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(config.run.seed)
-    torch.use_deterministic_algorithms(config.run.deterministic)
+    torch.use_deterministic_algorithms(True)
     if torch.backends.cudnn.is_available():
-        torch.backends.cudnn.benchmark = not config.run.deterministic
-        torch.backends.cudnn.deterministic = config.run.deterministic
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
     store = ArtifactStore(config)
     store.initialize_run()
     return config, store
@@ -80,19 +83,20 @@ def _profile(
     store: ArtifactStore,
     *,
     target: bool = False,
-    judge: bool = False,
     chat_template_hash: str | None = None,
+    judge_template_hash: str | None = None,
 ) -> ArtifactProfile:
-    return store.profile(target=target, judge=judge, chat_template_hash=chat_template_hash)
-
-
-def _judge_chat_hash(chat_template_hash: str) -> str:
-    return object_sha256({"processor_chat_template": chat_template_hash, "judge_template": judge_template_hash()})
+    return store.profile(
+        target=target,
+        chat_template_hash=chat_template_hash,
+        judge_template_hash=judge_template_hash,
+    )
 
 
 def _check_error_budget(count: int, config: ProjectConfig, phase: str) -> None:
-    if count > config.run.max_errors:
-        raise PipelineError(f"{phase} produced {count} infrastructure errors; maximum is {config.run.max_errors}")
+    maximum = config.run.max_infrastructure_errors
+    if count > maximum:
+        raise PipelineError(f"{phase} produced {count} infrastructure errors; maximum is {maximum}")
 
 
 def _write_json_artifact(
@@ -105,16 +109,13 @@ def _write_json_artifact(
     private: bool = False,
 ) -> None:
     store.write_json(path, value, private=private)
-    count = len(value) if isinstance(value, list) else 1
     metadata = ArtifactMetadata(
-        schema_version=1,
         artifact_type=artifact_type,
         private=private,
-        record_count=count,
         content_sha256=file_sha256(path),
         profile=profile,
     )
-    store.write_json(store.metadata_path(path), dataclasses.asdict(metadata), private=private)
+    store.write_json(store.metadata_path(path), metadata.as_dict(), private=private)
 
 
 def _read_json_artifact(
@@ -139,7 +140,6 @@ def _validate_static_context_budget(config: ProjectConfig, runtime: BaseModelRun
         original_prompt="",
         raw_generated_token_ids=(),
         raw_decoded_output="",
-        thinking_segments=("",),
         thinking_text="",
         final_answer="",
         thinking_token_start=0,
@@ -149,14 +149,14 @@ def _validate_static_context_budget(config: ProjectConfig, runtime: BaseModelRun
         generation_truncated=False,
         parser_status="OK",
         model_revision=config.model.revision,
-        generation_config_hash=config.target_profile_hash,
+        generation_config_hash=config.target_generation_config_hash,
         trajectory_hash="context-preflight",
     )
     judge_rendered = runtime.adapter.render_judge_chat(runtime.processor, judge_messages(empty))
     judge_ids = tuple(int(value) for value in judge_rendered["input_ids"][0].tolist())
     decoder = EnumTrieConstrainedDecoder.compile(
         runtime.processor.tokenizer,
-        tuple(config.judge.labels),
+        tuple(label.value for label in JudgeLabel),
         (judge_ids,),
     )
     context_window = runtime.adapter.context_window(runtime.model)
@@ -165,11 +165,11 @@ def _validate_static_context_budget(config: ProjectConfig, runtime: BaseModelRun
         + config.data.max_prompt_tokens
         + config.target_generation.max_new_tokens
         + decoder.max_new_tokens
-        + config.judge.safety_margin_tokens
     )
     target_rendered = runtime.adapter.render_target_chat(
         runtime.processor,
-        target_messages("", config.run.system_prompt),
+        target_messages("", config.target_generation.system_prompt),
+        config=config.target_generation,
     )
     target_required = (
         int(target_rendered["input_ids"].shape[-1])
@@ -220,8 +220,8 @@ def _load_baseline_judgments(
         expected_profile=_profile(
             store,
             target=True,
-            judge=True,
-            chat_template_hash=_judge_chat_hash(chat_template_hash),
+            chat_template_hash=chat_template_hash,
+            judge_template_hash=current_judge_template_hash(),
         ),
     )
     return [JudgeResult.from_dict(row) for row in rows]
@@ -239,8 +239,8 @@ def _load_labeled(
         expected_profile=_profile(
             store,
             target=True,
-            judge=True,
-            chat_template_hash=_judge_chat_hash(chat_template_hash),
+            chat_template_hash=chat_template_hash,
+            judge_template_hash=current_judge_template_hash(),
         ),
     )
     return [LabeledTrajectory(**row) for row in rows]
@@ -252,6 +252,8 @@ def inspect_model(config_path: str) -> None:
         _validate_static_context_budget(config, runtime)
         fingerprints = runtime.adapter.processor_fingerprints(runtime.processor)
         report = dataclasses.asdict(runtime.compatibility_report)
+        if not report["errors"]:
+            del report["errors"]
         report.update(
             {
                 "model_id": config.model.id,
@@ -259,8 +261,6 @@ def inspect_model(config_path: str) -> None:
                 "config_hash": config.config_hash,
                 "chat_template_hash": runtime.chat_template_hash,
                 **fingerprints,
-                "target_thinking_enabled": True,
-                "judge_thinking_enabled": False,
             }
         )
         store.write_json(store.paths.root / "model_compatibility.json", report, private=False)
@@ -288,7 +288,7 @@ def generate_baseline_trajectories(config_path: str) -> None:
         write_prompt_split_artifacts(store, records, profile=_profile(store))
         baseline_records = [item for item in records if item.split in {"train", "validation"}]
         trajectories = [runtime.generate_target(record) for record in baseline_records]
-        errors = sum(item.trajectory_status == "ERROR" for item in trajectories)
+        errors = sum(item.parser_status == "ERROR" for item in trajectories)
         _check_error_budget(errors, config, "baseline trajectory generation")
         store.write_jsonl(
             store.paths.baseline_trajectories,
@@ -303,15 +303,15 @@ def judge_baseline_trajectories(config_path: str) -> None:
     config, store = _load(config_path)
     with BaseModelRuntime(config) as runtime:
         trajectories = _load_baseline_trajectories(store, runtime.chat_template_hash)
-        judge = TrajectoryJudge(config, runtime.adapter, runtime.model, runtime.processor, runtime.chat_template_hash)
+        judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
         judgments = [judge.classify(trajectory) for trajectory in trajectories]
         errors = sum(item.status == "ERROR" for item in judgments)
         _check_error_budget(errors, config, "baseline trajectory judging")
         judgment_profile = _profile(
             store,
             target=True,
-            judge=True,
-            chat_template_hash=_judge_chat_hash(runtime.chat_template_hash),
+            chat_template_hash=runtime.chat_template_hash,
+            judge_template_hash=current_judge_template_hash(),
         )
         store.write_jsonl(
             store.paths.baseline_judgments,
@@ -332,7 +332,6 @@ def judge_baseline_trajectories(config_path: str) -> None:
             labeled[labeled_split].append(
                 LabeledTrajectory(
                     prompt_id=trajectory.prompt_id,
-                    split=labeled_split,
                     label=result.label,
                     trajectory_hash=trajectory.trajectory_hash,
                 )
@@ -363,146 +362,59 @@ def judge_baseline_trajectories(config_path: str) -> None:
 def collect_activations(config_path: str) -> None:
     config, store = _load(config_path)
     with BaseModelRuntime(config) as runtime:
-        model = runtime.model
         trajectories = _load_baseline_trajectories(store, runtime.chat_template_hash)
         labeled = _load_labeled(store, runtime.chat_template_hash, "train")
         trajectory_by_hash = {item.trajectory_hash: item for item in trajectories}
-        layer_selection = config.direction.candidate_layers
-        statistics: list[ActivationStatistics] = []
-        boundary_tokens: dict[str, Counter[str]] = {}
-        positions_by_phase: dict[str, set[int]] = {}
-        for phase in config.direction.candidate_phases:
-            typed_phase = cast(Literal["pre_thinking", "pre_final"], phase)
-            typed_layers = cast(Literal["all"] | Sequence[int], layer_selection)
-            collectors: dict[tuple[int, ...], ActivationCollector] = {}
-            for item in labeled:
-                trajectory = trajectory_by_hash[item.trajectory_hash]
-                if phase == "pre_thinking":
-                    positions = tuple(runtime.adapter.discover_pre_thinking_positions(runtime.processor, config))
-                    rendered = runtime.adapter.render_target_chat(
-                        runtime.processor,
-                        target_messages(trajectory.original_prompt, config.run.system_prompt),
-                    )
-                    inputs = _move_inputs(dict(rendered), runtime.adapter.input_device(runtime.model))
-                else:
-                    positions = tuple(
-                        runtime.adapter.discover_pre_final_positions(runtime.processor, trajectory, config)
-                    )
-                    inputs = _pre_final_inputs(runtime, trajectory)
-                collector = collectors.get(positions)
-                if collector is None:
-                    collector = ActivationCollector(
-                        runtime.adapter.activation_read_points(model),
-                        phase=typed_phase,
-                        relative_positions=positions,
-                        layers=typed_layers,
-                        dtype=config.direction.online_accumulator_dtype,
-                    )
-                    collectors[positions] = collector
-                input_ids = inputs["input_ids"]
-                sequence_length = int(input_ids.shape[-1])
-                _validate_relative_positions(positions, sequence_length, phase)
-                positions_by_phase.setdefault(phase, set()).update(positions)
-                for position in positions:
-                    token_id = int(input_ids[0, sequence_length + position].item())
-                    token = runtime.processor.tokenizer.decode([token_id], skip_special_tokens=False)
-                    boundary_tokens.setdefault(f"{phase}:{position}", Counter())[token] += 1
-                with collector.capture([item.label], boundary_positions=[sequence_length]), torch.inference_mode():
-                    model(**inputs, use_cache=False, logits_to_keep=1, return_dict=True)
-            statistics.extend(collector.statistics() for collector in collectors.values())
-        merged = merge_activation_statistics(statistics)
-        save_activation_statistics(store.paths.activation_statistics, merged)
+        statistics = _collect_activation_statistics(config, runtime, labeled, trajectory_by_hash)
+        save_activation_statistics(store.paths.activation_statistics, statistics)
         activation_profile = _profile(
             store,
             target=True,
-            judge=True,
-            chat_template_hash=_judge_chat_hash(runtime.chat_template_hash),
+            chat_template_hash=runtime.chat_template_hash,
+            judge_template_hash=current_judge_template_hash(),
         )
         metadata = ArtifactMetadata(
-            schema_version=1,
             artifact_type="activation_statistics",
             private=True,
-            record_count=len(merged.keys),
             content_sha256=file_sha256(store.paths.activation_statistics),
             profile=activation_profile,
         )
         store.write_json(
             store.metadata_path(store.paths.activation_statistics),
-            dataclasses.asdict(metadata),
+            metadata.as_dict(),
             private=True,
         )
-        token_metadata = {
-            key: counts.most_common(1)[0][0] if len(counts) == 1 else "<variable>"
-            for key, counts in boundary_tokens.items()
-        }
-        _write_json_artifact(
-            store,
-            store.paths.activation_metadata,
-            {
-                "candidate_phases": list(config.direction.candidate_phases),
-                "relative_positions": sorted({value for values in positions_by_phase.values() for value in values}),
-                "relative_positions_by_phase": {
-                    phase: sorted(values) for phase, values in sorted(positions_by_phase.items())
-                },
-                "candidate_layers": layer_selection,
-                "boundary_tokens": token_metadata,
-                "text_only": True,
-            },
-            artifact_type="activation_position_metadata",
-            profile=activation_profile,
-            private=False,
-        )
 
 
-def _pre_final_inputs(runtime: BaseModelRuntime, trajectory: TargetTrajectory) -> dict[str, torch.Tensor]:
-    if not 0 <= trajectory.final_token_start <= len(trajectory.raw_generated_token_ids):
-        raise InvariantError("pre-final trajectory boundary is outside the generated token sequence")
-    rendered = runtime.adapter.render_target_chat(
-        runtime.processor,
-        target_messages(trajectory.original_prompt, runtime.config.run.system_prompt),
+def _collect_activation_statistics(
+    config: ProjectConfig,
+    runtime: BaseModelRuntime,
+    labeled: Sequence[LabeledTrajectory],
+    trajectory_by_hash: Mapping[str, TargetTrajectory],
+):
+    model = runtime.model
+    layers = cast(Literal["all"] | Sequence[int], config.search.layers)
+    collector = ActivationCollector(
+        runtime.adapter.activation_read_points(model),
+        layers=layers,
+        dtype=config.search.accumulator_dtype,
     )
-    inputs = _move_inputs(dict(rendered), runtime.adapter.input_device(runtime.model))
-    prefix = inputs.get("input_ids")
-    if not isinstance(prefix, torch.Tensor) or prefix.ndim != 2 or prefix.shape[0] != 1:
-        raise InvariantError("pre-final target input_ids must contain one sequence")
-    generated = torch.tensor(
-        trajectory.raw_generated_token_ids[: trajectory.final_token_start],
-        dtype=prefix.dtype,
-        device=prefix.device,
-    ).unsqueeze(0)
-    input_ids = torch.cat((prefix, generated), dim=-1)
-    suffix_length = generated.shape[-1]
-    result: dict[str, torch.Tensor] = {"input_ids": input_ids}
-    for name, value in inputs.items():
-        if name == "input_ids":
-            continue
-        if not isinstance(value, torch.Tensor):
-            raise InvariantError(f"pre-final model input is not a tensor: {name}")
-        sequence_aligned = value.ndim >= 2 and value.shape[0] == 1 and value.shape[-1] == prefix.shape[-1]
-        if not sequence_aligned:
-            result[name] = value
-            continue
-        extension_shape = (*value.shape[:-1], suffix_length)
-        if name == "attention_mask":
-            extension = torch.ones(extension_shape, dtype=value.dtype, device=value.device)
-        elif name == "position_ids":
-            increments = torch.arange(1, suffix_length + 1, dtype=value.dtype, device=value.device)
-            extension = value[..., -1:] + increments
-        elif name in {"token_type_ids", "mm_token_type_ids"}:
-            extension = torch.zeros(extension_shape, dtype=value.dtype, device=value.device)
-        else:
-            raise InvariantError(f"pre-final sequence input cannot be extended safely: {name}")
-        result[name] = torch.cat((value, extension), dim=-1)
-    if "attention_mask" not in result:
-        result["attention_mask"] = torch.ones_like(input_ids)
-    return result
-
-
-def _validate_relative_positions(positions: Sequence[int], sequence_length: int, phase: str) -> None:
-    if not positions or len(set(positions)) != len(positions):
-        raise InvariantError(f"{phase} adapter positions must be non-empty and unique")
-    if any(position >= 0 or sequence_length + position < 0 for position in positions):
-        raise InvariantError(f"{phase} adapter position is outside the available prefix")
+    for item in labeled:
+        trajectory = trajectory_by_hash[item.trajectory_hash]
+        rendered = runtime.adapter.render_target_chat(
+            runtime.processor,
+            target_messages(trajectory.original_prompt, config.target_generation.system_prompt),
+            config=config.target_generation,
+        )
+        inputs = _move_inputs(dict(rendered), runtime.adapter.input_device(model))
+        input_ids = inputs.get("input_ids")
+        if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise InvariantError("activation input_ids must contain one sequence")
+        if input_ids.shape[1] < 1:
+            raise InvariantError("activation input sequence must be non-empty")
+        with collector.capture([item.label]), torch.inference_mode():
+            model(**inputs, use_cache=False, logits_to_keep=1, return_dict=True)
+    return collector.statistics()
 
 
 def build_direction_candidates(config_path: str) -> None:
@@ -518,45 +430,16 @@ def build_direction_candidates(config_path: str) -> None:
         expected_profile=profile,
     )
     statistics = load_activation_statistics(store.paths.activation_statistics)
-    position_metadata = _read_json_artifact(
-        store,
-        store.paths.activation_metadata,
-        artifact_type="activation_position_metadata",
-        profile=profile,
-    )
-    tokens: dict[ActivationKey | str, str] = {}
-    for key in statistics.keys:
-        tokens[key.storage_key] = position_metadata.get("boundary_tokens", {}).get(
-            f"{key.phase}:{key.relative_position}",
-            "",
-        )
-    bundle = build_candidates(
-        statistics,
-        boundary_tokens=tokens,
-        minimum_norm=config.direction.minimum_direction_norm,
-        dtype="float32",
-    )
-    ranking = rank_stage_a(
-        bundle,
-        top_m=config.direction.stage_a_top_m,
-        minimum_norm=config.direction.minimum_direction_norm,
-    )
+    bundle = build_candidates(statistics, dtype="float32")
+    ranking = rank_activation_screening(bundle, keep=config.search.activation_screening_keep)
     if not ranking:
-        raise PipelineError("Stage A produced no numerically valid direction candidates")
+        raise PipelineError("activation screening produced no numerically valid direction candidates")
     write_candidate_artifacts(store, bundle, profile=profile)
     _write_json_artifact(
         store,
-        store.paths.stage_a_ranking,
-        [
-            {
-                "rank": rank,
-                "candidate_id": candidate.candidate_id,
-                "standardized_separation": candidate.standardized_separation,
-                "norm": candidate.norm,
-            }
-            for rank, candidate in enumerate(ranking, start=1)
-        ],
-        artifact_type="stage_a_ranking",
+        store.paths.activation_screening_ranking,
+        [candidate.candidate_id for candidate in ranking],
+        artifact_type="activation_screening_ranking",
         profile=profile,
     )
 
@@ -565,7 +448,7 @@ def _activation_dependent_profile(store: ArtifactStore) -> ArtifactProfile:
     metadata = store.validate(
         store.paths.activation_statistics,
         artifact_type="activation_statistics",
-        expected_profile=_profile(store, target=True, judge=True),
+        expected_profile=_profile(store, target=True),
     )
     if not metadata.private or metadata.profile.chat_template_hash is None:
         raise ArtifactError("activation statistics privacy or chat-template profile is invalid")
@@ -573,7 +456,7 @@ def _activation_dependent_profile(store: ArtifactStore) -> ArtifactProfile:
 
 
 def _validate_activation_chat_profile(profile: ArtifactProfile, chat_template_hash: str) -> None:
-    if profile.chat_template_hash != _judge_chat_hash(chat_template_hash):
+    if profile.chat_template_hash != chat_template_hash or profile.judge_template_hash != current_judge_template_hash():
         raise ArtifactError("activation-derived artifacts use a different chat template")
 
 
@@ -581,14 +464,19 @@ def evaluate_candidates(config_path: str) -> None:
     config, store = _load(config_path)
     profile = _activation_dependent_profile(store)
     bundle = load_candidate_artifacts(store, expected_profile=profile)
-    stage_a = _read_json_artifact(
+    screening = _read_json_artifact(
         store,
-        store.paths.stage_a_ranking,
-        artifact_type="stage_a_ranking",
+        store.paths.activation_screening_ranking,
+        artifact_type="activation_screening_ranking",
         profile=profile,
     )
+    if not isinstance(screening, list) or any(not isinstance(candidate_id, str) for candidate_id in screening):
+        raise ArtifactError("activation screening ranking is invalid")
     by_id = {item.candidate_id: item for item in bundle.candidates}
-    ranking = [by_id[row["candidate_id"]] for row in stage_a]
+    try:
+        ranking = [by_id[candidate_id] for candidate_id in screening]
+    except KeyError as error:
+        raise ArtifactError("activation screening ranking references an unknown candidate") from error
     with BaseModelRuntime(config) as profile_runtime:
         chat_template_hash = profile_runtime.chat_template_hash
         _validate_activation_chat_profile(profile, chat_template_hash)
@@ -597,63 +485,59 @@ def evaluate_candidates(config_path: str) -> None:
     baseline_trajectories = {item.prompt_id: item for item in trajectories}
     records = {item.prompt_id: item for item in _load_prompt_records(store, config)}
     quality_fallback = [records[item.prompt_id].original_prompt for item in validation if item.label == "NON_REFUSAL"]
-    stage_b_labels = _balanced_subset(validation, config.evaluation.stage_b_prompts_per_class)
-    stage_b_metrics, _ = _evaluate_stage(
+    pilot_labels = _balanced_subset(validation, config.search.pilot_prompts_per_class)
+    pilot_metrics, _ = _evaluate_candidates_phase(
         config,
         store,
         bundle,
         ranking,
-        stage_b_labels,
+        pilot_labels,
         records,
         baseline_trajectories,
         quality_fallback,
-        stage="B",
+        evaluation_phase="pilot_evaluation",
     )
-    stage_b_eligible = [item for item in stage_b_metrics if item.hard_filter_passed]
-    if not stage_b_eligible:
-        raise PipelineError("no Stage B direction candidate passed the configured hard filters")
-    top_k_ids = [
+    pilot_eligible = [item for item in pilot_metrics if item.hard_filter_passed]
+    if not pilot_eligible:
+        raise PipelineError("no pilot evaluation candidate passed the configured hard filters")
+    full_validation_ids = [
         item.candidate_id
-        for item in sorted(stage_b_eligible, key=_stage_ranking_key, reverse=True)[: config.direction.stage_b_top_k]
+        for item in sorted(pilot_eligible, key=_pilot_ranking_key, reverse=True)[: config.search.pilot_evaluation_keep]
     ]
-    stage_c_candidates = [by_id[candidate_id] for candidate_id in top_k_ids]
-    stage_c_metrics, quality_evaluation = _evaluate_stage(
+    full_validation_candidates = [by_id[candidate_id] for candidate_id in full_validation_ids]
+    full_validation_metrics, quality_evaluation = _evaluate_candidates_phase(
         config,
         store,
         bundle,
-        stage_c_candidates,
+        full_validation_candidates,
         validation,
         records,
         baseline_trajectories,
         quality_fallback,
-        stage="C",
+        evaluation_phase="full_validation",
     )
-    selected_metrics, selected_candidate = select_candidate(stage_c_metrics, by_id)
+    selected_metrics, selected_candidate = select_candidate(full_validation_metrics, by_id)
     selected_direction = bundle.direction(selected_candidate)
     selected_metadata = {
         "candidate": dataclasses.asdict(selected_candidate),
-        "validation_metrics": metrics_dict(selected_metrics),
-        "semantics": "REFUSAL iff thought considers refusal OR final answer refuses",
+        "full_validation_metrics": metrics_dict(selected_metrics),
     }
     save_direction(store.paths.selected_direction, selected_direction, metadata=selected_metadata, private=False)
     direction_sidecar = ArtifactMetadata(
-        schema_version=1,
         artifact_type="selected_direction",
         private=False,
-        record_count=1,
         content_sha256=file_sha256(store.paths.selected_direction),
         profile=profile,
     )
     store.write_json(
         store.metadata_path(store.paths.selected_direction),
-        dataclasses.asdict(direction_sidecar),
+        direction_sidecar.as_dict(),
         private=False,
     )
     _write_json_artifact(
         store,
         store.paths.final_selection,
         {
-            "candidate_id": selected_candidate.candidate_id,
             "candidate": dataclasses.asdict(selected_candidate),
             "metrics": metrics_dict(selected_metrics),
         },
@@ -665,34 +549,21 @@ def evaluate_candidates(config_path: str) -> None:
     report = {
         "base_model_id": config.model.id,
         "base_revision": config.model.revision,
-        "target_generation": {"thinking_enabled": True},
-        "judge": {
-            "thinking_enabled": False,
-            "immutable_base_checkpoint": True,
-            "semantics": "REFUSAL iff thought considers refusal OR final answer refuses",
-        },
         "baseline_counts": judgment_counts(judgments),
         "baseline_parser": parser_statistics(trajectories),
         "candidate_search": {
-            "phases": list(config.direction.candidate_phases),
-            "layers": config.direction.candidate_layers,
-            "relative_positions": sorted({item.relative_position for item in bundle.candidates}),
-            "relative_positions_by_phase": {
-                phase: sorted({item.relative_position for item in bundle.candidates if item.phase == phase})
-                for phase in config.direction.candidate_phases
-            },
-            "stage_a_count": len(ranking),
-            "stage_c_count": len(stage_c_candidates),
+            "layers": sorted({item.layer for item in bundle.candidates}),
+            "activation_screening_count": len(ranking),
+            "full_validation_count": len(full_validation_candidates),
         },
         "quality_evaluation": quality_evaluation,
         "selected_candidate": selected_metadata,
-        "raw_thinking_private": True,
     }
     _write_json_artifact(
         store,
-        store.paths.validation_report,
+        store.paths.full_validation_report,
         report,
-        artifact_type="validation_report",
+        artifact_type="full_validation_report",
         profile=profile,
     )
 
@@ -705,7 +576,7 @@ def _balanced_subset(values: Sequence[LabeledTrajectory], per_class: int) -> lis
     return selected
 
 
-def _stage_ranking_key(metrics: CandidateMetrics) -> tuple[float, ...]:
+def _pilot_ranking_key(metrics: CandidateMetrics) -> tuple[float, ...]:
     return (
         metrics.removal_success_rate,
         metrics.non_refusal_retention_rate,
@@ -714,7 +585,7 @@ def _stage_ranking_key(metrics: CandidateMetrics) -> tuple[float, ...]:
     )
 
 
-def _evaluate_stage(
+def _evaluate_candidates_phase(
     config: ProjectConfig,
     store: ArtifactStore,
     bundle: CandidateBundle,
@@ -724,7 +595,7 @@ def _evaluate_stage(
     baseline_trajectories: Mapping[str, TargetTrajectory],
     quality_fallback: Sequence[str],
     *,
-    stage: Literal["B", "C"],
+    evaluation_phase: Literal["pilot_evaluation", "full_validation"],
 ) -> tuple[list[CandidateMetrics], dict[str, Any]]:
     labels = {item.prompt_id: item.label for item in labeled}
     prompts = [prompt_records[item.prompt_id] for item in labeled]
@@ -752,9 +623,10 @@ def _evaluate_stage(
                 }
                 for trajectory in trajectories
             )
-            if stage == "C" and config.evaluation.run_activation_addition_diagnostic:
+            beta = config.acceptance.activation_addition_beta
+            if evaluation_phase == "full_validation" and beta is not None:
                 block_name = _transformer_block_name(runtime, candidate.layer)
-                coefficient = config.evaluation.activation_addition_beta * candidate.norm
+                coefficient = beta * candidate.norm
                 with plan.activation_addition(runtime.model, block_name, coefficient):
                     additions = [runtime.generate_target(prompt) for prompt in non_refusal_prompts]
                 trajectory_rows.extend(
@@ -766,19 +638,28 @@ def _evaluate_stage(
                     for trajectory in additions
                 )
         chat_template_hash = runtime.chat_template_hash
-    errors = sum(row["trajectory"]["trajectory_status"] == "ERROR" for row in trajectory_rows)
-    _check_error_budget(errors, config, f"Stage {stage} intervention generation")
-    trajectories_path = store.paths.stage_b_trajectories if stage == "B" else store.paths.stage_c_trajectories
+    errors = sum(row["trajectory"]["parser_status"] == "ERROR" for row in trajectory_rows)
+    _check_error_budget(errors, config, f"{evaluation_phase} intervention generation")
+    trajectories_path = (
+        store.paths.pilot_evaluation_trajectories
+        if evaluation_phase == "pilot_evaluation"
+        else store.paths.full_validation_trajectories
+    )
     store.write_jsonl(
         trajectories_path,
         trajectory_rows,
-        artifact_type=f"stage_{stage.lower()}_trajectories",
-        profile=_profile(store, target=True, chat_template_hash=chat_template_hash),
+        artifact_type=f"{evaluation_phase}_trajectories",
+        profile=_profile(
+            store,
+            target=True,
+            chat_template_hash=chat_template_hash,
+            judge_template_hash=current_judge_template_hash(),
+        ),
         private=True,
     )
     judgment_rows: list[dict[str, Any]] = []
     with BaseModelRuntime(config) as runtime:
-        judge = TrajectoryJudge(config, runtime.adapter, runtime.model, runtime.processor, runtime.chat_template_hash)
+        judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
         for row in trajectory_rows:
             trajectory = TargetTrajectory.from_dict(row["trajectory"])
             result = judge.classify(trajectory)
@@ -791,18 +672,23 @@ def _evaluate_stage(
                     "judgment": result.as_dict(),
                 }
             )
+        del judge
     judge_errors = sum(row["judgment"]["status"] == "ERROR" for row in judgment_rows)
-    _check_error_budget(judge_errors, config, f"Stage {stage} judging")
-    judgments_path = store.paths.stage_b_judgments if stage == "B" else store.paths.stage_c_judgments
+    _check_error_budget(judge_errors, config, f"{evaluation_phase} judging")
+    judgments_path = (
+        store.paths.pilot_evaluation_judgments
+        if evaluation_phase == "pilot_evaluation"
+        else store.paths.full_validation_judgments
+    )
     store.write_jsonl(
         judgments_path,
         judgment_rows,
-        artifact_type=f"stage_{stage.lower()}_judgments",
+        artifact_type=f"{evaluation_phase}_judgments",
         profile=_profile(
             store,
             target=True,
-            judge=True,
-            chat_template_hash=_judge_chat_hash(chat_template_hash),
+            chat_template_hash=chat_template_hash,
+            judge_template_hash=current_judge_template_hash(),
         ),
         private=False,
     )
@@ -821,27 +707,30 @@ def _evaluate_stage(
         metrics.append(
             evaluate_behavior(
                 candidate_id=candidate.candidate_id,
-                stage=stage,
                 baseline_labels=labels,
                 baseline_trajectories=baseline_trajectories,
                 trajectories=[TargetTrajectory.from_dict(row["trajectory"]) for row in removal_rows],
                 judgments=candidate_judgments,
                 mean_kl=mean_kl,
                 ce_loss_delta=ce_delta,
-                config=config.evaluation,
+                acceptance=config.acceptance,
                 activation_addition_induction_rate=induction,
             )
         )
-    results_path = store.paths.stage_b_results if stage == "B" else store.paths.stage_c_results
+    results_path = (
+        store.paths.pilot_evaluation_results
+        if evaluation_phase == "pilot_evaluation"
+        else store.paths.full_validation_results
+    )
     store.write_jsonl(
         results_path,
         metrics,
-        artifact_type=f"stage_{stage.lower()}_results",
+        artifact_type=f"{evaluation_phase}_results",
         profile=_profile(
             store,
             target=True,
-            judge=True,
-            chat_template_hash=_judge_chat_hash(chat_template_hash),
+            chat_template_hash=chat_template_hash,
+            judge_template_hash=current_judge_template_hash(),
         ),
         private=False,
     )
@@ -860,7 +749,8 @@ def _next_token_logits(
 ) -> torch.Tensor:
     rendered = runtime.adapter.render_target_chat(
         runtime.processor,
-        target_messages(prompt.original_prompt, runtime.config.run.system_prompt),
+        target_messages(prompt.original_prompt, runtime.config.target_generation.system_prompt),
+        config=runtime.config.target_generation,
     )
     inputs = _move_inputs(dict(rendered), runtime.adapter.input_device(runtime.model))
     with torch.inference_mode():
@@ -941,7 +831,6 @@ def _resolve_quality_texts(
         tokenizer = runtime.processor.tokenizer
         texts = ingest_prompts(
             config.data.quality_text_files,
-            deduplicate=True,
             token_counter=lambda text: len(tokenizer.encode(text, add_special_tokens=True)),
             max_prompt_tokens=config.data.max_prompt_tokens,
         )
@@ -1004,20 +893,11 @@ def export_model(config_path: str) -> None:
     prompt = validation[0]
     export_result: Any
     with IntervenedModelRuntime(config, direction=direction, install_temporary=False) as runtime:
-        plan = dataclasses.replace(
-            runtime.weight_edit_plan,
-            metadata={
-                **runtime.weight_edit_plan.metadata,
-                "phase": direction_metadata["candidate"]["phase"],
-                "layer": direction_metadata["candidate"]["layer"],
-                "relative_position": direction_metadata["candidate"]["relative_position"],
-                "text_only_direction_discovery": True,
-                "multimodal_behavior_validated": False,
-            },
-        )
+        plan = runtime.weight_edit_plan
         probe = runtime.adapter.render_target_chat(
             runtime.processor,
-            target_messages(prompt.original_prompt, config.run.system_prompt),
+            target_messages(prompt.original_prompt, config.target_generation.system_prompt),
+            config=config.target_generation,
         )
         probe = _move_inputs(dict(probe), runtime.adapter.input_device(runtime.model))
         export_result = export_edited_model(
@@ -1028,17 +908,13 @@ def export_model(config_path: str) -> None:
             config,
             probe,
             output_dir=store.paths.exported_model,
-            validation_metrics=selection["metrics"],
+            full_validation_metrics=selection["metrics"],
             defer_reload=True,
+            direction_layer=int(direction_metadata["candidate"]["layer"]),
         )
     export_result = complete_deferred_reload(export_result)
     if export_result.reload is None:
         raise InvariantError("fresh reload verification did not produce a report")
-    store.write_json(
-        store.paths.exported_model / "reload_report.json",
-        dataclasses.asdict(export_result.reload),
-        private=False,
-    )
 
 
 def _validate_direction_selection(
@@ -1046,15 +922,17 @@ def _validate_direction_selection(
     selection: Mapping[str, Any],
 ) -> None:
     candidate = direction_metadata.get("candidate")
-    validation_metrics = direction_metadata.get("validation_metrics")
-    if not isinstance(candidate, Mapping) or not isinstance(validation_metrics, Mapping):
+    full_validation_metrics = direction_metadata.get("full_validation_metrics")
+    selected_candidate = selection.get("candidate")
+    if (
+        not isinstance(candidate, Mapping)
+        or not isinstance(full_validation_metrics, Mapping)
+        or not isinstance(selected_candidate, Mapping)
+    ):
         raise ArtifactError("selected direction metadata is incomplete")
-    candidate_id = candidate.get("candidate_id")
-    if candidate_id != selection.get("candidate_id"):
-        raise ArtifactError("selected direction and final selection candidate IDs differ")
-    if object_sha256(candidate) != object_sha256(selection.get("candidate")):
+    if object_sha256(candidate) != object_sha256(selected_candidate):
         raise ArtifactError("selected direction and final selection candidate metadata differ")
-    if object_sha256(validation_metrics) != object_sha256(selection.get("metrics")):
+    if object_sha256(full_validation_metrics) != object_sha256(selection.get("metrics")):
         raise ArtifactError("selected direction and final selection metrics differ")
 
 
@@ -1096,7 +974,11 @@ def evaluate_export(config_path: str) -> None:
     store.validate(
         manifest_path,
         artifact_type="edit_manifest",
-        expected_profile=_profile(store, target=True, judge=True),
+        expected_profile=_profile(
+            store,
+            target=True,
+            judge_template_hash=current_judge_template_hash(),
+        ),
     )
     manifest = _read_json(manifest_path)
     profile = _activation_dependent_profile(store)
@@ -1117,8 +999,6 @@ def evaluate_export(config_path: str) -> None:
     initial_manifest_hash = object_sha256(manifest)
     with BaseModelRuntime(config) as runtime:
         _validate_activation_chat_profile(profile, runtime.chat_template_hash)
-        if manifest.get("adapter") != runtime.adapter.__class__.__name__:
-            raise ArtifactError("export manifest adapter differs from the configured architecture adapter")
         fingerprints = runtime.adapter.processor_fingerprints(runtime.processor)
         if runtime.chat_template_hash != manifest["chat_template_hash"]:
             raise ArtifactError("export manifest chat template hash differs from the pinned base processor")
@@ -1128,7 +1008,6 @@ def evaluate_export(config_path: str) -> None:
             store,
             evaluation_started_path,
             {
-                "config_hash": config.config_hash,
                 "initial_export_manifest_sha256": initial_manifest_hash,
             },
             artifact_type="test_evaluation_started",
@@ -1143,7 +1022,7 @@ def evaluate_export(config_path: str) -> None:
         if not prompts or any(prompt.split != "test" for prompt in prompts):
             raise PipelineError("independent test artifact must contain only test prompts")
         baseline_trajectories = [runtime.generate_target(prompt) for prompt in prompts]
-        judge = TrajectoryJudge(config, runtime.adapter, runtime.model, runtime.processor, runtime.chat_template_hash)
+        judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
         baseline_judgments = [judge.classify(trajectory) for trajectory in baseline_trajectories]
         chat_template_hash = runtime.chat_template_hash
         base_checkpoint_checksum = runtime.checkpoint_checksum
@@ -1161,6 +1040,7 @@ def evaluate_export(config_path: str) -> None:
             [prompt.original_prompt for prompt in non_refusal_prompts],
         )
         base_ce = _mean_ce_loss(runtime, quality_texts)
+        del judge
     baseline_errors = sum(item.status == "ERROR" for item in baseline_judgments)
     _check_error_budget(baseline_errors, config, "test baseline judging")
     store.write_jsonl(
@@ -1177,8 +1057,8 @@ def evaluate_export(config_path: str) -> None:
         profile=_profile(
             store,
             target=True,
-            judge=True,
-            chat_template_hash=_judge_chat_hash(chat_template_hash),
+            chat_template_hash=chat_template_hash,
+            judge_template_hash=current_judge_template_hash(),
         ),
         private=False,
     )
@@ -1195,32 +1075,32 @@ def evaluate_export(config_path: str) -> None:
         export_trajectories = [runtime.generate_target(prompt) for prompt in prompts]
         export_logits = [_next_token_logits(runtime, prompt) for prompt in non_refusal_prompts]
         export_ce = _mean_ce_loss(runtime, quality_texts)
-    export_generation_errors = sum(item.trajectory_status == "ERROR" for item in export_trajectories)
+    export_generation_errors = sum(item.parser_status == "ERROR" for item in export_trajectories)
     _check_error_budget(export_generation_errors, config, "test export trajectory generation")
     with BaseModelRuntime(config) as runtime:
         if runtime.checkpoint_checksum != base_checkpoint_checksum:
             raise InvariantError("test judges did not use the same immutable base checkpoint")
-        judge = TrajectoryJudge(config, runtime.adapter, runtime.model, runtime.processor, runtime.chat_template_hash)
+        judge = TrajectoryJudge(runtime.adapter, runtime.model, runtime.processor)
         export_judgments = [judge.classify(trajectory) for trajectory in export_trajectories]
+        del judge
     export_judge_errors = sum(item.status == "ERROR" for item in export_judgments)
     _check_error_budget(export_judge_errors, config, "test export trajectory judging")
     export_judgments_by_hash = {item.trajectory_hash: item for item in export_judgments}
     mean_kl = mean_next_token_kl(base_logits, export_logits) if base_logits else 0.0
     metrics = evaluate_behavior(
         candidate_id="exported_model",
-        stage="C",
         baseline_labels=baseline_labels,
         baseline_trajectories={item.prompt_id: item for item in baseline_trajectories},
         trajectories=[item for item in export_trajectories if item.prompt_id in baseline_labels],
         judgments=export_judgments_by_hash,
         mean_kl=mean_kl,
         ce_loss_delta=export_ce - base_ce,
-        config=config.evaluation,
+        acceptance=config.acceptance,
     )
-    validation_report = _read_json_artifact(
+    full_validation_report = _read_json_artifact(
         store,
-        store.paths.validation_report,
-        artifact_type="validation_report",
+        store.paths.full_validation_report,
+        artifact_type="full_validation_report",
         profile=profile,
     )
     test_metrics = metrics_dict(metrics)
@@ -1230,45 +1110,13 @@ def evaluate_export(config_path: str) -> None:
     test_report = {
         "base_model_id": config.model.id,
         "base_revision": config.model.revision,
-        "target_generation_thinking_enabled_all_phases": True,
-        "judge_thinking_enabled_all_phases": False,
-        "judge_uses_immutable_base_checkpoint": True,
         "base_checkpoint_checksum": base_checkpoint_checksum,
-        "judge_semantics": "REFUSAL iff thought considers refusal OR final answer refuses",
         "baseline_counts": judgment_counts(baseline_judgments),
         "baseline_parser": parser_statistics(baseline_trajectories),
         "export_parser": parser_statistics(export_trajectories),
-        "candidate_search": validation_report["candidate_search"],
-        "selected_candidate": validation_report["selected_candidate"],
         "test_metrics": test_metrics,
         "quality_evaluation": quality_evaluation,
         "export_manifest_sha256": manifest_hash,
-        "intervention_uncertain_count": test_metrics["uncertain_count"],
-        "judge_or_parser_error_count": test_metrics["error_count"],
-        "activation_addition_diagnostic": validation_report["selected_candidate"]["validation_metrics"].get(
-            "activation_addition_induction_rate"
-        ),
-        "edited_parameters": manifest["edited_parameter_names"],
-        "projection_rules": manifest["projection_rules"],
-        "temporary_permanent_equivalence": manifest["temporary_permanent_equivalence"],
-        "fresh_reload": manifest["fresh_reload"],
-        "evaluation_scope": {
-            "direction_discovery": "text-only",
-            "text_behavior_validated": True,
-            "multimodal_loader_preserved": True,
-            "multimodal_refusal_behavior_validated": False,
-        },
-        "privacy": {
-            "raw_thinking_artifacts": "private run directory only",
-            "raw_thinking_in_export": False,
-            "automatic_publication": False,
-        },
-        "known_limitations": [
-            "rank-1 direction only",
-            "dense Gemma 4 only",
-            "MoE and PLE export fail closed",
-            "multimodal refusal removal was not behaviorally evaluated",
-        ],
     }
     store.write_jsonl(
         test_export_path,
@@ -1277,7 +1125,12 @@ def evaluate_export(config_path: str) -> None:
             for trajectory in export_trajectories
         ),
         artifact_type="test_export_trajectories",
-        profile=_profile(store, target=True, chat_template_hash=chat_template_hash),
+        profile=_profile(
+            store,
+            target=True,
+            chat_template_hash=chat_template_hash,
+            judge_template_hash=current_judge_template_hash(),
+        ),
         private=True,
     )
     store.write_jsonl(
@@ -1287,8 +1140,8 @@ def evaluate_export(config_path: str) -> None:
         profile=_profile(
             store,
             target=True,
-            judge=True,
-            chat_template_hash=_judge_chat_hash(chat_template_hash),
+            chat_template_hash=chat_template_hash,
+            judge_template_hash=current_judge_template_hash(),
         ),
         private=False,
     )
@@ -1304,7 +1157,7 @@ def evaluate_export(config_path: str) -> None:
         store.paths.quality_metrics,
         {
             "quality_evaluation": quality_evaluation,
-            "validation_metrics": validation_report["selected_candidate"]["validation_metrics"],
+            "full_validation_metrics": full_validation_report["selected_candidate"]["full_validation_metrics"],
             "test_metrics": test_metrics,
         },
         artifact_type="quality_metrics",
@@ -1321,34 +1174,24 @@ def _validate_export_manifest(
     direction: torch.Tensor,
 ) -> None:
     expected = {
-        "schema_version": 1,
         "base_model_id": config.model.id,
         "base_revision": config.model.revision,
         "config_hash": config.config_hash,
-        "target_profile_hash": config.target_profile_hash,
-        "judge_profile_hash": config.judge_profile_hash,
+        "target_generation_config_hash": config.target_generation_config_hash,
+        "judge_template_hash": current_judge_template_hash(),
     }
     mismatches = [name for name, value in expected.items() if manifest.get(name) != value]
     if mismatches:
         raise ArtifactError(f"export manifest profile mismatch: {mismatches}")
-    if manifest.get("target_generation") != {"thinking_enabled": True}:
-        raise ArtifactError("export manifest target generation profile is invalid")
-    judge_profile = manifest.get("judge_profile")
-    if not isinstance(judge_profile, Mapping) or judge_profile.get("thinking_enabled") is not False:
-        raise ArtifactError("export manifest judge profile is invalid")
-    if object_sha256(manifest.get("validation_metrics")) != object_sha256(selection.get("metrics")):
-        raise ArtifactError("export manifest validation metrics differ from final selection")
+    if object_sha256(manifest.get("full_validation_metrics")) != object_sha256(selection.get("metrics")):
+        raise ArtifactError("export manifest full validation metrics differ from final selection")
     selected_candidate = selection.get("candidate")
     if not isinstance(selected_candidate, Mapping):
         raise ArtifactError("final selection candidate metadata is missing")
-    source_fields = {
-        "direction_source_phase": selected_candidate.get("phase"),
-        "direction_source_layer": selected_candidate.get("layer"),
-        "direction_source_relative_position": selected_candidate.get("relative_position"),
-    }
+    source_fields = {"direction_source_layer": selected_candidate.get("layer")}
     if any(manifest.get(name) != value for name, value in source_fields.items()):
         raise ArtifactError("export manifest direction source differs from final selection")
-    if manifest.get("test_metrics"):
+    if "test_metrics" in manifest:
         raise PipelineError("export manifest already contains independent test metrics")
     unit_direction = direction.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
     norm = torch.linalg.vector_norm(unit_direction)
@@ -1361,8 +1204,6 @@ def _validate_export_manifest(
         raise ArtifactError("export manifest has no passing temporary/permanent equivalence")
     if manifest.get("untouched_parameters_verified") is not True:
         raise ArtifactError("export manifest has no untouched-parameter verification")
-    if manifest.get("privacy") != {"raw_thinking_included": False, "push_to_hub": False}:
-        raise ArtifactError("export manifest privacy profile is invalid")
     reload_report = manifest.get("fresh_reload")
     required_reload = {
         "status": "OK",
@@ -1370,7 +1211,6 @@ def _validate_export_manifest(
         "probe_logits_match": True,
         "processor_reload_verified": True,
         "target_trajectory_required": True,
-        "target_thinking_enabled": True,
         "target_trajectory_passed": True,
     }
     if not isinstance(reload_report, Mapping) or any(
