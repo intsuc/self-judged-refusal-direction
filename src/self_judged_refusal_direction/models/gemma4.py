@@ -145,10 +145,17 @@ class Gemma4Adapter(ArchitectureAdapter):
         config: TargetGenerationConfig | None = None,
         *,
         thinking_enabled: bool | None = None,
+        prefill_thinking: bool,
         **kwargs: Any,
     ) -> Any:
         resolved = self._target_thinking_mode(config, thinking_enabled)
-        return self._render_chat(processor, messages, enable_thinking=resolved, **kwargs)
+        options = self._target_render_options(resolved, prefill_thinking, kwargs)
+        prepared = (
+            (*messages, {"role": "assistant", "reasoning_content": "", "content": ""})
+            if prefill_thinking and resolved
+            else messages
+        )
+        return self._render_chat(processor, prepared, enable_thinking=resolved, **options)
 
     def render_target_chat_batch(
         self,
@@ -157,6 +164,7 @@ class Gemma4Adapter(ArchitectureAdapter):
         config: TargetGenerationConfig | None = None,
         *,
         thinking_enabled: bool | None = None,
+        prefill_thinking: bool,
         **kwargs: Any,
     ) -> Any:
         if not conversations:
@@ -177,7 +185,33 @@ class Gemma4Adapter(ArchitectureAdapter):
         processor_options["padding"] = True
         processor_options["padding_side"] = "left"
         options["processor_kwargs"] = processor_options
-        return self._render_chat(processor, conversations, enable_thinking=resolved, **options)
+        render_options = self._target_render_options(resolved, prefill_thinking, options)
+        prepared = (
+            tuple(
+                (*conversation, {"role": "assistant", "reasoning_content": "", "content": ""})
+                for conversation in conversations
+            )
+            if prefill_thinking and resolved
+            else conversations
+        )
+        return self._render_chat(processor, prepared, enable_thinking=resolved, **render_options)
+
+    def _target_render_options(
+        self,
+        enable_thinking: bool,
+        prefill_thinking: bool,
+        kwargs: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(prefill_thinking, bool):
+            raise InvariantError("target thinking prefill mode must be a boolean")
+        if "add_generation_prompt" in kwargs or "continue_final_message" in kwargs:
+            raise InvariantError("target response boundary cannot be overridden")
+        options = dict(kwargs)
+        if not prefill_thinking or not enable_thinking:
+            return options
+        options["add_generation_prompt"] = False
+        options["continue_final_message"] = "reasoning_content"
+        return options
 
     def _target_thinking_mode(
         self,
@@ -279,12 +313,12 @@ class Gemma4Adapter(ArchitectureAdapter):
                 f"{type(error).__name__}: {error}",
             ) from error
         if thinking_enabled:
-            if tokens[: len(grammar.thinking_open)] != grammar.thinking_open:
+            if prefix[-len(grammar.thinking_open) :] != grammar.thinking_open:
                 raise TargetParseError(
-                    TargetParseErrorCode.THINKING_OPEN_MISSING,
-                    "thinking output does not start with the official response delimiter",
+                    TargetParseErrorCode.INVALID_INPUT,
+                    "thinking prefix does not end with the official response delimiter",
                 )
-            thinking_start = len(grammar.thinking_open)
+            thinking_start = 0
             thinking_end = _find_sequence(tokens, grammar.thinking_close, thinking_start)
             if thinking_end is None:
                 if any(
@@ -442,8 +476,8 @@ class Gemma4Adapter(ArchitectureAdapter):
                 grammar = self.response_token_grammar(processor)
                 if not callable(getattr(processor, "parse_response", None)):
                     raise CompatibilityError("processor has no parse_response method")
-                probe = (*grammar.thinking_open, *grammar.thinking_close, *grammar.content_closes[0])
-                self.parse_target_trajectory(processor, probe)
+                probe = (*grammar.thinking_close, *grammar.content_closes[0])
+                self.parse_target_trajectory(processor, probe, prefix_ids=grammar.thinking_open)
                 self.parse_target_trajectory(
                     processor,
                     grammar.content_closes[0],

@@ -76,11 +76,12 @@ def test_render_target_chat_resolves_config_and_explicit_thinking_modes() -> Non
         processor,
         messages,
         config=TargetGenerationConfig(thinking_enabled=False),
+        prefill_thinking=True,
     )
     assert processor.chat_options is not None
     assert processor.chat_options["enable_thinking"] is False
 
-    adapter.render_target_chat(processor, messages, thinking_enabled=True)
+    adapter.render_target_chat(processor, messages, thinking_enabled=True, prefill_thinking=False)
     assert processor.chat_options["enable_thinking"] is True
 
     with pytest.raises(InvariantError, match="conflicts"):
@@ -89,6 +90,7 @@ def test_render_target_chat_resolves_config_and_explicit_thinking_modes() -> Non
             messages,
             config=TargetGenerationConfig(thinking_enabled=True),
             thinking_enabled=False,
+            prefill_thinking=False,
         )
 
 
@@ -103,16 +105,48 @@ def test_render_target_chat_batch_requires_left_padding() -> None:
     adapter.render_target_chat_batch(
         processor,
         conversations,
-        config=TargetGenerationConfig(thinking_enabled=False),
+        config=TargetGenerationConfig(thinking_enabled=True),
+        prefill_thinking=True,
     )
 
-    assert processor.chat_messages == conversations
+    assert processor.chat_messages == [
+        (*conversation, {"role": "assistant", "reasoning_content": "", "content": ""}) for conversation in conversations
+    ]
     assert processor.chat_options is not None
-    assert processor.chat_options["enable_thinking"] is False
+    assert processor.chat_options["enable_thinking"] is True
+    assert processor.chat_options["add_generation_prompt"] is False
+    assert processor.chat_options["continue_final_message"] == "reasoning_content"
     assert processor.chat_options["processor_kwargs"] == {"padding": True, "padding_side": "left"}
 
     with pytest.raises(InvariantError, match="padding cannot be overridden"):
-        adapter.render_target_chat_batch(processor, conversations, processor_kwargs={"padding_side": "right"})
+        adapter.render_target_chat_batch(
+            processor,
+            conversations,
+            prefill_thinking=False,
+            processor_kwargs={"padding_side": "right"},
+        )
+
+
+def test_render_target_chat_prefills_official_thinking_boundary() -> None:
+    adapter = Gemma4Adapter()
+    processor = ProcessorSpy()
+    messages = [{"role": "user", "content": "request"}]
+
+    adapter.render_target_chat(
+        processor,
+        messages,
+        config=TargetGenerationConfig(thinking_enabled=True),
+        prefill_thinking=True,
+    )
+
+    assert processor.chat_messages == [
+        *messages,
+        {"role": "assistant", "reasoning_content": "", "content": ""},
+    ]
+    assert processor.chat_options is not None
+    assert processor.chat_options["enable_thinking"] is True
+    assert processor.chat_options["add_generation_prompt"] is False
+    assert processor.chat_options["continue_final_message"] == "reasoning_content"
 
 
 def test_processor_fingerprints_include_chat_and_response_templates() -> None:
@@ -136,11 +170,12 @@ def test_parse_thinking_trajectory_preserves_strict_token_boundaries() -> None:
     adapter = Gemma4Adapter()
     processor = ProcessorSpy({"role": "assistant", "thinking": "reason", "content": "answer"})
     prefix = (7, 8)
-    output = token_ids(f"{THINKING_OPEN}reason{THINKING_CLOSE}answer{CONTENT_CLOSE}")
+    prefix = (*prefix, *token_ids(THINKING_OPEN))
+    output = token_ids(f"reason{THINKING_CLOSE}answer{CONTENT_CLOSE}")
 
     parsed = adapter.parse_target_trajectory(processor, output, prefix_ids=prefix, thinking_enabled=True)
 
-    thinking_start = len(token_ids(THINKING_OPEN))
+    thinking_start = 0
     thinking_end = thinking_start + len("reason")
     final_start = thinking_end + len(token_ids(THINKING_CLOSE))
     assert parsed.thinking_token_start == thinking_start
@@ -155,11 +190,12 @@ def test_parse_truncated_thinking_trajectory_preserves_incomplete_thought() -> N
     adapter = Gemma4Adapter()
     processor = ProcessorSpy({"role": "assistant", "thinking": "unfinished"})
     prefix = (7, 8)
-    output = token_ids(f"{THINKING_OPEN}unfinished")
+    prefix = (*prefix, *token_ids(THINKING_OPEN))
+    output = token_ids("unfinished")
 
     parsed = adapter.parse_target_trajectory(processor, output, prefix_ids=prefix, thinking_enabled=True)
 
-    thinking_start = len(token_ids(THINKING_OPEN))
+    thinking_start = 0
     assert parsed.thinking_text == "unfinished"
     assert parsed.final_answer == ""
     assert parsed.thinking_token_start == thinking_start
@@ -173,10 +209,11 @@ def test_parse_truncated_thinking_trajectory_preserves_incomplete_thought() -> N
 def test_parse_thinking_trajectory_rejects_terminal_before_thinking_close() -> None:
     adapter = Gemma4Adapter()
     processor = ProcessorSpy({"role": "assistant", "thinking": f"unfinished{CONTENT_CLOSE}"})
-    output = token_ids(f"{THINKING_OPEN}unfinished{CONTENT_CLOSE}")
+    prefix = token_ids(THINKING_OPEN)
+    output = token_ids(f"unfinished{CONTENT_CLOSE}")
 
     with pytest.raises(TargetParseError) as raised:
-        adapter.parse_target_trajectory(processor, output, thinking_enabled=True)
+        adapter.parse_target_trajectory(processor, output, prefix_ids=prefix, thinking_enabled=True)
     assert raised.value.code is TargetParseErrorCode.THINKING_CLOSE_MISSING
 
 

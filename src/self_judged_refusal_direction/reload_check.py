@@ -302,7 +302,12 @@ def _run_target_trajectory_probe(
     if probe_generation.system_prompt is not None:
         messages.append({"role": "system", "content": probe_generation.system_prompt})
     messages.append({"role": "user", "content": "Reply with exactly OK."})
-    rendered = adapter.render_target_chat(processor, messages, config=probe_generation)
+    rendered = adapter.render_target_chat(
+        processor,
+        messages,
+        config=probe_generation,
+        prefill_thinking=True,
+    )
     if not isinstance(rendered, dict) and not hasattr(rendered, "items"):
         raise InvariantError("fresh reload target chat did not return model inputs")
     inputs = dict(rendered)

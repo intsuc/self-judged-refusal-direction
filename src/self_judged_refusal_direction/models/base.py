@@ -97,6 +97,7 @@ class ArchitectureAdapter(ABC):
         config: TargetGenerationConfig | None = None,
         *,
         thinking_enabled: bool | None = None,
+        prefill_thinking: bool,
         **kwargs: Any,
     ) -> Any:
         raise NotImplementedError
@@ -109,6 +110,7 @@ class ArchitectureAdapter(ABC):
         config: TargetGenerationConfig | None = None,
         *,
         thinking_enabled: bool | None = None,
+        prefill_thinking: bool,
         **kwargs: Any,
     ) -> Any:
         raise NotImplementedError
@@ -184,7 +186,7 @@ class ArchitectureAdapter(ABC):
     def processor_fingerprints(self, processor: Any) -> dict[str, str]:
         if callable(getattr(processor, "apply_chat_template", None)):
             messages = [{"role": "user", "content": "fingerprint"}]
-            self.render_target_chat(processor, messages)
+            self.render_target_chat(processor, messages, prefill_thinking=False)
             self.render_judge_chat(processor, messages)
         tokenizer = getattr(processor, "tokenizer", None)
         backend = getattr(tokenizer, "backend_tokenizer", None)

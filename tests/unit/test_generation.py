@@ -109,6 +109,7 @@ class AdapterSpy:
     def __init__(self) -> None:
         self.messages: list[dict[str, str]] | None = None
         self.generation_config: TargetGenerationConfig | None = None
+        self.prefill_thinking: bool | None = None
         self.parse_thinking_enabled: bool | None = None
         self.parse_prefix: tuple[int, ...] | None = None
 
@@ -117,11 +118,14 @@ class AdapterSpy:
         processor: Any,
         messages: list[dict[str, str]],
         config: TargetGenerationConfig | None = None,
+        *,
+        prefill_thinking: bool,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         del processor, kwargs
         self.messages = messages
         self.generation_config = config
+        self.prefill_thinking = prefill_thinking
         return {
             "input_ids": torch.tensor([[11, 12]], dtype=torch.long),
             "attention_mask": torch.ones((1, 2), dtype=torch.long),
@@ -171,10 +175,13 @@ class BatchAdapterSpy(AdapterSpy):
         processor: Any,
         conversations: list[list[dict[str, str]]],
         config: TargetGenerationConfig | None = None,
+        *,
+        prefill_thinking: bool,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         del processor, config, kwargs
         self.conversations = conversations
+        self.prefill_thinking = prefill_thinking
         return {
             "input_ids": torch.tensor([[0, 0, 11, 12], [21, 22, 23, 24]], dtype=torch.long),
             "attention_mask": torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]], dtype=torch.long),
@@ -263,6 +270,7 @@ def test_generation_uses_target_profile_and_hashes_resolved_model_defaults() -> 
         {"role": "user", "content": "request"},
     ]
     assert runtime.adapter.parse_thinking_enabled is False
+    assert runtime.adapter.prefill_thinking is True
     assert runtime.adapter.parse_prefix == (11, 12)
     assert runtime.model.options is not None
     assert runtime.model.options["max_new_tokens"] == 24
@@ -349,6 +357,7 @@ def test_greedy_batch_generation_restores_prefixes_and_removes_only_post_eos_pad
             {"role": "user", "content": "two"},
         ],
     ]
+    assert runtime.adapter.prefill_thinking is True
     assert runtime.adapter.parse_calls == [
         ((9, 3), (11, 12)),
         ((8, 7, 4), (21, 22, 23, 24)),

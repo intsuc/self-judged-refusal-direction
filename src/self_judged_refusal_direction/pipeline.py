@@ -655,6 +655,7 @@ def _validate_static_context_budget(config: ProjectConfig, runtime: BaseModelRun
         runtime.processor,
         target_messages("", config.target_generation.system_prompt),
         config=config.target_generation,
+        prefill_thinking=True,
     )
     target_required = (
         int(target_rendered["input_ids"].shape[-1])
@@ -1345,6 +1346,7 @@ def _collect_activation_statistics(
             runtime.processor,
             target_messages(trajectory.original_prompt, config.target_generation.system_prompt),
             config=config.target_generation,
+            prefill_thinking=False,
         )
         inputs = _move_inputs(dict(rendered), runtime.adapter.input_device(model))
         input_ids = inputs.get("input_ids")
@@ -2160,6 +2162,7 @@ def _next_token_logits(
         runtime.processor,
         target_messages(prompt.original_prompt, runtime.config.target_generation.system_prompt),
         config=runtime.config.target_generation,
+        prefill_thinking=True,
     )
     inputs = _move_inputs(dict(rendered), runtime.adapter.input_device(runtime.model))
     with torch.inference_mode():
@@ -2421,6 +2424,7 @@ def export_model(config_path: str) -> None:
             runtime.processor,
             target_messages(prompt.original_prompt, config.target_generation.system_prompt),
             config=config.target_generation,
+            prefill_thinking=True,
         )
         probe = _move_inputs(dict(probe), runtime.adapter.input_device(runtime.model))
         export_result = export_edited_model(

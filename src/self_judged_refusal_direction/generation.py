@@ -319,7 +319,12 @@ class TargetTrajectoryGenerator:
         prompt_token_count = len(runtime.processor.tokenizer.encode(original_prompt, add_special_tokens=False))
         if prompt_token_count > config.data.max_text_tokens:
             raise InvariantError(f"prompt has {prompt_token_count} tokens; maximum is {config.data.max_text_tokens}")
-        rendered = runtime.adapter.render_target_chat(runtime.processor, messages, config=generation)
+        rendered = runtime.adapter.render_target_chat(
+            runtime.processor,
+            messages,
+            config=generation,
+            prefill_thinking=True,
+        )
         inputs = _move_inputs(rendered, runtime.adapter.input_device(runtime.model))
         if not isinstance(inputs, Mapping) or "input_ids" not in inputs:
             raise InvariantError("rendered target chat has no input_ids")
@@ -394,6 +399,7 @@ class TargetTrajectoryGenerator:
             runtime.processor,
             conversations,
             config=generation,
+            prefill_thinking=True,
         )
         inputs = _move_inputs(rendered, runtime.adapter.input_device(runtime.model))
         if not isinstance(inputs, Mapping) or "input_ids" not in inputs:
