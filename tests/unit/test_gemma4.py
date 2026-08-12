@@ -151,6 +151,35 @@ def test_parse_thinking_trajectory_preserves_strict_token_boundaries() -> None:
     assert processor.prefix == list(prefix)
 
 
+def test_parse_truncated_thinking_trajectory_preserves_incomplete_thought() -> None:
+    adapter = Gemma4Adapter()
+    processor = ProcessorSpy({"role": "assistant", "thinking": "unfinished"})
+    prefix = (7, 8)
+    output = token_ids(f"{THINKING_OPEN}unfinished")
+
+    parsed = adapter.parse_target_trajectory(processor, output, prefix_ids=prefix, thinking_enabled=True)
+
+    thinking_start = len(token_ids(THINKING_OPEN))
+    assert parsed.thinking_text == "unfinished"
+    assert parsed.final_answer == ""
+    assert parsed.thinking_token_start == thinking_start
+    assert parsed.thinking_token_end == len(output)
+    assert parsed.final_token_start == len(output)
+    assert parsed.final_token_end == len(output)
+    assert not parsed.terminal_found
+    assert processor.prefix == list(prefix)
+
+
+def test_parse_thinking_trajectory_rejects_terminal_before_thinking_close() -> None:
+    adapter = Gemma4Adapter()
+    processor = ProcessorSpy({"role": "assistant", "thinking": f"unfinished{CONTENT_CLOSE}"})
+    output = token_ids(f"{THINKING_OPEN}unfinished{CONTENT_CLOSE}")
+
+    with pytest.raises(TargetParseError) as raised:
+        adapter.parse_target_trajectory(processor, output, thinking_enabled=True)
+    assert raised.value.code is TargetParseErrorCode.THINKING_CLOSE_MISSING
+
+
 def test_parse_content_only_trajectory_has_empty_thinking_span() -> None:
     adapter = Gemma4Adapter()
     processor = ProcessorSpy({"role": "assistant", "content": "answer"})

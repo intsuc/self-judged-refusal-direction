@@ -287,11 +287,17 @@ class Gemma4Adapter(ArchitectureAdapter):
             thinking_start = len(grammar.thinking_open)
             thinking_end = _find_sequence(tokens, grammar.thinking_close, thinking_start)
             if thinking_end is None:
-                raise TargetParseError(
-                    TargetParseErrorCode.THINKING_CLOSE_MISSING,
-                    "thinking output has no official closing delimiter",
-                )
-            final_start = thinking_end + len(grammar.thinking_close)
+                if any(
+                    _find_sequence(tokens, pattern, thinking_start) is not None for pattern in grammar.content_closes
+                ):
+                    raise TargetParseError(
+                        TargetParseErrorCode.THINKING_CLOSE_MISSING,
+                        "thinking output reaches a terminal delimiter without its closing delimiter",
+                    )
+                thinking_end = len(tokens)
+                final_start = len(tokens)
+            else:
+                final_start = thinking_end + len(grammar.thinking_close)
         else:
             if _find_sequence(tokens, grammar.thinking_open, 0) is not None:
                 raise TargetParseError(
