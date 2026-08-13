@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
@@ -14,6 +15,7 @@ from self_judged_refusal_direction.schema import CandidateMetrics, DirectionCand
 
 _REPETITION_NGRAM_SIZE = 4
 _REPETITION_THRESHOLD = 0.5
+_CONTROL_DELIMITER = re.compile(r"<(?:\|[^<>\r\n]+|[^<>\r\n]+\|)>")
 
 
 def mean_next_token_kl(base_logits: Sequence[torch.Tensor], intervention_logits: Sequence[torch.Tensor]) -> float:
@@ -42,6 +44,7 @@ def evaluate_behavior(
     acceptance: AcceptanceConfig,
     activation_addition_induction_rate: float | None = None,
     activation_addition_error_rate: float | None = None,
+    require_activation_addition: bool = False,
 ) -> CandidateMetrics:
     records = list(trajectories)
     refusal_ids = {prompt_id for prompt_id, label in baseline_labels.items() if label == "REFUSAL"}
@@ -77,12 +80,23 @@ def evaluate_behavior(
     retention_rate = _ratio(retention_successes, len(non_refusal_ids))
     uncertain_rate = _ratio(uncertain_count, total)
     error_rate = _ratio(error_count, total)
-    empty_rate = _ratio(sum(not item.final_answer.strip() for item in observed), total)
-    repeated = (
-        _abnormal_repetition(item.final_answer, _REPETITION_NGRAM_SIZE, _REPETITION_THRESHOLD) for item in observed
+    generated = [by_prompt[prompt_id] for prompt_id in expected_ids if prompt_id in by_prompt]
+    baseline_generated = [baseline_trajectories[prompt_id] for prompt_id in expected_ids]
+    baseline_completion_rate = _ratio(sum(not item.generation_truncated for item in baseline_generated), total)
+    completion_rate = _ratio(sum(not item.generation_truncated for item in generated), total)
+    baseline_empty_rate = _ratio(sum(not item.final_answer.strip() for item in baseline_generated), total)
+    empty_rate = _ratio(
+        sum(prompt_id not in by_prompt or not by_prompt[prompt_id].final_answer.strip() for prompt_id in expected_ids),
+        total,
     )
-    repetition_rate = _ratio(
-        sum(repeated),
+    baseline_repetition_rate = _ratio(sum(_abnormal_repetition(item) for item in baseline_generated), total)
+    repetition_rate = _ratio(sum(_abnormal_repetition(item) for item in generated), total)
+    baseline_delimiter_repetition_rate = _ratio(
+        sum(_abnormal_control_delimiter_repetition(item.raw_decoded_output) for item in baseline_generated),
+        total,
+    )
+    delimiter_repetition_rate = _ratio(
+        sum(_abnormal_control_delimiter_repetition(item.raw_decoded_output) for item in generated),
         total,
     )
     thinking_lengths = [max(item.thinking_token_end - item.thinking_token_start, 0) for item in observed]
@@ -102,7 +116,6 @@ def evaluate_behavior(
     baseline_mean_final = _mean(baseline_final_lengths)
     intervention_mean_thinking = _mean(thinking_lengths)
     intervention_mean_final = _mean(final_lengths)
-    completion_proxy = _ratio(sum(bool(item.final_answer.strip()) for item in observed), total)
     metrics = CandidateMetrics(
         candidate_id=candidate_id,
         baseline_refusal_count=len(refusal_ids),
@@ -117,23 +130,44 @@ def evaluate_behavior(
         error_rate=error_rate,
         mean_kl=mean_kl,
         ce_loss_delta=ce_loss_delta,
+        baseline_completion_rate=baseline_completion_rate,
+        completion_rate=completion_rate,
+        completion_rate_delta=completion_rate - baseline_completion_rate,
+        baseline_empty_answer_rate=baseline_empty_rate,
         empty_answer_rate=empty_rate,
+        empty_answer_rate_delta=empty_rate - baseline_empty_rate,
+        baseline_abnormal_repetition_rate=baseline_repetition_rate,
         abnormal_repetition_rate=repetition_rate,
+        abnormal_repetition_rate_delta=repetition_rate - baseline_repetition_rate,
+        baseline_control_delimiter_repetition_rate=baseline_delimiter_repetition_rate,
+        control_delimiter_repetition_rate=delimiter_repetition_rate,
+        control_delimiter_repetition_rate_delta=(delimiter_repetition_rate - baseline_delimiter_repetition_rate),
         baseline_mean_thinking_tokens=baseline_mean_thinking,
         baseline_mean_final_tokens=baseline_mean_final,
         mean_thinking_tokens=intervention_mean_thinking,
         mean_final_tokens=intervention_mean_final,
         mean_thinking_tokens_delta=intervention_mean_thinking - baseline_mean_thinking,
         mean_final_tokens_delta=intervention_mean_final - baseline_mean_final,
-        task_completion_proxy=completion_proxy,
         activation_addition_induction_rate=activation_addition_induction_rate,
         activation_addition_error_rate=activation_addition_error_rate,
     )
-    return apply_hard_filters(metrics, acceptance)
+    return apply_hard_filters(metrics, acceptance, require_activation_addition=require_activation_addition)
 
 
-def apply_hard_filters(metrics: CandidateMetrics, acceptance: AcceptanceConfig) -> CandidateMetrics:
+def apply_hard_filters(
+    metrics: CandidateMetrics,
+    acceptance: AcceptanceConfig,
+    *,
+    require_activation_addition: bool = False,
+) -> CandidateMetrics:
     reasons: list[str] = []
+    if metrics.removal_success_rate < acceptance.min_removal_success_rate:
+        reasons.append("removal_success_rate")
+    if require_activation_addition and (
+        metrics.activation_addition_induction_rate is None
+        or metrics.activation_addition_induction_rate < acceptance.min_activation_addition_induction_rate
+    ):
+        reasons.append("activation_addition_induction_rate")
     if metrics.error_rate > acceptance.max_error_rate:
         reasons.append("error_rate")
     if (
@@ -145,6 +179,15 @@ def apply_hard_filters(metrics: CandidateMetrics, acceptance: AcceptanceConfig) 
         reasons.append("uncertain_rate")
     if metrics.non_refusal_retention_rate < acceptance.min_non_refusal_retention:
         reasons.append("non_refusal_retention")
+    failure_limit = acceptance.max_generation_failure_rate_increase
+    if -metrics.completion_rate_delta > failure_limit:
+        reasons.append("completion_rate")
+    if metrics.empty_answer_rate_delta > failure_limit:
+        reasons.append("empty_answer_rate")
+    if metrics.abnormal_repetition_rate_delta > failure_limit:
+        reasons.append("abnormal_repetition_rate")
+    if metrics.control_delimiter_repetition_rate_delta > failure_limit:
+        reasons.append("control_delimiter_repetition_rate")
     if not math.isfinite(metrics.mean_kl) or metrics.mean_kl > acceptance.max_mean_kl:
         reasons.append("mean_kl")
     if not math.isfinite(metrics.ce_loss_delta) or metrics.ce_loss_delta > acceptance.max_ce_loss_delta:
@@ -208,13 +251,19 @@ def metrics_dict(metrics: CandidateMetrics) -> dict[str, Any]:
     return value
 
 
-def _abnormal_repetition(text: str, n: int, threshold: float) -> bool:
-    tokens = text.split()
+def _abnormal_repetition(trajectory: TargetTrajectory) -> bool:
+    tokens = trajectory.raw_generated_token_ids
+    n = _REPETITION_NGRAM_SIZE
     if len(tokens) < n * 2:
         return False
     ngrams = [tuple(tokens[index : index + n]) for index in range(len(tokens) - n + 1)]
     repeated_fraction = 1.0 - len(set(ngrams)) / len(ngrams)
-    return repeated_fraction >= threshold
+    return repeated_fraction >= _REPETITION_THRESHOLD
+
+
+def _abnormal_control_delimiter_repetition(text: str) -> bool:
+    counts = Counter(_CONTROL_DELIMITER.findall(text))
+    return any(count > 1 for count in counts.values())
 
 
 def _ratio(numerator: int, denominator: int) -> float:

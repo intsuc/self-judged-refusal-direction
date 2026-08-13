@@ -33,6 +33,7 @@ class ArtifactProfile:
     judge_validation_hash: str | None = None
     baseline_generation_hash: str | None = None
     baseline_judgment_hash: str | None = None
+    activation_extraction_hash: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -202,6 +203,7 @@ class ArtifactStore:
         judge_validation_hash: str | None = None,
         baseline_generation_hash: str | None = None,
         baseline_judgment_hash: str | None = None,
+        activation_extraction_hash: str | None = None,
     ) -> ArtifactProfile:
         if self.config.model.id is None:
             raise ArtifactError("model ID is required")
@@ -216,6 +218,7 @@ class ArtifactStore:
             judge_validation_hash=judge_validation_hash,
             baseline_generation_hash=baseline_generation_hash,
             baseline_judgment_hash=baseline_judgment_hash,
+            activation_extraction_hash=activation_extraction_hash,
         )
 
     def initialize_run(self) -> None:

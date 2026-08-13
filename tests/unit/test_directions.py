@@ -24,6 +24,7 @@ def moments(mean: list[float], *, count: int = 2, m2: list[float] | None = None)
 def test_direction_is_normalized_refusal_minus_non_refusal_mean() -> None:
     key = ActivationKey(layer=3)
     statistics = ActivationStatistics(
+        layer_count=4,
         refusal={key: moments([4.0, 2.0], m2=[2.0, 8.0])},
         non_refusal={key: moments([1.0, -2.0], m2=[4.0, 2.0])},
     )
@@ -43,6 +44,7 @@ def test_zero_norm_and_nan_candidates_are_not_ranked() -> None:
     zero_key = ActivationKey(layer=1)
     nan_key = ActivationKey(layer=2)
     statistics = ActivationStatistics(
+        layer_count=3,
         refusal={
             valid_key: moments([1.0, 0.0]),
             zero_key: moments([2.0, 2.0]),
@@ -64,12 +66,27 @@ def test_zero_norm_and_nan_candidates_are_not_ranked() -> None:
     assert candidates[2].norm == 0.0
     torch.testing.assert_close(bundle.direction(candidates[1]), torch.zeros(2))
     torch.testing.assert_close(bundle.direction(candidates[2]), torch.zeros(2))
-    assert rank_activation_screening(bundle, keep=3) == (candidates[0],)
+    assert rank_activation_screening(bundle, keep=3, layer_count=3) == (candidates[0],)
+
+
+def test_activation_screening_prioritizes_middle_layers_and_excludes_final_fifth() -> None:
+    keys = tuple(ActivationKey(layer=layer) for layer in range(60))
+    statistics = ActivationStatistics(
+        layer_count=60,
+        refusal={key: moments([1.0, 0.0]) for key in keys},
+        non_refusal={key: moments([0.0, 0.0]) for key in keys},
+    )
+
+    ranking = rank_activation_screening(build_candidates(statistics), keep=32, layer_count=60)
+
+    assert ranking[0].layer == 36
+    assert {candidate.layer for candidate in ranking} == set(range(16, 48))
 
 
 def test_candidate_and_selected_direction_artifacts_round_trip(tmp_path) -> None:
     key = ActivationKey(layer=4)
     statistics = ActivationStatistics(
+        layer_count=5,
         refusal={key: moments([3.0, 4.0])},
         non_refusal={key: moments([0.0, 0.0])},
     )

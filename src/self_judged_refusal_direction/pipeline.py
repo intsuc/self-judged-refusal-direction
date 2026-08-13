@@ -137,6 +137,7 @@ def _profile(
     judge_validation_hash: str | None = None,
     baseline_generation_hash: str | None = None,
     baseline_judgment_hash: str | None = None,
+    activation_extraction_hash: str | None = None,
 ) -> ArtifactProfile:
     return store.profile(
         target=target,
@@ -146,6 +147,7 @@ def _profile(
         judge_validation_hash=judge_validation_hash,
         baseline_generation_hash=baseline_generation_hash,
         baseline_judgment_hash=baseline_judgment_hash,
+        activation_extraction_hash=activation_extraction_hash,
     )
 
 
@@ -306,6 +308,16 @@ def _implementation_hash(*values: Any) -> str:
             raise InvariantError("runtime implementation source is unavailable")
         sources[module.__name__] = file_sha256(source)
     return object_sha256(sources)
+
+
+def _activation_extraction_hash(config: ProjectConfig) -> str:
+    adapter = adapter_for_config(config)
+    return _implementation_hash(
+        _collect_activation_statistics,
+        ActivationCollector,
+        adapter.activation_read_points,
+        type(adapter),
+    )
 
 
 def _baseline_generation_hash(
@@ -1309,6 +1321,7 @@ def collect_activations(config_path: str) -> None:
             judge_validation_hash=validation_hash,
             baseline_generation_hash=baseline_profile.baseline_generation_hash,
             baseline_judgment_hash=judgment_hash,
+            activation_extraction_hash=_activation_extraction_hash(config),
         )
         metadata = ArtifactMetadata(
             artifact_type="activation_statistics",
@@ -1346,7 +1359,7 @@ def _collect_activation_statistics(
             runtime.processor,
             target_messages(trajectory.original_prompt, config.target_generation.system_prompt),
             config=config.target_generation,
-            prefill_thinking=False,
+            prefill_thinking=True,
         )
         inputs = _move_inputs(dict(rendered), runtime.adapter.input_device(model))
         input_ids = inputs.get("input_ids")
@@ -1373,7 +1386,11 @@ def build_direction_candidates(config_path: str) -> None:
     )
     statistics = load_activation_statistics(store.paths.activation_statistics)
     bundle = build_candidates(statistics, dtype="float32")
-    ranking = rank_activation_screening(bundle, keep=config.search.activation_screening_keep)
+    ranking = rank_activation_screening(
+        bundle,
+        keep=config.search.activation_screening_keep,
+        layer_count=statistics.layer_count,
+    )
     if not ranking:
         raise PipelineError("activation screening produced no numerically valid direction candidates")
     write_candidate_artifacts(store, bundle, profile=profile)
@@ -1406,6 +1423,7 @@ def _activation_dependent_profile(store: ArtifactStore) -> ArtifactProfile:
             judge_validation_hash=validation_hash,
             baseline_generation_hash=baseline_profile.baseline_generation_hash,
             baseline_judgment_hash=judgment_hash,
+            activation_extraction_hash=_activation_extraction_hash(store.config),
         ),
     )
     if (
@@ -1413,6 +1431,7 @@ def _activation_dependent_profile(store: ArtifactStore) -> ArtifactProfile:
         or metadata.profile.chat_template_hash is None
         or metadata.profile.baseline_generation_hash is None
         or metadata.profile.baseline_judgment_hash is None
+        or metadata.profile.activation_extraction_hash is None
     ):
         raise ArtifactError("activation statistics privacy or chat-template profile is invalid")
     return metadata.profile
@@ -1470,7 +1489,18 @@ def evaluate_candidates(config_path: str) -> None:
     )
     pilot_eligible = [item for item in pilot_metrics if item.hard_filter_passed]
     if not pilot_eligible:
-        raise PipelineError("no pilot evaluation candidate passed the configured hard filters")
+        rejection_counts = Counter(reason for item in pilot_metrics for reason in item.rejection_reasons)
+        rejection_summary = ", ".join(f"{reason}={count}" for reason, count in sorted(rejection_counts.items()))
+        best_removal = max((item.removal_success_rate for item in pilot_metrics), default=0.0)
+        best_induction = max(
+            (item.activation_addition_induction_rate or 0.0 for item in pilot_metrics),
+            default=0.0,
+        )
+        raise PipelineError(
+            "no pilot evaluation candidate passed the configured hard filters; "
+            f"best removal={best_removal:.2%}, best addition induction={best_induction:.2%}; "
+            f"rejection counts: {rejection_summary}; results: {store.paths.pilot_evaluation_results}"
+        )
     full_validation_ids = [
         item.candidate_id
         for item in sorted(pilot_eligible, key=_pilot_ranking_key, reverse=True)[: config.search.pilot_evaluation_keep]
@@ -1555,6 +1585,7 @@ def _balanced_subset(values: Sequence[LabeledTrajectory], per_class: int) -> lis
 def _pilot_ranking_key(metrics: CandidateMetrics) -> tuple[float, ...]:
     return (
         metrics.removal_success_rate,
+        metrics.activation_addition_induction_rate or 0.0,
         metrics.non_refusal_retention_rate,
         -metrics.uncertain_rate,
         -metrics.mean_kl,
@@ -1606,9 +1637,7 @@ def _candidate_phase_identity(
                 for batch in _fixed_batches(baseline_prompt_plan, config.target_generation.batch_size)
             ],
             "reference_input": reference_input,
-            "activation_addition_beta": (
-                config.acceptance.activation_addition_beta if evaluation_phase == "full_validation" else None
-            ),
+            "activation_addition_beta": config.acceptance.activation_addition_beta,
             "implementation_hash": _implementation_hash(
                 _candidate_phase_identity,
                 evaluate_behavior,
@@ -1737,8 +1766,7 @@ def _evaluate_candidates_phase(
     generation_plan: list[tuple[DirectionCandidate, Literal["removal", "addition"], PromptRecord]] = []
     for candidate in candidates:
         generation_plan.extend((candidate, "removal", prompt) for prompt in prompts)
-        if evaluation_phase == "full_validation" and config.acceptance.activation_addition_beta is not None:
-            generation_plan.extend((candidate, "addition", prompt) for prompt in non_refusal_prompts)
+        generation_plan.extend((candidate, "addition", prompt) for prompt in non_refusal_prompts)
     generation_keys = [
         _candidate_trajectory_key(candidate.candidate_id, kind, prompt.prompt_id)
         for candidate, kind, prompt in generation_plan
@@ -1926,8 +1954,6 @@ def _evaluate_candidates_phase(
                         ]
                         if any(ordinal not in trajectory_by_ordinal for ordinal in addition_ordinals):
                             beta = config.acceptance.activation_addition_beta
-                            if beta is None:
-                                raise InvariantError("addition checkpoint plan has no configured coefficient")
                             block_name = _transformer_block_name(runtime, candidate.layer)
                             with plan.activation_addition(runtime.model, block_name, beta * candidate.norm):
                                 generate_batches(addition_ordinals)
@@ -2131,6 +2157,7 @@ def _evaluate_candidates_phase(
             acceptance=config.acceptance,
             activation_addition_induction_rate=induction,
             activation_addition_error_rate=addition_error_rate,
+            require_activation_addition=True,
         )
         metrics.append(candidate_metrics)
     results_path = (
@@ -2528,8 +2555,6 @@ def _validate_selection_error_policy(
     for name in ("error_rate", "activation_addition_error_rate"):
         value = metrics.get(name)
         if value is None and name == "activation_addition_error_rate":
-            if config.acceptance.activation_addition_beta is None:
-                continue
             raise ArtifactError("final selection activation_addition_error_rate is missing")
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise ArtifactError(f"final selection {name} is invalid")

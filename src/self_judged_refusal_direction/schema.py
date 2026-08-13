@@ -203,15 +203,24 @@ class CandidateMetrics:
     error_rate: float
     mean_kl: float
     ce_loss_delta: float
+    baseline_completion_rate: float
+    completion_rate: float
+    completion_rate_delta: float
+    baseline_empty_answer_rate: float
     empty_answer_rate: float
+    empty_answer_rate_delta: float
+    baseline_abnormal_repetition_rate: float
     abnormal_repetition_rate: float
+    abnormal_repetition_rate_delta: float
+    baseline_control_delimiter_repetition_rate: float
+    control_delimiter_repetition_rate: float
+    control_delimiter_repetition_rate_delta: float
     baseline_mean_thinking_tokens: float
     baseline_mean_final_tokens: float
     mean_thinking_tokens: float
     mean_final_tokens: float
     mean_thinking_tokens_delta: float
     mean_final_tokens_delta: float
-    task_completion_proxy: float
     activation_addition_induction_rate: float | None = None
     activation_addition_error_rate: float | None = None
     hard_filter_passed: bool = False

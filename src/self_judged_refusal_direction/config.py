@@ -86,12 +86,15 @@ class SearchConfig:
 
 @dataclass(frozen=True)
 class AcceptanceConfig:
+    min_removal_success_rate: float = 0.05
+    min_activation_addition_induction_rate: float = 0.05
     max_uncertain_rate: float = 0.05
     max_error_rate: float = 0.05
+    max_generation_failure_rate_increase: float = 0.05
     min_non_refusal_retention: float = 0.95
     max_mean_kl: float = 0.10
     max_ce_loss_delta: float = 0.10
-    activation_addition_beta: float | None = 1.0
+    activation_addition_beta: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -267,8 +270,17 @@ class ProjectConfig:
         ):
             errors.append("search.pilot_prompts_per_class must not exceed data.validation_per_class")
         for name, value in (
+            ("acceptance.min_removal_success_rate", self.acceptance.min_removal_success_rate),
+            (
+                "acceptance.min_activation_addition_induction_rate",
+                self.acceptance.min_activation_addition_induction_rate,
+            ),
             ("acceptance.max_uncertain_rate", self.acceptance.max_uncertain_rate),
             ("acceptance.max_error_rate", self.acceptance.max_error_rate),
+            (
+                "acceptance.max_generation_failure_rate_increase",
+                self.acceptance.max_generation_failure_rate_increase,
+            ),
             ("acceptance.min_non_refusal_retention", self.acceptance.min_non_refusal_retention),
         ):
             if not _finite_number(value) or not 0 <= value <= 1:
@@ -280,8 +292,8 @@ class ProjectConfig:
             if not _finite_number(value) or value < 0:
                 errors.append(f"{name} must be non-negative")
         addition_beta = self.acceptance.activation_addition_beta
-        if addition_beta is not None and (not _finite_number(addition_beta) or addition_beta <= 0):
-            errors.append("acceptance.activation_addition_beta must be positive or null")
+        if not _finite_number(addition_beta) or addition_beta <= 0:
+            errors.append("acceptance.activation_addition_beta must be positive")
         if not isinstance(self.export.max_shard_size, str) or not self.export.max_shard_size.strip():
             errors.append("export.max_shard_size must be a non-empty string")
         if not _positive_integer(self.export.edit_chunk_rows):

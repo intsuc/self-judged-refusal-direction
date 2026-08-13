@@ -127,8 +127,16 @@ class OnlineWelford:
 
 @dataclass(frozen=True)
 class ActivationStatistics:
+    layer_count: int
     refusal: Mapping[ActivationKey, ActivationMoments]
     non_refusal: Mapping[ActivationKey, ActivationMoments]
+
+    def __post_init__(self) -> None:
+        if type(self.layer_count) is not int or self.layer_count < 1:
+            raise InvariantError("transformer layer count must be positive")
+        keys = set(self.refusal) | set(self.non_refusal)
+        if any(key.layer < 0 or key.layer >= self.layer_count for key in keys):
+            raise InvariantError("activation key is outside the transformer layer sequence")
 
     def for_label(self, label: ClassLabel | JudgeLabel | str) -> Mapping[ActivationKey, ActivationMoments]:
         value = label.value if isinstance(label, JudgeLabel) else str(label)
@@ -257,6 +265,7 @@ class ActivationCollector:
             return {key: accumulator.snapshot() for key, accumulator in self._moments[label].items()}
 
         return ActivationStatistics(
+            layer_count=len(self.block_modules),
             refusal=snapshots(JudgeLabel.REFUSAL.value),
             non_refusal=snapshots(JudgeLabel.NON_REFUSAL.value),
         )
@@ -276,6 +285,9 @@ def _atomic_safetensors(path: Path, tensors: dict[str, torch.Tensor], metadata: 
 
 
 def save_activation_statistics(path: str | Path, statistics: ActivationStatistics) -> None:
+    keys = set(statistics.refusal) | set(statistics.non_refusal)
+    if any(key.layer < 0 or key.layer >= statistics.layer_count for key in keys):
+        raise InvariantError("activation key is outside the transformer layer sequence")
     tensors: dict[str, torch.Tensor] = {}
     entries: list[dict[str, object]] = []
     for label in (JudgeLabel.REFUSAL.value, JudgeLabel.NON_REFUSAL.value):
@@ -287,7 +299,7 @@ def save_activation_statistics(path: str | Path, statistics: ActivationStatistic
             tensors[f"{prefix}/mean"] = moments.mean.contiguous()
             tensors[f"{prefix}/m2"] = moments.m2.contiguous()
             entries.append({"label": label, "key": key.storage_key, "count": moments.count})
-    payload = {"entries": entries}
+    payload = {"layer_count": statistics.layer_count, "entries": entries}
     _atomic_safetensors(
         Path(path),
         tensors,
@@ -315,6 +327,9 @@ def load_activation_statistics(path: str | Path) -> ActivationStatistics:
             payload = json.loads(payload_text)
             if object_sha256(payload) != metadata.get("content_profile_sha256"):
                 raise ArtifactError("activation statistics metadata is invalid")
+            layer_count = payload["layer_count"]
+            if type(layer_count) is not int or layer_count < 1:
+                raise ArtifactError("activation statistics layer count is invalid")
             for entry in payload.get("entries", []):
                 label = entry["label"]
                 if label not in loaded:
@@ -330,7 +345,11 @@ def load_activation_statistics(path: str | Path) -> ActivationStatistics:
         raise
     except (KeyError, OSError, SafetensorError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise ArtifactError(f"invalid activation statistics: {target}") from error
-    return ActivationStatistics(
-        refusal=loaded[JudgeLabel.REFUSAL.value],
-        non_refusal=loaded[JudgeLabel.NON_REFUSAL.value],
-    )
+    try:
+        return ActivationStatistics(
+            layer_count=layer_count,
+            refusal=loaded[JudgeLabel.REFUSAL.value],
+            non_refusal=loaded[JudgeLabel.NON_REFUSAL.value],
+        )
+    except InvariantError as error:
+        raise ArtifactError(f"invalid activation statistics: {target}") from error

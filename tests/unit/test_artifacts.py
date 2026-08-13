@@ -14,10 +14,17 @@ def test_artifact_reuse_requires_matching_profile_and_content(tmp_path) -> None:
     config = ProjectConfig(run=RunConfig(output_dir=str(tmp_path)), model=ModelConfig(id="model", revision="a" * 40))
     store = ArtifactStore(config)
     path = tmp_path / "rows.jsonl"
-    profile = store.profile(target=True, chat_template_hash="chat-a")
+    profile = store.profile(
+        target=True,
+        chat_template_hash="chat-a",
+        activation_extraction_hash="activation-a",
+    )
     store.write_jsonl(path, [{"value": 1}], artifact_type="rows", profile=profile, private=True)
     assert list(store.read_jsonl(path, artifact_type="rows", expected_profile=profile)) == [{"value": 1}]
     mismatch = replace(profile, chat_template_hash="chat-b")
+    with pytest.raises(ArtifactError, match="profile mismatch"):
+        list(store.read_jsonl(path, artifact_type="rows", expected_profile=mismatch))
+    mismatch = replace(profile, activation_extraction_hash="activation-b")
     with pytest.raises(ArtifactError, match="profile mismatch"):
         list(store.read_jsonl(path, artifact_type="rows", expected_profile=mismatch))
     path.write_text('{"value":2}\n', encoding="utf-8")

@@ -42,8 +42,11 @@ search:
   pilot_prompts_per_class: 16
 
 acceptance:
+  min_removal_success_rate: 0.05
+  min_activation_addition_induction_rate: 0.05
   max_uncertain_rate: 0.05
   max_error_rate: 0.05
+  max_generation_failure_rate_increase: 0.05
   min_non_refusal_retention: 0.95
   max_mean_kl: 0.10
   max_ce_loss_delta: 0.10

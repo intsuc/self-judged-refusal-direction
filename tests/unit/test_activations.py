@@ -1,7 +1,12 @@
 import torch
 from torch import nn
 
-from self_judged_refusal_direction.activations import ActivationCollector, OnlineWelford
+from self_judged_refusal_direction.activations import (
+    ActivationCollector,
+    OnlineWelford,
+    load_activation_statistics,
+    save_activation_statistics,
+)
 from self_judged_refusal_direction.schema import ActivationKey
 
 
@@ -36,9 +41,9 @@ def test_welford_matches_full_batch_moments_across_updates() -> None:
     torch.testing.assert_close(moments.variance, expected_m2 / len(values))
 
 
-def test_collector_reads_last_prefix_token_and_excludes_non_training_labels() -> None:
+def test_collector_reads_last_prefix_token_and_excludes_non_training_labels(tmp_path) -> None:
     block = OffsetBlock()
-    collector = ActivationCollector((block,), dtype=torch.float64)
+    collector = ActivationCollector((block, OffsetBlock()), layers=(0,), dtype=torch.float64)
     values = torch.arange(4 * 5 * 3, dtype=torch.float32).reshape(4, 5, 3)
 
     output = collector.collect(
@@ -48,6 +53,7 @@ def test_collector_reads_last_prefix_token_and_excludes_non_training_labels() ->
 
     torch.testing.assert_close(output, values + 1_000)
     statistics = collector.statistics()
+    assert statistics.layer_count == 2
     key = ActivationKey(layer=0)
     refusal = statistics.refusal[key]
     non_refusal = statistics.non_refusal[key]
@@ -57,3 +63,10 @@ def test_collector_reads_last_prefix_token_and_excludes_non_training_labels() ->
     torch.testing.assert_close(non_refusal.mean, values[1, -1].to(torch.float64))
     assert all(moments.count == 1 for moments in statistics.refusal.values())
     assert all(moments.count == 1 for moments in statistics.non_refusal.values())
+
+    path = tmp_path / "statistics.safetensors"
+    save_activation_statistics(path, statistics)
+    restored = load_activation_statistics(path)
+    assert restored.layer_count == 2
+    torch.testing.assert_close(restored.refusal[key].mean, refusal.mean)
+    torch.testing.assert_close(restored.non_refusal[key].mean, non_refusal.mean)

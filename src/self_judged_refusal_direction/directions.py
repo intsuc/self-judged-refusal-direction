@@ -62,6 +62,8 @@ def build_candidates(
     *,
     dtype: str | torch.dtype = torch.float32,
 ) -> CandidateBundle:
+    if any(key.layer < 0 or key.layer >= statistics.layer_count for key in statistics.keys):
+        raise InvariantError("activation key is outside the transformer layer sequence")
     output_dtype = _direction_dtype(dtype)
     directions: list[torch.Tensor] = []
     candidates: list[DirectionCandidate] = []
@@ -146,10 +148,15 @@ def rank_activation_screening(
     candidates: CandidateBundle | Sequence[DirectionCandidate],
     *,
     keep: int,
+    layer_count: int,
 ) -> tuple[DirectionCandidate, ...]:
     if keep < 1:
         raise InvariantError("activation screening keep count must be positive")
+    if layer_count < 1:
+        raise InvariantError("transformer layer count must be positive")
     metadata = candidates.candidates if isinstance(candidates, CandidateBundle) else tuple(candidates)
+    if any(candidate.layer < 0 or candidate.layer >= layer_count for candidate in metadata):
+        raise InvariantError("direction candidate layer is outside the transformer layer sequence")
     eligible = [
         candidate
         for candidate in metadata
@@ -157,9 +164,11 @@ def rank_activation_screening(
         and candidate.norm >= _MINIMUM_DIRECTION_NORM
         and candidate.refusal_count > 0
         and candidate.non_refusal_count > 0
+        and candidate.layer < 4 * layer_count // 5
     ]
     eligible.sort(
         key=lambda candidate: (
+            abs(5 * candidate.layer - 3 * layer_count),
             -candidate.standardized_separation,
             -candidate.norm,
             candidate.layer,

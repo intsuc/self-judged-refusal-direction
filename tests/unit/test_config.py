@@ -143,6 +143,24 @@ def test_sampling_parameters_require_sampling() -> None:
             "max_uncertain_rate",
         ),
         (
+            replace(valid_config(), acceptance=replace(valid_config().acceptance, min_removal_success_rate=-0.1)),
+            "min_removal_success_rate",
+        ),
+        (
+            replace(
+                valid_config(),
+                acceptance=replace(valid_config().acceptance, min_activation_addition_induction_rate=1.1),
+            ),
+            "min_activation_addition_induction_rate",
+        ),
+        (
+            replace(
+                valid_config(),
+                acceptance=replace(valid_config().acceptance, max_generation_failure_rate_increase=-0.1),
+            ),
+            "max_generation_failure_rate_increase",
+        ),
+        (
             replace(valid_config(), acceptance=replace(valid_config().acceptance, max_mean_kl=-0.1)),
             "max_mean_kl",
         ),

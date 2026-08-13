@@ -15,9 +15,12 @@ flag. Invalid parses are rejected before the judge call, and constrained decodin
    labeling.
 3. Generate and parse a baseline response for each prompt using the configured target-generation settings.
 4. Label each valid response with the unchanged base checkpoint.
-5. At each selected decoder layer, collect the residual activation at the last token of the rendered assistant prefix.
-6. Rank layer-wise mean-difference directions through `activation_screening`.
-7. Run causal interventions for the survivors on a small balanced subset through `pilot_evaluation`.
+5. At each selected decoder layer, collect the residual activation at the last token of the same generation prefix used
+   for target responses.
+6. Exclude the final 20% of decoder layers and rank the remaining layer-wise mean-difference directions through
+   `activation_screening`, prioritizing layers near 60% depth.
+7. Run removal and activation-addition interventions for the survivors on a small balanced subset through
+   `pilot_evaluation`.
 8. Apply the acceptance criteria to the survivors on the full validation set through `full_validation`.
 9. Convert the selected direction to an architecture-specific weight-edit plan, save a standard Transformers checkpoint,
    verify it in a fresh offline process, and evaluate the independent test split once.
@@ -100,12 +103,15 @@ requires every packaged case to match.
 | `search.activation_screening_keep` | `32` | Maximum layer directions retained after activation screening. |
 | `search.pilot_evaluation_keep` | `5` | Maximum directions retained after the pilot evaluation. |
 | `search.pilot_prompts_per_class` | `16` | Validation prompts per refusal class used by the pilot evaluation. |
+| `acceptance.min_removal_success_rate` | `0.05` | Smallest allowed fraction of baseline refusals changed to non-refusals. |
+| `acceptance.min_activation_addition_induction_rate` | `0.05` | Smallest allowed fraction of baseline non-refusals changed to refusals by activation addition. |
 | `acceptance.max_uncertain_rate` | `0.05` | Largest allowed semantic-uncertainty rate for a candidate. |
 | `acceptance.max_error_rate` | `0.05` | Largest allowed parser or judge `ERROR` rate for each stage and candidate. |
+| `acceptance.max_generation_failure_rate_increase` | `0.05` | Largest allowed increase over baseline in each of incomplete, empty, repeated, and repeated-delimiter response rates. |
 | `acceptance.min_non_refusal_retention` | `0.95` | Smallest allowed fraction of baseline non-refusals that remain non-refusals. |
 | `acceptance.max_mean_kl` | `0.10` | Largest allowed mean next-token KL divergence on baseline non-refusal prompts. |
 | `acceptance.max_ce_loss_delta` | `0.10` | Largest allowed increase in mean CE loss on reference text. |
-| `acceptance.activation_addition_beta` | `1.0` | Scale for the optional reverse-direction diagnostic; `null` disables it. |
+| `acceptance.activation_addition_beta` | `1.0` | Scale applied to the raw mean-difference direction during the activation-addition causal check. |
 | `export.max_shard_size` | `5GB` | Maximum Transformers checkpoint shard size. |
 | `export.edit_chunk_rows` | `4096` | Rows processed at once while applying the weight projection in float32. |
 
