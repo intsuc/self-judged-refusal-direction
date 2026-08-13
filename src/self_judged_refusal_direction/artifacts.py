@@ -16,7 +16,7 @@ import torch
 import transformers
 import yaml
 
-from self_judged_refusal_direction.config import ProjectConfig, resolved_config_mapping
+from self_judged_refusal_direction.config import ArtifactStage, ProjectConfig, resolved_config_mapping
 from self_judged_refusal_direction.errors import ArtifactError
 from self_judged_refusal_direction.hashing import canonical_json_bytes, file_sha256
 
@@ -25,7 +25,8 @@ from self_judged_refusal_direction.hashing import canonical_json_bytes, file_sha
 class ArtifactProfile:
     model_id: str
     model_revision: str
-    config_hash: str
+    artifact_stage: ArtifactStage
+    stage_config_hash: str
     target_generation_config_hash: str | None = None
     chat_template_hash: str | None = None
     judge_profile_hash: str | None = None
@@ -33,7 +34,11 @@ class ArtifactProfile:
     judge_validation_hash: str | None = None
     baseline_generation_hash: str | None = None
     baseline_judgment_hash: str | None = None
+    label_selection_hash: str | None = None
     activation_extraction_hash: str | None = None
+    direction_construction_hash: str | None = None
+    candidate_evaluation_hash: str | None = None
+    acceptance_policy_hash: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -196,6 +201,7 @@ class ArtifactStore:
     def profile(
         self,
         *,
+        stage: ArtifactStage,
         target: bool = False,
         chat_template_hash: str | None = None,
         judge_profile_hash: str | None = None,
@@ -203,14 +209,19 @@ class ArtifactStore:
         judge_validation_hash: str | None = None,
         baseline_generation_hash: str | None = None,
         baseline_judgment_hash: str | None = None,
+        label_selection_hash: str | None = None,
         activation_extraction_hash: str | None = None,
+        direction_construction_hash: str | None = None,
+        candidate_evaluation_hash: str | None = None,
+        acceptance_policy_hash: str | None = None,
     ) -> ArtifactProfile:
         if self.config.model.id is None:
             raise ArtifactError("model ID is required")
         return ArtifactProfile(
             model_id=self.config.model.id,
             model_revision=self.config.model.revision,
-            config_hash=self.config.config_hash,
+            artifact_stage=stage,
+            stage_config_hash=self.config.stage_config_hash(stage),
             target_generation_config_hash=self.config.target_generation_config_hash if target else None,
             chat_template_hash=chat_template_hash,
             judge_profile_hash=judge_profile_hash,
@@ -218,7 +229,11 @@ class ArtifactStore:
             judge_validation_hash=judge_validation_hash,
             baseline_generation_hash=baseline_generation_hash,
             baseline_judgment_hash=baseline_judgment_hash,
+            label_selection_hash=label_selection_hash,
             activation_extraction_hash=activation_extraction_hash,
+            direction_construction_hash=direction_construction_hash,
+            candidate_evaluation_hash=candidate_evaluation_hash,
+            acceptance_policy_hash=acceptance_policy_hash,
         )
 
     def initialize_run(self) -> None:
@@ -242,7 +257,6 @@ class ArtifactStore:
         environment = {
             "model_id": self.config.model.id,
             "model_revision": self.config.model.revision,
-            "config_hash": self.config.config_hash,
             "python": platform.python_version(),
             "platform": platform.platform(),
             "torch": torch.__version__,

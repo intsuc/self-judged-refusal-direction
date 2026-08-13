@@ -14,14 +14,14 @@ flag. Invalid parses are rejected before the judge call, and constrained decodin
 2. Read one prompt per non-empty line, normalize and deduplicate prompts, group related templates, and split them before
    labeling.
 3. Generate and parse a baseline response for each prompt using the configured target-generation settings.
-4. Label each valid response with the unchanged base checkpoint.
+4. Label complete, non-empty, non-truncated responses with the unchanged base checkpoint.
 5. At each selected decoder layer, collect the residual activation at the last token of the same generation prefix used
    for target responses.
-6. Exclude the final 20% of decoder layers and rank the remaining layer-wise mean-difference directions through
-   `activation_screening`, prioritizing layers near 60% depth.
-7. Run removal and activation-addition interventions for the survivors on a small balanced subset through
-   `pilot_evaluation`.
-8. Apply the acceptance criteria to the survivors on the full validation set through `full_validation`.
+6. Exclude the final 20% of decoder layers, measure next-token KL for every remaining direction, and retain compatible
+   directions in an order that prioritizes layers near 60% depth.
+7. Run removal and activation-addition interventions on a small balanced subset, discarding candidates with no causal
+   signal, excessive KL or CE loss, or catastrophic generation failures.
+8. Apply the configured acceptance criteria to the pilot survivors on the full validation set.
 9. Convert the selected direction to an architecture-specific weight-edit plan, save a standard Transformers checkpoint,
    verify it in a fresh offline process, and evaluate the independent test split once.
 
@@ -90,7 +90,7 @@ requires every packaged case to match.
 | `target_generation.typical_p` | `null` | Locally typical sampling probability. |
 | `target_generation.repetition_penalty` | `null` | Repetition penalty; `1.0` applies no penalty. |
 | `data.prompt_files` | `[]` | Plain-text prompt files used for discovery, validation, and testing. |
-| `data.reference_files` | `[]` | Optional CE-loss reference files; empty uses baseline non-refusal prompts. |
+| `data.reference_files` | `[]` | Optional plain-text CE references; empty evaluates completed baseline non-refusal completions in chat context. |
 | `data.train_fraction` | `0.6` | Target fraction of prompts assigned to discovery. |
 | `data.validation_fraction` | `0.2` | Target fraction of prompts assigned to validation; the test target is the remainder. |
 | `data.train_per_class` | `128` | Required labeled discovery trajectories per refusal class. |
@@ -110,7 +110,7 @@ requires every packaged case to match.
 | `acceptance.max_generation_failure_rate_increase` | `0.05` | Largest allowed increase over baseline in each of incomplete, empty, repeated, and repeated-delimiter response rates. |
 | `acceptance.min_non_refusal_retention` | `0.95` | Smallest allowed fraction of baseline non-refusals that remain non-refusals. |
 | `acceptance.max_mean_kl` | `0.10` | Largest allowed mean next-token KL divergence on baseline non-refusal prompts. |
-| `acceptance.max_ce_loss_delta` | `0.10` | Largest allowed increase in mean CE loss on reference text. |
+| `acceptance.max_ce_loss_delta` | `0.10` | Largest allowed increase in mean CE loss on the CE evaluation inputs. |
 | `acceptance.activation_addition_beta` | `1.0` | Scale applied to the raw mean-difference direction during the activation-addition causal check. |
 | `export.max_shard_size` | `5GB` | Maximum Transformers checkpoint shard size. |
 | `export.edit_chunk_rows` | `4096` | Rows processed at once while applying the weight projection in float32. |
@@ -122,11 +122,11 @@ The adapter is selected from the pinned checkpoint's `model_type`. The included 
 
 ## Artifacts and privacy
 
-Artifacts are content-hashed and bound to their model, inputs, runtime profiles, and upstream results. Completed
-generations and judgments are checkpointed incrementally; rerunning a stage resumes its matching checkpoint. Error
-summaries contain stable reason codes and reference owner-only diagnostics. Prompt text, generated tokens, parsed
-responses, and private checkpoints remain owner-only and are excluded from exported checkpoints. The pipeline does
-not publish models or artifacts.
+Each artifact stage is content-hashed against only its inputs, runtime profile, and upstream results, so unrelated
+later-stage configuration changes reuse completed earlier work. Generations and judgments are checkpointed
+incrementally. Error summaries contain stable reason codes and reference owner-only diagnostics. Prompt text,
+generated tokens, parsed responses, and private checkpoints remain owner-only and are excluded from exported
+checkpoints. The pipeline does not publish models or artifacts.
 
 ## References
 

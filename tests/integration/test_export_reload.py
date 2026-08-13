@@ -9,6 +9,7 @@ import pytest
 import torch
 from transformers import Gemma4Config, Gemma4ForConditionalGeneration, Gemma4TextConfig
 
+from self_judged_refusal_direction.ce_loss import compute_ce_loss, raw_text_ce_inputs
 from self_judged_refusal_direction.config import ExportConfig, ModelConfig, ProjectConfig, RunConfig
 from self_judged_refusal_direction.errors import ArtifactError
 from self_judged_refusal_direction.exporting import (
@@ -19,7 +20,6 @@ from self_judged_refusal_direction.exporting import (
 )
 from self_judged_refusal_direction.hashing import object_sha256
 from self_judged_refusal_direction.models.gemma4 import Gemma4Adapter
-from self_judged_refusal_direction.pipeline import _mean_ce_loss
 from self_judged_refusal_direction.prompting import judge_profile_hash
 
 
@@ -88,8 +88,8 @@ def test_reference_ce_matches_model_loss(softcap: float | None) -> None:
     with torch.inference_mode():
         expected = model(**inputs, labels=inputs["input_ids"], use_cache=False, return_dict=True).loss
     runtime = SimpleNamespace(model=model, adapter=Gemma4Adapter(), processor=processor)
-    actual = _mean_ce_loss(cast(Any, runtime), ["quality"])
-    assert actual == pytest.approx(float(expected.item()), rel=2e-6, abs=2e-6)
+    actual = compute_ce_loss(cast(Any, runtime), raw_text_ce_inputs(cast(Any, runtime), ["quality"]))
+    assert actual.mean_loss == pytest.approx(float(expected.item()), rel=2e-6, abs=2e-6)
 
 
 def test_export_and_fresh_offline_auto_reload(tmp_path: Path) -> None:

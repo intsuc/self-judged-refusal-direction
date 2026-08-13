@@ -15,6 +15,7 @@ def test_artifact_reuse_requires_matching_profile_and_content(tmp_path) -> None:
     store = ArtifactStore(config)
     path = tmp_path / "rows.jsonl"
     profile = store.profile(
+        stage="activation_extraction",
         target=True,
         chat_template_hash="chat-a",
         activation_extraction_hash="activation-a",
@@ -36,7 +37,7 @@ def test_private_artifact_permissions_fail_closed(tmp_path) -> None:
     config = ProjectConfig(run=RunConfig(output_dir=str(tmp_path)), model=ModelConfig(id="model", revision="a" * 40))
     store = ArtifactStore(config)
     path = tmp_path / "trajectories.private.jsonl"
-    profile = store.profile(target=True)
+    profile = store.profile(stage="baseline_generation", target=True)
     store.write_jsonl(path, [{"thinking": "private"}], artifact_type="trajectories", profile=profile, private=True)
     metadata_path = store.metadata_path(path)
 
@@ -61,7 +62,7 @@ def test_failed_jsonl_serialization_leaves_no_partial_file(tmp_path) -> None:
             path,
             [{"value": 1}, {"value": object()}],
             artifact_type="rows",
-            profile=store.profile(),
+            profile=store.profile(stage="baseline_generation"),
             private=True,
         )
 
@@ -81,6 +82,9 @@ def test_environment_extensions_survive_and_identity_changes_fail_closed(tmp_pat
     store.initialize_run()
     assert json.loads(path.read_text(encoding="utf-8"))["processor_sha256"] == "processor"
 
+    changed_policy = replace(config, acceptance=replace(config.acceptance, max_mean_kl=0.2))
+    ArtifactStore(changed_policy).initialize_run()
+
     changed = ProjectConfig(run=config.run, model=ModelConfig(id="model", revision="b" * 40))
     resolved_path = store.paths.root / "resolved_config.yaml"
     resolved = resolved_path.read_bytes()
@@ -98,7 +102,8 @@ def test_activation_artifacts_require_the_current_runtime_profile() -> None:
     profile = ArtifactProfile(
         model_id="model",
         model_revision="a" * 40,
-        config_hash="config",
+        artifact_stage="activation_extraction",
+        stage_config_hash="config",
         chat_template_hash="chat-a",
         judge_profile_hash=judge_profile_hash(),
         judge_validation_hash="validation",

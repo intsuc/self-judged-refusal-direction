@@ -15,7 +15,6 @@ from typing import Any, Literal, cast
 
 import safetensors
 import torch
-import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
@@ -25,8 +24,17 @@ from self_judged_refusal_direction.activations import (
     save_activation_statistics,
 )
 from self_judged_refusal_direction.artifacts import ArtifactMetadata, ArtifactProfile, ArtifactStore
+from self_judged_refusal_direction.ce_loss import (
+    CEComparison,
+    CEInput,
+    CELoss,
+    compare_ce_losses,
+    completed_non_refusal_completion_inputs,
+    compute_ce_loss,
+    raw_text_ce_inputs,
+)
 from self_judged_refusal_direction.checkpoint import PrivateCheckpoint
-from self_judged_refusal_direction.config import ProjectConfig, load_config
+from self_judged_refusal_direction.config import ArtifactStage, ProjectConfig, load_config
 from self_judged_refusal_direction.data import (
     ingest_and_split_prompts,
     ingest_texts,
@@ -130,6 +138,7 @@ def _load(
 def _profile(
     store: ArtifactStore,
     *,
+    stage: ArtifactStage,
     target: bool = False,
     chat_template_hash: str | None = None,
     judge_profile_hash: str | None = None,
@@ -137,9 +146,14 @@ def _profile(
     judge_validation_hash: str | None = None,
     baseline_generation_hash: str | None = None,
     baseline_judgment_hash: str | None = None,
+    label_selection_hash: str | None = None,
     activation_extraction_hash: str | None = None,
+    direction_construction_hash: str | None = None,
+    candidate_evaluation_hash: str | None = None,
+    acceptance_policy_hash: str | None = None,
 ) -> ArtifactProfile:
     return store.profile(
+        stage=stage,
         target=target,
         chat_template_hash=chat_template_hash,
         judge_profile_hash=judge_profile_hash,
@@ -147,7 +161,11 @@ def _profile(
         judge_validation_hash=judge_validation_hash,
         baseline_generation_hash=baseline_generation_hash,
         baseline_judgment_hash=baseline_judgment_hash,
+        label_selection_hash=label_selection_hash,
         activation_extraction_hash=activation_extraction_hash,
+        direction_construction_hash=direction_construction_hash,
+        candidate_evaluation_hash=candidate_evaluation_hash,
+        acceptance_policy_hash=acceptance_policy_hash,
     )
 
 
@@ -174,6 +192,7 @@ def _load_judge_validation(
     cases = load_judge_validation_cases()
     expected_profile = _profile(
         store,
+        stage="judge_validation",
         judge_profile_hash=current_judge_profile_hash(),
         judge_fixture_hash=judge_validation_fixture_hash(cases),
     )
@@ -240,6 +259,7 @@ def _write_judge_validation(
         artifact_type="judge_validation_results",
         profile=_profile(
             store,
+            stage="judge_validation",
             chat_template_hash=chat_template_hash,
             judge_profile_hash=current_judge_profile_hash(),
             judge_fixture_hash=judge_validation_fixture_hash(cases),
@@ -710,6 +730,7 @@ def _read_baseline_generation_manifest(
         raise ArtifactError("baseline generation manifest profile is invalid") from error
     expected = _profile(
         store,
+        stage="baseline_generation",
         target=True,
         chat_template_hash=profile.chat_template_hash,
         baseline_generation_hash=profile.baseline_generation_hash,
@@ -734,12 +755,12 @@ def _read_baseline_generation_manifest(
     store.validate(
         splits_path,
         artifact_type="prompt_splits",
-        expected_profile=_profile(store),
+        expected_profile=_profile(store, stage="baseline_generation"),
     )
     store.validate(
         test_prompts_path,
         artifact_type="test_prompts",
-        expected_profile=_profile(store),
+        expected_profile=_profile(store, stage="baseline_generation"),
     )
     store.validate(
         trajectories_path,
@@ -774,7 +795,7 @@ def _load_prompt_records(store: ArtifactStore, config: ProjectConfig) -> list[Pr
     rows = store.read_jsonl(
         directory / "splits.private.jsonl",
         artifact_type="prompt_splits",
-        expected_profile=_profile(store),
+        expected_profile=_profile(store, stage="baseline_generation"),
     )
     records = [PromptRecord.from_dict(row) for row in rows if row.get("split") in {"train", "validation"}]
     if not records:
@@ -843,6 +864,7 @@ def _load_baseline_judgments(
     judgment_hash = _require_sha256(value["judgment_hash"], "baseline judgment hash")
     expected_profile = _profile(
         store,
+        stage="baseline_judgment",
         target=True,
         chat_template_hash=chat_template_hash,
         judge_profile_hash=current_judge_profile_hash(),
@@ -889,21 +911,65 @@ def _load_labeled(
     _load_baseline_judgments(store, chat_template_hash)
     judgment_manifest = _read_json(store.paths.baseline_judgment)
     judgment_hash = _require_sha256(judgment_manifest.get("judgment_hash"), "baseline judgment hash")
+    selection_hash = _label_selection_hash(store.config, judgment_hash)
     path = store.paths.labeled_train if split == "train" else store.paths.labeled_validation
     rows = store.read_jsonl(
         path,
         artifact_type=f"labeled_{split}",
         expected_profile=_profile(
             store,
+            stage="label_selection",
             target=True,
             chat_template_hash=chat_template_hash,
             judge_profile_hash=current_judge_profile_hash(),
             judge_validation_hash=validation_hash,
             baseline_generation_hash=baseline_profile.baseline_generation_hash,
             baseline_judgment_hash=judgment_hash,
+            label_selection_hash=selection_hash,
         ),
     )
     return [LabeledTrajectory(**row) for row in rows]
+
+
+def _label_selection_hash(config: ProjectConfig, judgment_hash: str) -> str:
+    return object_sha256(
+        {
+            "stage_config_hash": config.stage_config_hash("label_selection"),
+            "baseline_judgment_hash": judgment_hash,
+            "implementation_hash": _implementation_hash(
+                _eligible_baseline_trajectory,
+                _require_healthy_baseline_capacity,
+                judge_baseline_trajectories,
+            ),
+        }
+    )
+
+
+def _eligible_baseline_trajectory(trajectory: TargetTrajectory) -> bool:
+    return (
+        trajectory.parser_status == "OK"
+        and not trajectory.generation_truncated
+        and bool(trajectory.final_answer.strip())
+    )
+
+
+def _require_healthy_baseline_capacity(
+    trajectories: Sequence[TargetTrajectory],
+    config: ProjectConfig,
+) -> None:
+    required = {
+        "train": 2 * config.data.train_per_class,
+        "validation": 2 * config.data.validation_per_class,
+    }
+    for split, minimum in required.items():
+        available = sum(
+            trajectory.split == split and _eligible_baseline_trajectory(trajectory) for trajectory in trajectories
+        )
+        if available < minimum:
+            raise PipelineError(
+                f"{split} has {available} complete non-empty baseline trajectories; "
+                f"at least {minimum} are required for two refusal classes"
+            )
 
 
 def inspect_model(config_path: str) -> None:
@@ -919,7 +985,7 @@ def inspect_model(config_path: str) -> None:
             {
                 "model_id": config.model.id,
                 "model_revision": config.model.revision,
-                "config_hash": config.config_hash,
+                "model_profile_hash": config.stage_config_hash("judge_validation"),
                 "chat_template_hash": runtime.chat_template_hash,
                 **fingerprints,
             }
@@ -1006,6 +1072,7 @@ def generate_baseline_trajectories(config_path: str) -> None:
             )
     baseline_profile = _profile(
         store,
+        stage="baseline_generation",
         target=True,
         chat_template_hash=chat_template_hash,
         baseline_generation_hash=generation_hash,
@@ -1048,14 +1115,14 @@ def generate_baseline_trajectories(config_path: str) -> None:
         splits_path,
         records,
         artifact_type="prompt_splits",
-        profile=_profile(store),
+        profile=_profile(store, stage="baseline_generation"),
         private=True,
     )
     store.write_jsonl(
         test_prompts_path,
         (record for record in records if record.split == "test"),
         artifact_type="test_prompts",
-        profile=_profile(store),
+        profile=_profile(store, stage="baseline_generation"),
         private=True,
     )
     metadata = store.write_jsonl(
@@ -1115,9 +1182,11 @@ def judge_baseline_trajectories(config_path: str) -> None:
     with BaseModelRuntime(config) as runtime:
         validation_hash = _require_judge_validation(store, runtime)
         trajectories = _load_baseline_trajectories(store, runtime.chat_template_hash)
+        _require_healthy_baseline_capacity(trajectories, config)
         baseline_profile = _baseline_artifact_profile(store, runtime.chat_template_hash)
         judgment_profile = _profile(
             store,
+            stage="baseline_judgment",
             target=True,
             chat_template_hash=runtime.chat_template_hash,
             judge_profile_hash=current_judge_profile_hash(),
@@ -1227,6 +1296,8 @@ def judge_baseline_trajectories(config_path: str) -> None:
     by_hash = {item.trajectory_hash: item for item in judgments}
     labeled: dict[str, list[LabeledTrajectory]] = {"train": [], "validation": []}
     for trajectory in trajectories:
+        if not _eligible_baseline_trajectory(trajectory):
+            continue
         result = by_hash[trajectory.trajectory_hash]
         if result.status != "OK" or result.label not in {"REFUSAL", "NON_REFUSAL"}:
             continue
@@ -1290,13 +1361,24 @@ def judge_baseline_trajectories(config_path: str) -> None:
             private=False,
         )
         _discard_checkpoint(store.paths.baseline_judgment_checkpoint / judgment_hash)
+    label_profile = _profile(
+        store,
+        stage="label_selection",
+        target=True,
+        chat_template_hash=judgment_profile.chat_template_hash,
+        judge_profile_hash=current_judge_profile_hash(),
+        judge_validation_hash=judgment_profile.judge_validation_hash,
+        baseline_generation_hash=judgment_profile.baseline_generation_hash,
+        baseline_judgment_hash=judgment_hash,
+        label_selection_hash=_label_selection_hash(config, judgment_hash),
+    )
     for split, selected in selected_by_split.items():
         path = store.paths.labeled_train if split == "train" else store.paths.labeled_validation
         store.write_jsonl(
             path,
             selected,
             artifact_type=f"labeled_{split}",
-            profile=judgment_profile,
+            profile=label_profile,
             private=False,
         )
 
@@ -1310,17 +1392,20 @@ def collect_activations(config_path: str) -> None:
         labeled = _load_labeled(store, runtime.chat_template_hash, "train")
         judgment_manifest = _read_json(store.paths.baseline_judgment)
         judgment_hash = _require_sha256(judgment_manifest.get("judgment_hash"), "baseline judgment hash")
+        selection_hash = _label_selection_hash(config, judgment_hash)
         trajectory_by_hash = {item.trajectory_hash: item for item in trajectories}
         statistics = _collect_activation_statistics(config, runtime, labeled, trajectory_by_hash)
         save_activation_statistics(store.paths.activation_statistics, statistics)
         activation_profile = _profile(
             store,
+            stage="activation_extraction",
             target=True,
             chat_template_hash=runtime.chat_template_hash,
             judge_profile_hash=current_judge_profile_hash(),
             judge_validation_hash=validation_hash,
             baseline_generation_hash=baseline_profile.baseline_generation_hash,
             baseline_judgment_hash=judgment_hash,
+            label_selection_hash=selection_hash,
             activation_extraction_hash=_activation_extraction_hash(config),
         )
         metadata = ArtifactMetadata(
@@ -1374,25 +1459,31 @@ def _collect_activation_statistics(
 
 def build_direction_candidates(config_path: str) -> None:
     config, store = _load(config_path)
-    profile = _activation_dependent_profile(store)
+    activation_profile = _activation_dependent_profile(store)
     adapter = adapter_for_config(config)
     processor = adapter.load_processor(config.model)
-    _validate_activation_chat_profile(profile, adapter.chat_template_hash(processor))
+    _validate_activation_chat_profile(activation_profile, adapter.chat_template_hash(processor))
     del processor
     store.validate(
         store.paths.activation_statistics,
         artifact_type="activation_statistics",
-        expected_profile=profile,
+        expected_profile=activation_profile,
     )
     statistics = load_activation_statistics(store.paths.activation_statistics)
     bundle = build_candidates(statistics, dtype="float32")
     ranking = rank_activation_screening(
         bundle,
-        keep=config.search.activation_screening_keep,
+        keep=max(len(bundle.candidates), 1),
         layer_count=statistics.layer_count,
     )
     if not ranking:
         raise PipelineError("activation screening produced no numerically valid direction candidates")
+    profile = _derived_profile(
+        store,
+        activation_profile,
+        stage="direction_construction",
+        direction_construction_hash=_direction_construction_hash(),
+    )
     write_candidate_artifacts(store, bundle, profile=profile)
     _write_json_artifact(
         store,
@@ -1400,6 +1491,66 @@ def build_direction_candidates(config_path: str) -> None:
         [candidate.candidate_id for candidate in ranking],
         artifact_type="activation_screening_ranking",
         profile=profile,
+    )
+
+
+def _direction_construction_hash() -> str:
+    return _implementation_hash(build_candidates, rank_activation_screening)
+
+
+def _candidate_evaluation_hash(config: ProjectConfig) -> str:
+    return object_sha256(
+        {
+            "stage_config_hash": config.stage_config_hash("candidate_evaluation"),
+            "reference_files": [
+                {
+                    "path": str(Path(path).resolve()),
+                    "content_sha256": file_sha256(Path(path).resolve()),
+                }
+                for path in config.data.reference_files
+            ],
+            "implementation_hash": _implementation_hash(
+                _screen_candidates_by_kl,
+                _evaluate_candidates_phase,
+                evaluate_behavior,
+                mean_next_token_kl,
+                compute_ce_loss,
+                type(adapter_for_config(config)),
+            ),
+        }
+    )
+
+
+def _derived_profile(
+    store: ArtifactStore,
+    upstream: ArtifactProfile,
+    *,
+    stage: ArtifactStage,
+    direction_construction_hash: str | None = None,
+    candidate_evaluation_hash: str | None = None,
+    acceptance_policy_hash: str | None = None,
+) -> ArtifactProfile:
+    return _profile(
+        store,
+        stage=stage,
+        target=upstream.target_generation_config_hash is not None,
+        chat_template_hash=upstream.chat_template_hash,
+        judge_profile_hash=upstream.judge_profile_hash,
+        judge_fixture_hash=upstream.judge_fixture_hash,
+        judge_validation_hash=upstream.judge_validation_hash,
+        baseline_generation_hash=upstream.baseline_generation_hash,
+        baseline_judgment_hash=upstream.baseline_judgment_hash,
+        label_selection_hash=upstream.label_selection_hash,
+        activation_extraction_hash=upstream.activation_extraction_hash,
+        direction_construction_hash=(
+            direction_construction_hash
+            if direction_construction_hash is not None
+            else upstream.direction_construction_hash
+        ),
+        candidate_evaluation_hash=(
+            candidate_evaluation_hash if candidate_evaluation_hash is not None else upstream.candidate_evaluation_hash
+        ),
+        acceptance_policy_hash=acceptance_policy_hash,
     )
 
 
@@ -1413,16 +1564,20 @@ def _activation_dependent_profile(store: ArtifactStore) -> ArtifactProfile:
     _load_baseline_judgments(store, chat_template_hash)
     judgment_manifest = _read_json(store.paths.baseline_judgment)
     judgment_hash = _require_sha256(judgment_manifest.get("judgment_hash"), "baseline judgment hash")
+    selection_hash = _label_selection_hash(store.config, judgment_hash)
     metadata = store.validate(
         store.paths.activation_statistics,
         artifact_type="activation_statistics",
         expected_profile=_profile(
             store,
+            stage="activation_extraction",
             target=True,
+            chat_template_hash=chat_template_hash,
             judge_profile_hash=current_judge_profile_hash(),
             judge_validation_hash=validation_hash,
             baseline_generation_hash=baseline_profile.baseline_generation_hash,
             baseline_judgment_hash=judgment_hash,
+            label_selection_hash=selection_hash,
             activation_extraction_hash=_activation_extraction_hash(store.config),
         ),
     )
@@ -1431,10 +1586,49 @@ def _activation_dependent_profile(store: ArtifactStore) -> ArtifactProfile:
         or metadata.profile.chat_template_hash is None
         or metadata.profile.baseline_generation_hash is None
         or metadata.profile.baseline_judgment_hash is None
+        or metadata.profile.label_selection_hash is None
         or metadata.profile.activation_extraction_hash is None
     ):
         raise ArtifactError("activation statistics privacy or chat-template profile is invalid")
     return metadata.profile
+
+
+def _direction_dependent_profile(store: ArtifactStore) -> ArtifactProfile:
+    activation_profile = _activation_dependent_profile(store)
+    profile = _derived_profile(
+        store,
+        activation_profile,
+        stage="direction_construction",
+        direction_construction_hash=_direction_construction_hash(),
+    )
+    store.validate(
+        store.paths.candidates,
+        artifact_type="direction_candidates",
+        expected_profile=profile,
+    )
+    return profile
+
+
+def _selection_dependent_profile(store: ArtifactStore) -> ArtifactProfile:
+    direction_profile = _direction_dependent_profile(store)
+    evaluation_profile = _derived_profile(
+        store,
+        direction_profile,
+        stage="candidate_evaluation",
+        candidate_evaluation_hash=_candidate_evaluation_hash(store.config),
+    )
+    profile = _derived_profile(
+        store,
+        evaluation_profile,
+        stage="candidate_selection",
+        acceptance_policy_hash=store.config.acceptance_policy_hash,
+    )
+    store.validate(
+        store.paths.selected_direction,
+        artifact_type="selected_direction",
+        expected_profile=profile,
+    )
+    return profile
 
 
 def _validate_activation_chat_profile(profile: ArtifactProfile, chat_template_hash: str) -> None:
@@ -1448,13 +1642,25 @@ def _validate_activation_chat_profile(profile: ArtifactProfile, chat_template_ha
 
 def evaluate_candidates(config_path: str) -> None:
     config, store = _load(config_path)
-    profile = _activation_dependent_profile(store)
-    bundle = load_candidate_artifacts(store, expected_profile=profile)
+    direction_profile = _direction_dependent_profile(store)
+    profile = _derived_profile(
+        store,
+        direction_profile,
+        stage="candidate_evaluation",
+        candidate_evaluation_hash=_candidate_evaluation_hash(config),
+    )
+    selection_profile = _derived_profile(
+        store,
+        profile,
+        stage="candidate_selection",
+        acceptance_policy_hash=config.acceptance_policy_hash,
+    )
+    bundle = load_candidate_artifacts(store, expected_profile=direction_profile)
     screening = _read_json_artifact(
         store,
         store.paths.activation_screening_ranking,
         artifact_type="activation_screening_ranking",
-        profile=profile,
+        profile=direction_profile,
     )
     if not isinstance(screening, list) or any(not isinstance(candidate_id, str) for candidate_id in screening):
         raise ArtifactError("activation screening ranking is invalid")
@@ -1472,8 +1678,16 @@ def evaluate_candidates(config_path: str) -> None:
     baseline_trajectories = {item.prompt_id: item for item in trajectories}
     records = {item.prompt_id: item for item in _load_prompt_records(store, config)}
     baseline_prompt_plan = [records[item.prompt_id] for item in trajectories]
-    reference_fallback = [records[item.prompt_id].original_prompt for item in validation if item.label == "NON_REFUSAL"]
     pilot_labels = _balanced_subset(validation, config.search.pilot_prompts_per_class)
+    kl_prompts = [records[item.prompt_id] for item in pilot_labels if item.label == "NON_REFUSAL"]
+    ranking, screened_mean_kl, kl_screening_identity = _screen_candidates_by_kl(
+        config,
+        store,
+        bundle,
+        ranking,
+        kl_prompts,
+        artifact_profile=profile,
+    )
     pilot_metrics, _, pilot_evaluation_identity = _evaluate_candidates_phase(
         config,
         store,
@@ -1483,9 +1697,10 @@ def evaluate_candidates(config_path: str) -> None:
         records,
         baseline_trajectories,
         baseline_prompt_plan,
-        reference_fallback,
         artifact_profile=profile,
+        results_profile=selection_profile,
         evaluation_phase="pilot_evaluation",
+        screened_mean_kl=screened_mean_kl,
     )
     pilot_eligible = [item for item in pilot_metrics if item.hard_filter_passed]
     if not pilot_eligible:
@@ -1497,7 +1712,7 @@ def evaluate_candidates(config_path: str) -> None:
             default=0.0,
         )
         raise PipelineError(
-            "no pilot evaluation candidate passed the configured hard filters; "
+            "no pilot evaluation candidate passed causal and quality screening; "
             f"best removal={best_removal:.2%}, best addition induction={best_induction:.2%}; "
             f"rejection counts: {rejection_summary}; results: {store.paths.pilot_evaluation_results}"
         )
@@ -1515,9 +1730,10 @@ def evaluate_candidates(config_path: str) -> None:
         records,
         baseline_trajectories,
         baseline_prompt_plan,
-        reference_fallback,
         artifact_profile=profile,
+        results_profile=selection_profile,
         evaluation_phase="full_validation",
+        screened_mean_kl=None,
     )
     selected_metrics, selected_candidate = select_candidate(full_validation_metrics, by_id)
     selected_direction = bundle.direction(selected_candidate)
@@ -1530,7 +1746,7 @@ def evaluate_candidates(config_path: str) -> None:
         artifact_type="selected_direction",
         private=False,
         content_sha256=file_sha256(store.paths.selected_direction),
-        profile=profile,
+        profile=selection_profile,
     )
     store.write_json(
         store.metadata_path(store.paths.selected_direction),
@@ -1544,11 +1760,12 @@ def evaluate_candidates(config_path: str) -> None:
             "candidate": dataclasses.asdict(selected_candidate),
             "metrics": metrics_dict(selected_metrics),
             "max_error_rate": config.acceptance.max_error_rate,
+            "kl_screening_identity": kl_screening_identity,
             "pilot_evaluation_identity": pilot_evaluation_identity,
             "full_validation_identity": full_validation_identity,
         },
         artifact_type="final_selection",
-        profile=profile,
+        profile=selection_profile,
         private=False,
     )
     judgments = _load_baseline_judgments(store, chat_template_hash)
@@ -1570,7 +1787,7 @@ def evaluate_candidates(config_path: str) -> None:
         store.paths.full_validation_report,
         report,
         artifact_type="full_validation_report",
-        profile=profile,
+        profile=selection_profile,
     )
 
 
@@ -1592,6 +1809,189 @@ def _pilot_ranking_key(metrics: CandidateMetrics) -> tuple[float, ...]:
     )
 
 
+def _apply_pilot_screen(metrics: CandidateMetrics, config: ProjectConfig) -> CandidateMetrics:
+    reasons: list[str] = []
+    induction = metrics.activation_addition_induction_rate
+    if metrics.removal_success_rate <= 0:
+        reasons.append("removal_signal")
+    if induction is None or induction <= 0:
+        reasons.append("activation_addition_signal")
+    if not math.isfinite(metrics.mean_kl) or metrics.mean_kl > config.acceptance.max_mean_kl:
+        reasons.append("mean_kl")
+    if not math.isfinite(metrics.ce_loss_delta) or metrics.ce_loss_delta > config.acceptance.max_ce_loss_delta:
+        reasons.append("ce_loss_delta")
+    catastrophic_rate = 0.5
+    if metrics.error_rate >= catastrophic_rate:
+        reasons.append("catastrophic_error_rate")
+    if (
+        metrics.activation_addition_error_rate is not None
+        and metrics.activation_addition_error_rate >= catastrophic_rate
+    ):
+        reasons.append("catastrophic_activation_addition_error_rate")
+    if metrics.uncertain_rate >= catastrophic_rate:
+        reasons.append("catastrophic_uncertain_rate")
+    if metrics.non_refusal_retention_rate <= 1 - catastrophic_rate:
+        reasons.append("catastrophic_non_refusal_retention")
+    for name, degradation in (
+        ("completion_rate", -metrics.completion_rate_delta),
+        ("empty_answer_rate", metrics.empty_answer_rate_delta),
+        ("abnormal_repetition_rate", metrics.abnormal_repetition_rate_delta),
+        ("control_delimiter_repetition_rate", metrics.control_delimiter_repetition_rate_delta),
+    ):
+        if degradation >= catastrophic_rate:
+            reasons.append(f"catastrophic_{name}")
+    return dataclasses.replace(
+        metrics,
+        hard_filter_passed=not reasons,
+        rejection_reasons=tuple(reasons),
+    )
+
+
+def _select_kl_screened_candidates(
+    candidates: Sequence[DirectionCandidate],
+    mean_kl_by_candidate: Mapping[str, float],
+    *,
+    maximum: float,
+    keep: int,
+) -> list[DirectionCandidate]:
+    return [
+        candidate
+        for candidate in candidates
+        if math.isfinite(mean_kl_by_candidate[candidate.candidate_id])
+        and mean_kl_by_candidate[candidate.candidate_id] <= maximum
+    ][:keep]
+
+
+def _candidate_kl_screen_identity(
+    config: ProjectConfig,
+    bundle: CandidateBundle,
+    candidates: Sequence[DirectionCandidate],
+    prompts: Sequence[PromptRecord],
+    artifact_profile: ArtifactProfile,
+) -> str:
+    return object_sha256(
+        {
+            "profile": artifact_profile.as_dict(),
+            "target_generation_config_hash": config.target_generation_config_hash,
+            "candidates": [
+                {
+                    "metadata": dataclasses.asdict(candidate),
+                    "direction_sha256": tensor_sha256(bundle.direction(candidate)),
+                }
+                for candidate in candidates
+            ],
+            "prompts": [dataclasses.asdict(prompt) for prompt in prompts],
+            "implementation_hash": _implementation_hash(
+                _next_token_logits,
+                mean_next_token_kl,
+                WeightEditPlan,
+                type(adapter_for_config(config)),
+                IntervenedModelRuntime,
+            ),
+        }
+    )
+
+
+def _validate_candidate_kl_row(
+    row: Mapping[str, Any],
+    candidate: DirectionCandidate,
+) -> float:
+    if set(row) != {"candidate_id", "mean_kl"} or row["candidate_id"] != candidate.candidate_id:
+        raise ArtifactError("candidate KL screening checkpoint identity is invalid")
+    mean_kl = row["mean_kl"]
+    if isinstance(mean_kl, bool) or not isinstance(mean_kl, int | float):
+        raise ArtifactError("candidate KL screening checkpoint value is invalid")
+    return float(mean_kl)
+
+
+def _screen_candidates_by_kl(
+    config: ProjectConfig,
+    store: ArtifactStore,
+    bundle: CandidateBundle,
+    candidates: Sequence[DirectionCandidate],
+    prompts: Sequence[PromptRecord],
+    *,
+    artifact_profile: ArtifactProfile,
+) -> tuple[list[DirectionCandidate], dict[str, float], str]:
+    if not candidates or not prompts:
+        raise PipelineError("candidate KL screening requires candidates and non-refusal validation prompts")
+    identity = _candidate_kl_screen_identity(config, bundle, candidates, prompts, artifact_profile)
+    checkpoint_root = store.paths.directions / ".candidate-evaluation-checkpoints" / "kl_screening" / identity
+    with PrivateCheckpoint(
+        checkpoint_root,
+        identity=identity,
+        prompt_keys=[candidate.candidate_id for candidate in candidates],
+    ) as checkpoint:
+        entries = checkpoint.load()
+        mean_kl_by_candidate = {
+            candidates[entry.ordinal].candidate_id: _validate_candidate_kl_row(
+                entry.payload,
+                candidates[entry.ordinal],
+            )
+            for entry in entries
+        }
+        if len(entries) < len(candidates):
+            with IntervenedModelRuntime(config) as runtime:
+                _validate_activation_chat_profile(artifact_profile, runtime.chat_template_hash)
+                base_logits = [
+                    _next_token_logits(runtime, prompt)
+                    for prompt in _progress(
+                        prompts,
+                        desc="KL screening: baseline logits",
+                        unit="prompt",
+                    )
+                ]
+                progress = tqdm(
+                    total=len(candidates),
+                    initial=len(entries),
+                    desc="KL screening: candidate directions",
+                    unit="candidate",
+                    dynamic_ncols=True,
+                    disable=None,
+                )
+                try:
+                    completed = {entry.ordinal for entry in entries}
+                    for ordinal, candidate in enumerate(candidates):
+                        if ordinal in completed:
+                            continue
+                        direction = bundle.direction(candidate)
+                        plan = runtime.adapter.build_weight_edit_plan(runtime.model, direction)
+                        with plan.temporary(runtime.model):
+                            intervention_logits = [_next_token_logits(runtime, prompt) for prompt in prompts]
+                        mean_kl = mean_next_token_kl(base_logits, intervention_logits)
+                        checkpoint.write(
+                            ordinal,
+                            candidate.candidate_id,
+                            {"candidate_id": candidate.candidate_id, "mean_kl": mean_kl},
+                        )
+                        mean_kl_by_candidate[candidate.candidate_id] = mean_kl
+                        progress.update()
+                finally:
+                    progress.close()
+        rows = [dict(entry.payload) for entry in checkpoint.require_complete()]
+    store.write_jsonl(
+        store.paths.directions / "kl_screening_results.jsonl",
+        rows,
+        artifact_type="kl_screening_results",
+        profile=artifact_profile,
+        private=False,
+    )
+    selected = _select_kl_screened_candidates(
+        candidates,
+        mean_kl_by_candidate,
+        maximum=config.acceptance.max_mean_kl,
+        keep=config.search.activation_screening_keep,
+    )
+    if not selected:
+        best = min(mean_kl_by_candidate.values(), default=math.inf)
+        raise PipelineError(
+            "no direction candidate passed next-token KL screening; "
+            f"best mean KL={best:.6g}, maximum={config.acceptance.max_mean_kl:.6g}; "
+            f"results: {store.paths.directions / 'kl_screening_results.jsonl'}"
+        )
+    return selected, mean_kl_by_candidate, identity
+
+
 def _candidate_phase_identity(
     config: ProjectConfig,
     bundle: CandidateBundle,
@@ -1600,9 +2000,9 @@ def _candidate_phase_identity(
     prompt_records: Mapping[str, PromptRecord],
     baseline_trajectories: Mapping[str, TargetTrajectory],
     baseline_prompt_plan: Sequence[PromptRecord],
-    reference_fallback: Sequence[str],
     artifact_profile: ArtifactProfile,
     evaluation_phase: str,
+    screened_mean_kl: Mapping[str, float] | None,
 ) -> str:
     reference_input = (
         [
@@ -1613,7 +2013,12 @@ def _candidate_phase_identity(
             for path in config.data.reference_files
         ]
         if config.data.reference_files
-        else [object_sha256({"text": text}) for text in reference_fallback]
+        else {
+            "source": "baseline_non_refusal_completions",
+            "trajectory_hashes": [
+                baseline_trajectories[item.prompt_id].trajectory_hash for item in labeled if item.label == "NON_REFUSAL"
+            ],
+        }
     )
     return object_sha256(
         {
@@ -1638,6 +2043,7 @@ def _candidate_phase_identity(
             ],
             "reference_input": reference_input,
             "activation_addition_beta": config.acceptance.activation_addition_beta,
+            "screened_mean_kl": dict(screened_mean_kl) if screened_mean_kl is not None else None,
             "implementation_hash": _implementation_hash(
                 _candidate_phase_identity,
                 evaluate_behavior,
@@ -1686,23 +2092,61 @@ def _validate_candidate_trajectory_row(
 def _validate_candidate_quality_row(
     row: Mapping[str, Any],
     candidate: DirectionCandidate,
-) -> tuple[float, float, dict[str, Any]]:
-    if set(row) != {"candidate_id", "mean_kl", "ce_loss_delta", "reference_corpus"}:
+) -> tuple[float, CEComparison, dict[str, Any]]:
+    if set(row) != {"candidate_id", "mean_kl", "ce", "reference_corpus"}:
         raise ArtifactError("candidate quality checkpoint row is invalid")
     if row["candidate_id"] != candidate.candidate_id:
         raise ArtifactError("candidate quality checkpoint identity is invalid")
     mean_kl = row["mean_kl"]
-    ce_loss_delta = row["ce_loss_delta"]
+    ce = row["ce"]
     reference_corpus = row["reference_corpus"]
     if (
         isinstance(mean_kl, bool)
         or not isinstance(mean_kl, int | float)
-        or isinstance(ce_loss_delta, bool)
-        or not isinstance(ce_loss_delta, int | float)
+        or not isinstance(ce, dict)
         or not isinstance(reference_corpus, dict)
     ):
         raise ArtifactError("candidate quality checkpoint values are invalid")
-    return float(mean_kl), float(ce_loss_delta), reference_corpus
+    return float(mean_kl), _ce_comparison_from_dict(ce), reference_corpus
+
+
+def _ce_comparison_from_dict(value: Mapping[str, Any]) -> CEComparison:
+    required = {
+        "baseline_ce_loss",
+        "baseline_ce_token_count",
+        "intervention_ce_loss",
+        "intervention_ce_token_count",
+        "ce_loss_delta",
+    }
+    if set(value) != required:
+        raise ArtifactError("candidate CE checkpoint fields are invalid")
+    baseline_count = value["baseline_ce_token_count"]
+    intervention_count = value["intervention_ce_token_count"]
+    baseline_mean = value["baseline_ce_loss"]
+    intervention_mean = value["intervention_ce_loss"]
+    if (
+        isinstance(baseline_count, bool)
+        or not isinstance(baseline_count, int)
+        or isinstance(intervention_count, bool)
+        or not isinstance(intervention_count, int)
+        or isinstance(baseline_mean, bool)
+        or not isinstance(baseline_mean, int | float)
+        or isinstance(intervention_mean, bool)
+        or not isinstance(intervention_mean, int | float)
+    ):
+        raise ArtifactError("candidate CE checkpoint values are invalid")
+    comparison = compare_ce_losses(
+        CELoss(total_loss=float(baseline_mean) * baseline_count, token_count=baseline_count),
+        CELoss(total_loss=float(intervention_mean) * intervention_count, token_count=intervention_count),
+    )
+    delta = value["ce_loss_delta"]
+    if (
+        isinstance(delta, bool)
+        or not isinstance(delta, int | float)
+        or not math.isclose(comparison.loss_delta, float(delta), rel_tol=1e-9, abs_tol=1e-12)
+    ):
+        raise ArtifactError("candidate CE checkpoint delta does not match its losses")
+    return comparison
 
 
 def _candidate_addition_error_rate(
@@ -1725,10 +2169,11 @@ def _evaluate_candidates_phase(
     prompt_records: Mapping[str, PromptRecord],
     baseline_trajectories: Mapping[str, TargetTrajectory],
     baseline_prompt_plan: Sequence[PromptRecord],
-    reference_fallback: Sequence[str],
     *,
     artifact_profile: ArtifactProfile,
+    results_profile: ArtifactProfile,
     evaluation_phase: Literal["pilot_evaluation", "full_validation"],
+    screened_mean_kl: Mapping[str, float] | None,
 ) -> tuple[list[CandidateMetrics], dict[str, Any], str]:
     phase_desc = "Pilot evaluation" if evaluation_phase == "pilot_evaluation" else "Full validation"
     labels = {item.prompt_id: item.label for item in labeled}
@@ -1753,9 +2198,9 @@ def _evaluate_candidates_phase(
         prompt_records,
         baseline_trajectories,
         baseline_prompt_plan,
-        reference_fallback,
         artifact_profile,
         evaluation_phase,
+        screened_mean_kl,
     )
     store.write_json(
         store.paths.directions / f"{evaluation_phase}_attempt.json",
@@ -1772,7 +2217,7 @@ def _evaluate_candidates_phase(
         for candidate, kind, prompt in generation_plan
     ]
     generation_profile_hash = next(iter(baseline_trajectories.values())).generation_config_hash
-    quality: dict[str, tuple[float, float]] = {}
+    quality: dict[str, tuple[float, CEComparison]] = {}
     reference_corpus: dict[str, Any] | None = None
     with (
         PrivateCheckpoint(
@@ -1801,8 +2246,8 @@ def _evaluate_candidates_phase(
         quality_entries = quality_checkpoint.load()
         for entry in quality_entries:
             candidate = candidates[entry.ordinal]
-            mean_kl, ce_loss_delta, saved_reference = _validate_candidate_quality_row(entry.payload, candidate)
-            quality[candidate.candidate_id] = (mean_kl, ce_loss_delta)
+            mean_kl, ce_comparison, saved_reference = _validate_candidate_quality_row(entry.payload, candidate)
+            quality[candidate.candidate_id] = (mean_kl, ce_comparison)
             if reference_corpus is None:
                 reference_corpus = saved_reference
             elif reference_corpus != saved_reference:
@@ -1893,25 +2338,37 @@ def _evaluate_candidates_phase(
 
                     missing_quality = len(quality_entries) < len(candidates)
                     if missing_quality:
-                        base_logits = [
-                            _next_token_logits(runtime, prompt)
-                            for prompt in _progress(
-                                non_refusal_prompts,
-                                desc=f"{phase_desc}: baseline logits",
-                                unit="prompt",
-                            )
-                        ]
-                        reference_texts, current_reference_corpus = _resolve_reference_texts(
+                        base_logits = (
+                            [
+                                _next_token_logits(runtime, prompt)
+                                for prompt in _progress(
+                                    non_refusal_prompts,
+                                    desc=f"{phase_desc}: baseline logits",
+                                    unit="prompt",
+                                )
+                            ]
+                            if screened_mean_kl is None
+                            else []
+                        )
+                        ce_inputs, current_reference_corpus = _resolve_ce_inputs(
                             config,
                             runtime,
-                            reference_fallback,
+                            [baseline_trajectories[item.prompt_id] for item in labeled],
+                            labels,
                         )
                         if reference_corpus is not None and reference_corpus != current_reference_corpus:
                             raise ArtifactError("candidate checkpoint reference corpus changed")
                         reference_corpus = current_reference_corpus
-                        base_ce = _mean_ce_loss(
+                        store.write_jsonl(
+                            store.paths.directions / f"{evaluation_phase}_ce_inputs.private.jsonl",
+                            (dataclasses.asdict(item) for item in ce_inputs),
+                            artifact_type=f"{evaluation_phase}_ce_inputs",
+                            profile=artifact_profile,
+                            private=True,
+                        )
+                        base_ce = compute_ce_loss(
                             runtime,
-                            reference_texts,
+                            ce_inputs,
                             desc=f"{phase_desc}: baseline CE loss",
                         )
                     for candidate_index, candidate in enumerate(candidates):
@@ -1934,18 +2391,22 @@ def _evaluate_candidates_phase(
                         with plan.temporary(runtime.model):
                             generate_batches(removal_ordinals)
                             if needs_quality:
-                                intervention_logits = [
-                                    _next_token_logits(runtime, prompt)
-                                    for prompt in _progress(
-                                        non_refusal_prompts,
-                                        desc=f"{phase_desc}: intervention logits",
-                                        unit="prompt",
-                                        leave=False,
-                                    )
-                                ]
-                                intervention_ce = _mean_ce_loss(
+                                intervention_logits = (
+                                    [
+                                        _next_token_logits(runtime, prompt)
+                                        for prompt in _progress(
+                                            non_refusal_prompts,
+                                            desc=f"{phase_desc}: intervention logits",
+                                            unit="prompt",
+                                            leave=False,
+                                        )
+                                    ]
+                                    if screened_mean_kl is None
+                                    else []
+                                )
+                                intervention_ce = compute_ce_loss(
                                     runtime,
-                                    reference_texts,
+                                    ce_inputs,
                                     desc=f"{phase_desc}: intervention CE loss",
                                     leave=False,
                                 )
@@ -1958,19 +2419,23 @@ def _evaluate_candidates_phase(
                             with plan.activation_addition(runtime.model, block_name, beta * candidate.norm):
                                 generate_batches(addition_ordinals)
                         if needs_quality:
-                            mean_kl = mean_next_token_kl(base_logits, intervention_logits) if base_logits else 0.0
-                            ce_loss_delta = intervention_ce - base_ce
+                            mean_kl = (
+                                mean_next_token_kl(base_logits, intervention_logits)
+                                if screened_mean_kl is None
+                                else screened_mean_kl[candidate.candidate_id]
+                            )
+                            ce_comparison = compare_ce_losses(base_ce, intervention_ce)
                             quality_checkpoint.write(
                                 candidate_index,
                                 candidate.candidate_id,
                                 {
                                     "candidate_id": candidate.candidate_id,
                                     "mean_kl": mean_kl,
-                                    "ce_loss_delta": ce_loss_delta,
+                                    "ce": ce_comparison.as_dict(),
                                     "reference_corpus": reference_corpus,
                                 },
                             )
-                            quality[candidate.candidate_id] = (mean_kl, ce_loss_delta)
+                            quality[candidate.candidate_id] = (mean_kl, ce_comparison)
                             quality_progress.update()
             trajectory_entries = generation_checkpoint.require_complete()
             quality_checkpoint.require_complete()
@@ -2145,7 +2610,7 @@ def _evaluate_candidates_phase(
         }
         induction = _addition_induction_rate(candidate.candidate_id, judgment_rows, labels)
         addition_error_rate = _candidate_addition_error_rate(candidate.candidate_id, judgment_rows)
-        mean_kl, ce_delta = quality[candidate.candidate_id]
+        mean_kl, ce_comparison = quality[candidate.candidate_id]
         candidate_metrics = evaluate_behavior(
             candidate_id=candidate.candidate_id,
             baseline_labels=labels,
@@ -2153,12 +2618,14 @@ def _evaluate_candidates_phase(
             trajectories=[TargetTrajectory.from_dict(row["trajectory"]) for row in removal_rows],
             judgments=candidate_judgments,
             mean_kl=mean_kl,
-            ce_loss_delta=ce_delta,
+            ce_loss_delta=ce_comparison.loss_delta,
             acceptance=config.acceptance,
             activation_addition_induction_rate=induction,
             activation_addition_error_rate=addition_error_rate,
             require_activation_addition=True,
         )
+        if evaluation_phase == "pilot_evaluation":
+            candidate_metrics = _apply_pilot_screen(candidate_metrics, config)
         metrics.append(candidate_metrics)
     results_path = (
         store.paths.pilot_evaluation_results
@@ -2169,7 +2636,7 @@ def _evaluate_candidates_phase(
         results_path,
         metrics,
         artifact_type=f"{evaluation_phase}_results",
-        profile=artifact_profile,
+        profile=results_profile,
         private=False,
     )
     return metrics, reference_corpus, phase_identity
@@ -2197,92 +2664,12 @@ def _next_token_logits(
     return output.logits[0, -1].detach().float().cpu()
 
 
-def _mean_ce_loss(
-    runtime: BaseModelRuntime | IntervenedModelRuntime,
-    texts: Sequence[str],
-    *,
-    desc: str = "Evaluating CE loss",
-    leave: bool = True,
-) -> float:
-    if not texts:
-        return 0.0
-    losses: list[float] = []
-    model = runtime.model
-    device = runtime.adapter.input_device(model)
-    backbone = runtime.adapter.text_backbone(model)
-    head = runtime.adapter.lm_head(model).module
-    weight = getattr(head, "weight", None)
-    if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
-        raise InvariantError("CE-loss evaluation LM head has no matrix weight")
-    chunk_positions = max(1, 1_048_576 // weight.shape[0])
-    for text in _progress(
-        texts,
-        desc=desc,
-        unit="text",
-        leave=leave,
-    ):
-        encoded = runtime.processor.tokenizer(text, return_tensors="pt", add_special_tokens=True)
-        inputs = _move_inputs(dict(encoded), device)
-        input_ids = inputs["input_ids"]
-        if input_ids.shape[-1] < 2:
-            continue
-        with torch.inference_mode():
-            output = backbone(**inputs, use_cache=False, return_dict=True)
-            hidden_states = getattr(output, "last_hidden_state", None)
-            if not isinstance(hidden_states, torch.Tensor):
-                raise InvariantError("CE-loss evaluation text backbone returned no hidden states")
-            shifted_states = hidden_states[:, :-1, :]
-            shifted_targets = input_ids[:, 1:].clone()
-            attention_mask = inputs.get("attention_mask")
-            if isinstance(attention_mask, torch.Tensor):
-                shifted_targets.masked_fill_(attention_mask[:, 1:] == 0, -100)
-            total_loss = 0.0
-            token_count = 0
-            chunks = range(0, shifted_states.shape[1], chunk_positions)
-            for start in _progress(
-                chunks,
-                desc=f"{desc}: chunks",
-                unit="chunk",
-                leave=False,
-            ):
-                stop = min(start + chunk_positions, shifted_states.shape[1])
-                logits = head(shifted_states[:, start:stop, :])
-                logits = _apply_final_logit_softcap(model, logits)
-                targets = shifted_targets[:, start:stop]
-                valid = int((targets != -100).sum().item())
-                if valid == 0:
-                    continue
-                loss = F.cross_entropy(
-                    logits.float().reshape(-1, logits.shape[-1]),
-                    targets.reshape(-1),
-                    ignore_index=-100,
-                    reduction="sum",
-                )
-                total_loss += float(loss.item())
-                token_count += valid
-        if token_count:
-            losses.append(total_loss / token_count)
-    return sum(losses) / len(losses) if losses else 0.0
-
-
-def _apply_final_logit_softcap(model: torch.nn.Module, logits: torch.Tensor) -> torch.Tensor:
-    model_config = getattr(model, "config", None)
-    get_text_config = getattr(model_config, "get_text_config", None)
-    text_config = get_text_config() if callable(get_text_config) else getattr(model_config, "text_config", model_config)
-    value = getattr(text_config, "final_logit_softcapping", None)
-    if value is None:
-        return logits
-    softcap = float(value)
-    if softcap <= 0:
-        raise InvariantError("final logit softcapping must be positive")
-    return torch.tanh(logits / softcap) * softcap
-
-
-def _resolve_reference_texts(
+def _resolve_ce_inputs(
     config: ProjectConfig,
     runtime: BaseModelRuntime | IntervenedModelRuntime,
-    fallback: Sequence[str],
-) -> tuple[list[str], dict[str, Any]]:
+    trajectories: Sequence[TargetTrajectory],
+    labels: Mapping[str, str],
+) -> tuple[tuple[CEInput, ...], dict[str, Any]]:
     if config.data.reference_files:
         tokenizer = runtime.processor.tokenizer
         texts = ingest_texts(
@@ -2292,18 +2679,23 @@ def _resolve_reference_texts(
         )
         if not texts:
             raise PipelineError("configured reference files produced no usable texts")
-        return texts, {
+        inputs = raw_text_ce_inputs(runtime, texts)
+        return inputs, {
             "source": "reference_files",
-            "text_count": len(texts),
+            "input_count": len(inputs),
+            "target_token_count": sum(item.target_token_count for item in inputs),
             "source_sha256": [file_sha256(Path(path).resolve()) for path in config.data.reference_files],
         }
-    texts = list(dict.fromkeys(text for text in fallback if text))
-    if not texts:
-        raise PipelineError("CE-loss evaluation requires reference files or baseline NON_REFUSAL prompts")
-    return texts, {
-        "source": "baseline_non_refusal_prompts",
-        "text_count": len(texts),
-        "source_sha256": [object_sha256({"text": text}) for text in texts],
+    inputs = completed_non_refusal_completion_inputs(runtime, trajectories, labels)
+    return inputs, {
+        "source": "baseline_non_refusal_completions",
+        "input_count": len(inputs),
+        "target_token_count": sum(item.target_token_count for item in inputs),
+        "trajectory_hashes": [
+            trajectory.trajectory_hash
+            for trajectory in trajectories
+            if labels.get(trajectory.prompt_id) == "NON_REFUSAL" and _eligible_baseline_trajectory(trajectory)
+        ],
     }
 
 
@@ -2337,7 +2729,7 @@ def export_model(config_path: str) -> None:
     )
 
     config, store = _load(config_path)
-    profile = _activation_dependent_profile(store)
+    profile = _selection_dependent_profile(store)
     validation_hash = profile.judge_validation_hash
     if validation_hash is None:
         raise ArtifactError("activation profile has no judge validation hash")
@@ -2584,7 +2976,7 @@ def _load_test_base_quality(
     *,
     identity: str,
     prompt_ids: Sequence[str],
-) -> tuple[list[torch.Tensor], float, list[str], dict[str, Any]] | None:
+) -> tuple[list[torch.Tensor], CELoss, tuple[CEInput, ...], dict[str, Any]] | None:
     metadata_path = directory / "quality.private.json"
     tensor_path = directory / "logits.private.safetensors"
     if not metadata_path.exists():
@@ -2605,7 +2997,7 @@ def _load_test_base_quality(
         "identity",
         "prompt_ids",
         "base_ce",
-        "reference_texts",
+        "ce_inputs",
         "reference_corpus",
         "tensor_sha256",
         "content_sha256",
@@ -2620,18 +3012,34 @@ def _load_test_base_quality(
     if _require_sha256(value["tensor_sha256"], "test base-quality tensor hash") != file_sha256(tensor_path):
         raise ArtifactError("test base-quality checkpoint tensor hash does not match")
     base_ce = value["base_ce"]
-    reference_texts = value["reference_texts"]
+    ce_input_rows = value["ce_inputs"]
     reference_corpus = value["reference_corpus"]
     if (
-        isinstance(base_ce, bool)
-        or not isinstance(base_ce, int | float)
-        or not math.isfinite(base_ce)
-        or not isinstance(reference_texts, list)
-        or not reference_texts
-        or any(not isinstance(text, str) for text in reference_texts)
+        not isinstance(base_ce, dict)
+        or set(base_ce) != {"total_loss", "token_count"}
+        or isinstance(base_ce["total_loss"], bool)
+        or not isinstance(base_ce["total_loss"], int | float)
+        or isinstance(base_ce["token_count"], bool)
+        or not isinstance(base_ce["token_count"], int)
+        or not isinstance(ce_input_rows, list)
+        or not ce_input_rows
         or not isinstance(reference_corpus, dict)
     ):
         raise ArtifactError("test base-quality checkpoint values are invalid")
+    try:
+        base_ce_loss = CELoss(total_loss=float(base_ce["total_loss"]), token_count=base_ce["token_count"])
+        ce_inputs = tuple(
+            CEInput(input_ids=tuple(row["input_ids"]), target_start=row["target_start"])
+            for row in ce_input_rows
+            if isinstance(row, dict) and set(row) == {"input_ids", "target_start"}
+        )
+    except (KeyError, TypeError, ValueError, InvariantError) as error:
+        raise ArtifactError("test base-quality CE checkpoint values are invalid") from error
+    if (
+        len(ce_inputs) != len(ce_input_rows)
+        or sum(item.target_token_count for item in ce_inputs) != base_ce_loss.token_count
+    ):
+        raise ArtifactError("test base-quality CE checkpoint token counts differ")
     try:
         tensors = load_file(tensor_path, device="cpu")
     except (OSError, RuntimeError, safetensors.SafetensorError) as error:
@@ -2646,7 +3054,7 @@ def _load_test_base_quality(
         or not bool(torch.isfinite(base_logits).all())
     ):
         raise ArtifactError("test base-quality checkpoint logits are invalid")
-    return list(base_logits.unbind(0)), float(base_ce), reference_texts, reference_corpus
+    return list(base_logits.unbind(0)), base_ce_loss, ce_inputs, reference_corpus
 
 
 def _save_test_base_quality(
@@ -2655,11 +3063,15 @@ def _save_test_base_quality(
     identity: str,
     prompt_ids: Sequence[str],
     base_logits: Sequence[torch.Tensor],
-    base_ce: float,
-    reference_texts: Sequence[str],
+    base_ce: CELoss,
+    ce_inputs: Sequence[CEInput],
     reference_corpus: Mapping[str, Any],
 ) -> None:
-    if len(base_logits) != len(prompt_ids) or not math.isfinite(base_ce) or not reference_texts:
+    if (
+        len(base_logits) != len(prompt_ids)
+        or not ce_inputs
+        or sum(item.target_token_count for item in ce_inputs) != base_ce.token_count
+    ):
         raise InvariantError("test base-quality checkpoint values are invalid")
     if directory.is_symlink():
         raise ArtifactError(f"test base-quality checkpoint must not be a symlink: {directory}")
@@ -2696,8 +3108,8 @@ def _save_test_base_quality(
     body = {
         "identity": identity,
         "prompt_ids": list(prompt_ids),
-        "base_ce": base_ce,
-        "reference_texts": list(reference_texts),
+        "base_ce": {"total_loss": base_ce.total_loss, "token_count": base_ce.token_count},
+        "ce_inputs": [dataclasses.asdict(item) for item in ce_inputs],
         "reference_corpus": dict(reference_corpus),
         "tensor_sha256": file_sha256(tensor_path),
     }
@@ -2776,17 +3188,23 @@ def evaluate_export(config_path: str) -> None:
     test_export_judgments_path = store.paths.evaluation / "test_export_judgments.jsonl"
     evaluation_started_path = store.paths.evaluation / "test_evaluation_started.json"
     manifest = load_export_manifest(store.paths.exported_model)
-    profile = _activation_dependent_profile(store)
+    selection_profile = _selection_dependent_profile(store)
+    profile = _derived_profile(
+        store,
+        selection_profile,
+        stage="test_evaluation",
+        acceptance_policy_hash=selection_profile.acceptance_policy_hash,
+    )
     selection = _read_json_artifact(
         store,
         store.paths.final_selection,
         artifact_type="final_selection",
-        profile=profile,
+        profile=selection_profile,
     )
     store.validate(
         store.paths.selected_direction,
         artifact_type="selected_direction",
-        expected_profile=profile,
+        expected_profile=selection_profile,
     )
     direction, direction_metadata = load_direction(store.paths.selected_direction)
     _validate_direction_selection(direction_metadata, selection)
@@ -2805,7 +3223,7 @@ def evaluate_export(config_path: str) -> None:
     test_prompt_rows = store.read_jsonl(
         baseline_directory / "test_prompts.private.jsonl",
         artifact_type="test_prompts",
-        expected_profile=_profile(store),
+        expected_profile=_profile(store, stage="baseline_generation"),
     )
     prompts = [PromptRecord.from_dict(row) for row in test_prompt_rows]
     if not prompts or any(prompt.split != "test" for prompt in prompts):
@@ -2960,8 +3378,8 @@ def evaluate_export(config_path: str) -> None:
         return
     baseline_judgments: list[JudgeResult] = []
     base_logits: list[torch.Tensor] = []
-    base_ce = 0.0
-    reference_texts: list[str] = []
+    base_ce: CELoss | None = None
+    ce_inputs: tuple[CEInput, ...] = ()
     reference_corpus: dict[str, Any] = {}
     base_quality_identity = ""
     with BaseModelRuntime(config) as runtime:
@@ -3053,23 +3471,24 @@ def evaluate_export(config_path: str) -> None:
                             unit="prompt",
                         )
                     ]
-                    reference_texts, reference_corpus = _resolve_reference_texts(
+                    ce_inputs, reference_corpus = _resolve_ce_inputs(
                         config,
                         runtime,
-                        [prompt.original_prompt for prompt in non_refusal_prompts],
+                        baseline_trajectories,
+                        baseline_labels,
                     )
-                    base_ce = _mean_ce_loss(runtime, reference_texts, desc="Computing test baseline CE loss")
+                    base_ce = compute_ce_loss(runtime, ce_inputs, desc="Computing test baseline CE loss")
                     _save_test_base_quality(
                         base_quality_directory,
                         identity=base_quality_identity,
                         prompt_ids=non_refusal_ids,
                         base_logits=base_logits,
                         base_ce=base_ce,
-                        reference_texts=reference_texts,
+                        ce_inputs=ce_inputs,
                         reference_corpus=reference_corpus,
                     )
                 else:
-                    base_logits, base_ce, reference_texts, reference_corpus = saved_quality
+                    base_logits, base_ce, ce_inputs, reference_corpus = saved_quality
     _record_error_diagnostics(
         config,
         store,
@@ -3155,18 +3574,22 @@ def evaluate_export(config_path: str) -> None:
                 quality_entries = quality_checkpoint.load()
                 if quality_entries:
                     quality_row = quality_entries[0].payload
-                    if set(quality_row) != {"mean_kl", "export_ce"}:
+                    if set(quality_row) != {"mean_kl", "ce"}:
                         raise ArtifactError("test export-quality checkpoint fields are invalid")
                     mean_kl = quality_row["mean_kl"]
-                    export_ce = quality_row["export_ce"]
-                    if any(
-                        isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value)
-                        for value in (mean_kl, export_ce)
+                    ce_value = quality_row["ce"]
+                    if (
+                        isinstance(mean_kl, bool)
+                        or not isinstance(mean_kl, int | float)
+                        or not math.isfinite(mean_kl)
+                        or not isinstance(ce_value, dict)
                     ):
                         raise ArtifactError("test export-quality checkpoint values are invalid")
                     mean_kl = float(mean_kl)
-                    export_ce = float(export_ce)
+                    ce_comparison = _ce_comparison_from_dict(ce_value)
                 else:
+                    if base_ce is None or not ce_inputs:
+                        raise InvariantError("test baseline quality is unavailable")
                     export_logits = [
                         _next_token_logits(runtime, prompt)
                         for prompt in _progress(
@@ -3175,12 +3598,13 @@ def evaluate_export(config_path: str) -> None:
                             unit="prompt",
                         )
                     ]
-                    export_ce = _mean_ce_loss(runtime, reference_texts, desc="Computing test export CE loss")
+                    export_ce = compute_ce_loss(runtime, ce_inputs, desc="Computing test export CE loss")
+                    ce_comparison = compare_ce_losses(base_ce, export_ce)
                     mean_kl = mean_next_token_kl(base_logits, export_logits) if base_logits else 0.0
                     quality_checkpoint.write(
                         0,
                         "quality",
-                        {"mean_kl": mean_kl, "export_ce": export_ce},
+                        {"mean_kl": mean_kl, "ce": ce_comparison.as_dict()},
                     )
     _record_error_diagnostics(
         config,
@@ -3250,14 +3674,14 @@ def evaluate_export(config_path: str) -> None:
         trajectories=[item for item in export_trajectories if item.prompt_id in baseline_labels],
         judgments=export_judgments_by_hash,
         mean_kl=mean_kl,
-        ce_loss_delta=export_ce - base_ce,
+        ce_loss_delta=ce_comparison.loss_delta,
         acceptance=config.acceptance,
     )
     full_validation_report = _read_json_artifact(
         store,
         store.paths.full_validation_report,
         artifact_type="full_validation_report",
-        profile=profile,
+        profile=selection_profile,
     )
     test_metrics = metrics_dict(metrics)
     test_report = {
@@ -3342,7 +3766,7 @@ def _validate_export_manifest(
     expected = {
         "base_model_id": config.model.id,
         "base_revision": config.model.revision,
-        "config_hash": config.config_hash,
+        "export_config_hash": config.stage_config_hash("export"),
         "target_generation_config_hash": config.target_generation_config_hash,
         "judge_profile_hash": current_judge_profile_hash(),
         "judge_validation_hash": judge_validation_hash_value,

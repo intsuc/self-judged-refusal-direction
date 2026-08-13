@@ -5,7 +5,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -13,6 +13,19 @@ from self_judged_refusal_direction.errors import ConfigurationError
 from self_judged_refusal_direction.hashing import object_sha256
 
 PINNED_REVISION = re.compile(r"^[0-9a-f]{40}$")
+
+type ArtifactStage = Literal[
+    "judge_validation",
+    "baseline_generation",
+    "baseline_judgment",
+    "label_selection",
+    "activation_extraction",
+    "direction_construction",
+    "candidate_evaluation",
+    "candidate_selection",
+    "test_evaluation",
+    "export",
+]
 
 
 def _finite_number(value: Any) -> bool:
@@ -113,26 +126,70 @@ class ProjectConfig:
     acceptance: AcceptanceConfig = field(default_factory=AcceptanceConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
 
-    @property
-    def config_hash(self) -> str:
-        acceptance = dataclasses.asdict(self.acceptance)
-        acceptance.pop("max_error_rate")
-        return object_sha256(
-            {
-                "seed": self.run.seed,
-                "model": {
-                    "id": self.model.id,
-                    "revision": self.model.revision,
-                    "dtype": self.model.dtype,
-                    "device_map": self.model.device_map,
-                    "attention_implementation": self.model.attention_implementation,
-                },
+    def stage_config_hash(self, stage: ArtifactStage) -> str:
+        model = dataclasses.asdict(self.model)
+        baseline_data = {
+            "prompt_files": self.data.prompt_files,
+            "train_fraction": self.data.train_fraction,
+            "validation_fraction": self.data.validation_fraction,
+            "max_test_prompts": self.data.max_test_prompts,
+            "max_text_tokens": self.data.max_text_tokens,
+            "template_similarity_threshold": self.data.template_similarity_threshold,
+        }
+        stage_inputs: dict[ArtifactStage, Any] = {
+            "judge_validation": {"model": model},
+            "baseline_generation": {
+                "model": model,
                 "target_generation": self.target_generation,
-                "data": self.data,
-                "search": self.search,
-                "acceptance": acceptance,
-            }
-        )
+                "seed": self.run.seed,
+                "data": baseline_data,
+            },
+            "baseline_judgment": {"model": model},
+            "label_selection": {
+                "train_per_class": self.data.train_per_class,
+                "validation_per_class": self.data.validation_per_class,
+            },
+            "activation_extraction": {
+                "model": model,
+                "layers": self.search.layers,
+                "accumulator_dtype": self.search.accumulator_dtype,
+            },
+            "direction_construction": {},
+            "candidate_evaluation": {
+                "model": model,
+                "target_generation": self.target_generation,
+                "reference_files": self.data.reference_files,
+                "max_text_tokens": self.data.max_text_tokens,
+                "pilot_prompts_per_class": self.search.pilot_prompts_per_class,
+                "activation_addition_beta": self.acceptance.activation_addition_beta,
+            },
+            "candidate_selection": {
+                "activation_screening_keep": self.search.activation_screening_keep,
+                "pilot_evaluation_keep": self.search.pilot_evaluation_keep,
+                "acceptance_policy_hash": self.acceptance_policy_hash,
+            },
+            "test_evaluation": {
+                "model": model,
+                "target_generation": self.target_generation,
+                "reference_files": self.data.reference_files,
+                "max_text_tokens": self.data.max_text_tokens,
+                "max_test_prompts": self.data.max_test_prompts,
+                "acceptance_policy_hash": self.acceptance_policy_hash,
+            },
+            "export": {"model": model, "export": self.export},
+        }
+        try:
+            inputs = stage_inputs[stage]
+        except KeyError as error:
+            raise ValueError(f"unknown artifact stage: {stage}") from error
+        return object_sha256({"stage": stage, "inputs": inputs})
+
+    @property
+    def acceptance_policy_hash(self) -> str:
+        acceptance = dataclasses.asdict(self.acceptance)
+        acceptance.pop("activation_addition_beta")
+        acceptance.pop("max_error_rate")
+        return object_sha256(acceptance)
 
     @property
     def target_generation_config_hash(self) -> str:

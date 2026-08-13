@@ -179,34 +179,106 @@ def test_invalid_values_and_cross_section_constraints_fail_fast(
         config.validate()
 
 
-def test_experiment_hash_boundary() -> None:
+def test_stage_config_hash_boundaries() -> None:
     config = valid_config()
-    operational = replace(
-        config,
-        run=replace(config.run, output_dir="another-run"),
-        export=replace(config.export, max_shard_size="1GB", edit_chunk_rows=128),
+    relocated = replace(config, run=replace(config.run, output_dir="another-run"))
+    assert relocated.target_generation_config_hash == config.target_generation_config_hash
+    assert all(
+        relocated.stage_config_hash(stage) == config.stage_config_hash(stage)
+        for stage in (
+            "judge_validation",
+            "baseline_generation",
+            "baseline_judgment",
+            "label_selection",
+            "activation_extraction",
+            "direction_construction",
+            "candidate_evaluation",
+            "candidate_selection",
+            "test_evaluation",
+            "export",
+        )
     )
 
-    assert operational.config_hash == config.config_hash
-    assert operational.target_generation_config_hash == config.target_generation_config_hash
     for model in (
         replace(config.model, dtype="float16"),
         replace(config.model, device_map="cuda:0"),
         replace(config.model, attention_implementation="eager"),
     ):
         changed = replace(config, model=model)
-        assert changed.config_hash != config.config_hash
         assert changed.target_generation_config_hash != config.target_generation_config_hash
-    assert replace(config, run=replace(config.run, seed=43)).config_hash != config.config_hash
-    error_rate_changed = replace(config, acceptance=replace(config.acceptance, max_error_rate=0.2))
-    assert error_rate_changed.config_hash == config.config_hash
-    assert error_rate_changed.target_generation_config_hash == config.target_generation_config_hash
+
+    assert replace(config, run=replace(config.run, seed=43)).stage_config_hash(
+        "baseline_generation"
+    ) != config.stage_config_hash("baseline_generation")
+
     acceptance_changed = replace(config, acceptance=replace(config.acceptance, max_mean_kl=0.2))
-    assert acceptance_changed.config_hash != config.config_hash
-    assert acceptance_changed.target_generation_config_hash == config.target_generation_config_hash
+    assert acceptance_changed.acceptance_policy_hash != config.acceptance_policy_hash
+    assert acceptance_changed.stage_config_hash("candidate_selection") != config.stage_config_hash(
+        "candidate_selection"
+    )
+    assert acceptance_changed.stage_config_hash("candidate_evaluation") == config.stage_config_hash(
+        "candidate_evaluation"
+    )
+    assert acceptance_changed.stage_config_hash("baseline_generation") == config.stage_config_hash(
+        "baseline_generation"
+    )
+
+    error_rate_changed = replace(config, acceptance=replace(config.acceptance, max_error_rate=0.2))
+    assert error_rate_changed.acceptance_policy_hash == config.acceptance_policy_hash
+    assert error_rate_changed.stage_config_hash("candidate_selection") == config.stage_config_hash(
+        "candidate_selection"
+    )
+    assert error_rate_changed.stage_config_hash("test_evaluation") == config.stage_config_hash("test_evaluation")
+
+    beta_changed = replace(config, acceptance=replace(config.acceptance, activation_addition_beta=2.0))
+    assert beta_changed.acceptance_policy_hash == config.acceptance_policy_hash
+    assert beta_changed.stage_config_hash("candidate_selection") == config.stage_config_hash("candidate_selection")
+    assert beta_changed.stage_config_hash("candidate_evaluation") != config.stage_config_hash("candidate_evaluation")
+
+    references_changed = replace(config, data=replace(config.data, reference_files=("references.txt",)))
+    assert references_changed.stage_config_hash("candidate_evaluation") != config.stage_config_hash(
+        "candidate_evaluation"
+    )
+    assert references_changed.stage_config_hash("baseline_generation") == config.stage_config_hash(
+        "baseline_generation"
+    )
+
+    selection_changed = replace(config, data=replace(config.data, train_per_class=256))
+    assert selection_changed.stage_config_hash("label_selection") != config.stage_config_hash("label_selection")
+    assert selection_changed.stage_config_hash("baseline_judgment") == config.stage_config_hash("baseline_judgment")
+
+    activation_changed = replace(config, search=replace(config.search, layers=(8, 9)))
+    assert activation_changed.stage_config_hash("activation_extraction") != config.stage_config_hash(
+        "activation_extraction"
+    )
+    assert activation_changed.stage_config_hash("baseline_generation") == config.stage_config_hash(
+        "baseline_generation"
+    )
+
+    screening_changed = replace(config, search=replace(config.search, activation_screening_keep=16))
+    assert screening_changed.stage_config_hash("direction_construction") == config.stage_config_hash(
+        "direction_construction"
+    )
+    assert screening_changed.stage_config_hash("activation_extraction") == config.stage_config_hash(
+        "activation_extraction"
+    )
+    assert screening_changed.stage_config_hash("candidate_evaluation") == config.stage_config_hash(
+        "candidate_evaluation"
+    )
+    assert screening_changed.stage_config_hash("candidate_selection") != config.stage_config_hash("candidate_selection")
+
+    shortlist_changed = replace(config, search=replace(config.search, pilot_evaluation_keep=4))
+    assert shortlist_changed.stage_config_hash("candidate_selection") != config.stage_config_hash("candidate_selection")
+    assert shortlist_changed.stage_config_hash("candidate_evaluation") == config.stage_config_hash(
+        "candidate_evaluation"
+    )
+
     generation_changed = replace(
         config,
         target_generation=replace(config.target_generation, batch_size=2),
     )
     assert generation_changed.target_generation_config_hash != config.target_generation_config_hash
-    assert generation_changed.config_hash != config.config_hash
+    assert generation_changed.stage_config_hash("baseline_generation") != config.stage_config_hash(
+        "baseline_generation"
+    )
+    assert generation_changed.stage_config_hash("baseline_judgment") == config.stage_config_hash("baseline_judgment")

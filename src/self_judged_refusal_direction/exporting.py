@@ -863,7 +863,7 @@ def _build_manifest(
     manifest: dict[str, Any] = {
         "base_model_id": config.model.id,
         "base_revision": config.model.revision,
-        "config_hash": config.config_hash,
+        "export_config_hash": config.stage_config_hash("export"),
         "export_implementation_hash": export_implementation_hash(),
         "target_generation_config_hash": config.target_generation_config_hash,
         "effective_generation_config_hash": effective_generation_config_hash,
