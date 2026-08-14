@@ -122,6 +122,14 @@ def test_sampling_parameters_require_sampling() -> None:
             "accumulator_dtype",
         ),
         (
+            replace(valid_config(), search=replace(valid_config().search, max_screening_kl=-0.1)),
+            "max_screening_kl",
+        ),
+        (
+            replace(valid_config(), search=replace(valid_config().search, max_screening_kl=0.05)),
+            "max_screening_kl",
+        ),
+        (
             replace(
                 valid_config(),
                 search=replace(valid_config().search, activation_screening_keep=4, pilot_evaluation_keep=5),
@@ -236,9 +244,10 @@ def test_stage_config_hash_boundaries() -> None:
     assert beta_changed.stage_config_hash("candidate_evaluation") != config.stage_config_hash("candidate_evaluation")
 
     references_changed = replace(config, data=replace(config.data, reference_files=("references.txt",)))
-    assert references_changed.stage_config_hash("candidate_evaluation") != config.stage_config_hash(
+    assert references_changed.stage_config_hash("candidate_evaluation") == config.stage_config_hash(
         "candidate_evaluation"
     )
+    assert references_changed.stage_config_hash("test_evaluation") == config.stage_config_hash("test_evaluation")
     assert references_changed.stage_config_hash("baseline_generation") == config.stage_config_hash(
         "baseline_generation"
     )
@@ -266,6 +275,14 @@ def test_stage_config_hash_boundaries() -> None:
         "candidate_evaluation"
     )
     assert screening_changed.stage_config_hash("candidate_selection") != config.stage_config_hash("candidate_selection")
+
+    kl_screening_changed = replace(config, search=replace(config.search, max_screening_kl=0.25))
+    assert kl_screening_changed.stage_config_hash("candidate_evaluation") == config.stage_config_hash(
+        "candidate_evaluation"
+    )
+    assert kl_screening_changed.stage_config_hash("candidate_selection") != config.stage_config_hash(
+        "candidate_selection"
+    )
 
     shortlist_changed = replace(config, search=replace(config.search, pilot_evaluation_keep=4))
     assert shortlist_changed.stage_config_hash("candidate_selection") != config.stage_config_hash("candidate_selection")

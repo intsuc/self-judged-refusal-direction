@@ -92,6 +92,7 @@ class DataConfig:
 class SearchConfig:
     layers: str | tuple[int, ...] = "all"
     accumulator_dtype: str = "float64"
+    max_screening_kl: float = 0.5
     activation_screening_keep: int = 32
     pilot_evaluation_keep: int = 5
     pilot_prompts_per_class: int = 16
@@ -158,12 +159,11 @@ class ProjectConfig:
             "candidate_evaluation": {
                 "model": model,
                 "target_generation": self.target_generation,
-                "reference_files": self.data.reference_files,
-                "max_text_tokens": self.data.max_text_tokens,
                 "pilot_prompts_per_class": self.search.pilot_prompts_per_class,
                 "activation_addition_beta": self.acceptance.activation_addition_beta,
             },
             "candidate_selection": {
+                "max_screening_kl": self.search.max_screening_kl,
                 "activation_screening_keep": self.search.activation_screening_keep,
                 "pilot_evaluation_keep": self.search.pilot_evaluation_keep,
                 "acceptance_policy_hash": self.acceptance_policy_hash,
@@ -171,8 +171,6 @@ class ProjectConfig:
             "test_evaluation": {
                 "model": model,
                 "target_generation": self.target_generation,
-                "reference_files": self.data.reference_files,
-                "max_text_tokens": self.data.max_text_tokens,
                 "max_test_prompts": self.data.max_test_prompts,
                 "acceptance_policy_hash": self.acceptance_policy_hash,
             },
@@ -307,6 +305,8 @@ class ProjectConfig:
             errors.append("search.layers must be all or a non-empty tuple of unique non-negative integers")
         if self.search.accumulator_dtype not in {"float32", "float64"}:
             errors.append("search.accumulator_dtype must be float32 or float64")
+        if not _finite_number(self.search.max_screening_kl) or self.search.max_screening_kl < 0:
+            errors.append("search.max_screening_kl must be non-negative")
         for name, value in (
             ("search.activation_screening_keep", self.search.activation_screening_keep),
             ("search.pilot_evaluation_keep", self.search.pilot_evaluation_keep),
@@ -348,6 +348,12 @@ class ProjectConfig:
         ):
             if not _finite_number(value) or value < 0:
                 errors.append(f"{name} must be non-negative")
+        if (
+            _finite_number(self.search.max_screening_kl)
+            and _finite_number(self.acceptance.max_mean_kl)
+            and self.search.max_screening_kl < self.acceptance.max_mean_kl
+        ):
+            errors.append("search.max_screening_kl must not be less than acceptance.max_mean_kl")
         addition_beta = self.acceptance.activation_addition_beta
         if not _finite_number(addition_beta) or addition_beta <= 0:
             errors.append("acceptance.activation_addition_beta must be positive")

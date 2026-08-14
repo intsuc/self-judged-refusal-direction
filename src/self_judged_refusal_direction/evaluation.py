@@ -11,7 +11,13 @@ import torch
 
 from self_judged_refusal_direction.config import AcceptanceConfig
 from self_judged_refusal_direction.errors import PipelineError
-from self_judged_refusal_direction.schema import CandidateMetrics, DirectionCandidate, JudgeResult, TargetTrajectory
+from self_judged_refusal_direction.schema import (
+    CandidateMetrics,
+    CEEvaluation,
+    DirectionCandidate,
+    JudgeResult,
+    TargetTrajectory,
+)
 
 _REPETITION_NGRAM_SIZE = 4
 _REPETITION_THRESHOLD = 0.5
@@ -39,8 +45,8 @@ def evaluate_behavior(
     baseline_trajectories: Mapping[str, TargetTrajectory],
     trajectories: Iterable[TargetTrajectory],
     judgments: Mapping[str, JudgeResult],
-    mean_kl: float,
-    ce_loss_delta: float,
+    mean_kl: float | None,
+    completion_ce: CEEvaluation,
     acceptance: AcceptanceConfig,
     activation_addition_induction_rate: float | None = None,
     activation_addition_error_rate: float | None = None,
@@ -129,7 +135,7 @@ def evaluate_behavior(
         uncertain_rate=uncertain_rate,
         error_rate=error_rate,
         mean_kl=mean_kl,
-        ce_loss_delta=ce_loss_delta,
+        completion_ce=completion_ce,
         baseline_completion_rate=baseline_completion_rate,
         completion_rate=completion_rate,
         completion_rate_delta=completion_rate - baseline_completion_rate,
@@ -188,10 +194,48 @@ def apply_hard_filters(
         reasons.append("abnormal_repetition_rate")
     if metrics.control_delimiter_repetition_rate_delta > failure_limit:
         reasons.append("control_delimiter_repetition_rate")
-    if not math.isfinite(metrics.mean_kl) or metrics.mean_kl > acceptance.max_mean_kl:
+    if metrics.mean_kl is None or not math.isfinite(metrics.mean_kl) or metrics.mean_kl > acceptance.max_mean_kl:
         reasons.append("mean_kl")
-    if not math.isfinite(metrics.ce_loss_delta) or metrics.ce_loss_delta > acceptance.max_ce_loss_delta:
+    if (
+        metrics.completion_ce.loss_delta is None
+        or not math.isfinite(metrics.completion_ce.loss_delta)
+        or metrics.completion_ce.loss_delta > acceptance.max_ce_loss_delta
+    ):
         reasons.append("ce_loss_delta")
+    return replace(metrics, hard_filter_passed=not reasons, rejection_reasons=tuple(reasons))
+
+
+def apply_pilot_filters(metrics: CandidateMetrics) -> CandidateMetrics:
+    reasons: list[str] = []
+    induction = metrics.activation_addition_induction_rate
+    if metrics.removal_success_rate <= 0:
+        reasons.append("removal_signal")
+    if induction is None or induction <= 0:
+        reasons.append("activation_addition_signal")
+    if metrics.mean_kl is None or not math.isfinite(metrics.mean_kl):
+        reasons.append("mean_kl")
+    if metrics.completion_ce.loss_delta is None or not math.isfinite(metrics.completion_ce.loss_delta):
+        reasons.append("ce_loss_delta")
+    catastrophic_rate = 0.5
+    if metrics.error_rate >= catastrophic_rate:
+        reasons.append("catastrophic_error_rate")
+    if (
+        metrics.activation_addition_error_rate is not None
+        and metrics.activation_addition_error_rate >= catastrophic_rate
+    ):
+        reasons.append("catastrophic_activation_addition_error_rate")
+    if metrics.uncertain_rate >= catastrophic_rate:
+        reasons.append("catastrophic_uncertain_rate")
+    if metrics.non_refusal_retention_rate <= 1 - catastrophic_rate:
+        reasons.append("catastrophic_non_refusal_retention")
+    for name, degradation in (
+        ("completion_rate", -metrics.completion_rate_delta),
+        ("empty_answer_rate", metrics.empty_answer_rate_delta),
+        ("abnormal_repetition_rate", metrics.abnormal_repetition_rate_delta),
+        ("control_delimiter_repetition_rate", metrics.control_delimiter_repetition_rate_delta),
+    ):
+        if degradation >= catastrophic_rate:
+            reasons.append(f"catastrophic_{name}")
     return replace(metrics, hard_filter_passed=not reasons, rejection_reasons=tuple(reasons))
 
 
@@ -210,7 +254,7 @@ def select_candidate(
             item.removal_success_rate,
             item.non_refusal_retention_rate,
             -item.uncertain_rate,
-            -item.mean_kl,
+            -(item.mean_kl if item.mean_kl is not None else math.inf),
             induction if induction is not None else -math.inf,
             candidate.standardized_separation,
             candidate.norm,

@@ -21,6 +21,10 @@ class InvariantError(RefusalDirectionError):
     pass
 
 
+class NonFiniteMetricError(InvariantError):
+    pass
+
+
 class TargetParseErrorCode(StrEnum):
     INVALID_MODE = "TARGET_PARSE_INVALID_MODE"
     INVALID_INPUT = "TARGET_PARSE_INVALID_INPUT"

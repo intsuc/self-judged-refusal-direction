@@ -39,6 +39,7 @@ class ArtifactProfile:
     direction_construction_hash: str | None = None
     candidate_evaluation_hash: str | None = None
     acceptance_policy_hash: str | None = None
+    reference_ce_hash: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -214,6 +215,7 @@ class ArtifactStore:
         direction_construction_hash: str | None = None,
         candidate_evaluation_hash: str | None = None,
         acceptance_policy_hash: str | None = None,
+        reference_ce_hash: str | None = None,
     ) -> ArtifactProfile:
         if self.config.model.id is None:
             raise ArtifactError("model ID is required")
@@ -234,6 +236,7 @@ class ArtifactStore:
             direction_construction_hash=direction_construction_hash,
             candidate_evaluation_hash=candidate_evaluation_hash,
             acceptance_policy_hash=acceptance_policy_hash,
+            reference_ce_hash=reference_ce_hash,
         )
 
     def initialize_run(self) -> None:

@@ -1,8 +1,24 @@
+from dataclasses import replace
 from typing import Literal
 
 from self_judged_refusal_direction.config import AcceptanceConfig
-from self_judged_refusal_direction.evaluation import evaluate_behavior
-from self_judged_refusal_direction.schema import JudgeResult, TargetTrajectory
+from self_judged_refusal_direction.evaluation import apply_pilot_filters, evaluate_behavior
+from self_judged_refusal_direction.schema import CEEvaluation, JudgeResult, TargetTrajectory
+
+
+def _ce_evaluation(
+    *,
+    source: Literal["baseline_non_refusal_completions", "reference_files"] = "baseline_non_refusal_completions",
+    baseline_loss: float = 0.1,
+    intervention_loss: float = 0.1,
+) -> CEEvaluation:
+    return CEEvaluation(
+        source=source,
+        input_count=1,
+        target_token_count=8,
+        baseline_loss=baseline_loss,
+        intervention_loss=intervention_loss,
+    )
 
 
 def _trajectory(
@@ -64,7 +80,7 @@ def test_causal_and_generation_health_filters_reject_ineffective_degenerate_cand
         trajectories=intervention.values(),
         judgments=judgments,
         mean_kl=0.0,
-        ce_loss_delta=0.0,
+        completion_ce=_ce_evaluation(),
         acceptance=AcceptanceConfig(),
         activation_addition_induction_rate=0.0,
         activation_addition_error_rate=0.0,
@@ -96,7 +112,7 @@ def test_causal_candidate_with_healthy_generation_passes() -> None:
         trajectories=intervention.values(),
         judgments=judgments,
         mean_kl=0.0,
-        ce_loss_delta=0.0,
+        completion_ce=_ce_evaluation(),
         acceptance=AcceptanceConfig(),
         activation_addition_induction_rate=1.0,
         activation_addition_error_rate=0.0,
@@ -105,3 +121,43 @@ def test_causal_candidate_with_healthy_generation_passes() -> None:
 
     assert metrics.hard_filter_passed
     assert metrics.rejection_reasons == ()
+
+
+def test_pilot_allows_finite_quality_threshold_excess_until_full_validation() -> None:
+    baseline = {prompt_id: _trajectory(prompt_id) for prompt_id in ("refusal", "non-refusal")}
+    intervention = {prompt_id: _trajectory(prompt_id) for prompt_id in baseline}
+    judgments = {
+        intervention["refusal"].trajectory_hash: _judgment(intervention["refusal"], "NON_REFUSAL"),
+        intervention["non-refusal"].trajectory_hash: _judgment(intervention["non-refusal"], "NON_REFUSAL"),
+    }
+
+    full_metrics = evaluate_behavior(
+        candidate_id="candidate",
+        baseline_labels={"refusal": "REFUSAL", "non-refusal": "NON_REFUSAL"},
+        baseline_trajectories=baseline,
+        trajectories=intervention.values(),
+        judgments=judgments,
+        mean_kl=0.2,
+        completion_ce=_ce_evaluation(intervention_loss=0.3),
+        acceptance=AcceptanceConfig(),
+        activation_addition_induction_rate=1.0,
+        activation_addition_error_rate=0.0,
+        require_activation_addition=True,
+    )
+
+    assert not full_metrics.hard_filter_passed
+    assert set(full_metrics.rejection_reasons) == {"mean_kl", "ce_loss_delta"}
+    pilot_metrics = apply_pilot_filters(full_metrics)
+    assert pilot_metrics.hard_filter_passed
+    assert pilot_metrics.rejection_reasons == ()
+
+    non_finite = type(full_metrics.completion_ce)(
+        source="baseline_non_refusal_completions",
+        input_count=1,
+        target_token_count=8,
+        baseline_loss=0.1,
+        intervention_loss=None,
+        error_code="NON_FINITE",
+    )
+    failed = apply_pilot_filters(replace(full_metrics, mean_kl=None, completion_ce=non_finite))
+    assert set(failed.rejection_reasons) == {"mean_kl", "ce_loss_delta"}

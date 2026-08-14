@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from self_judged_refusal_direction.errors import ArtifactError
+from self_judged_refusal_direction.errors import ArtifactError, InvariantError
 
 
 class JudgeLabel(StrEnum):
@@ -189,6 +190,108 @@ class DirectionCandidate:
 
 
 @dataclass(frozen=True)
+class CEEvaluation:
+    source: Literal["baseline_non_refusal_completions", "reference_files"]
+    input_count: int
+    target_token_count: int
+    baseline_loss: float
+    intervention_loss: float | None
+    error_code: Literal["NON_FINITE"] | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.input_count, bool) or not isinstance(self.input_count, int) or self.input_count <= 0:
+            raise InvariantError("CE input count must be positive")
+        if (
+            isinstance(self.target_token_count, bool)
+            or not isinstance(self.target_token_count, int)
+            or self.target_token_count <= 0
+        ):
+            raise InvariantError("CE target token count must be positive")
+        if not math.isfinite(self.baseline_loss) or self.baseline_loss < 0:
+            raise InvariantError("baseline CE loss must be finite and non-negative")
+        if self.intervention_loss is None:
+            if self.error_code != "NON_FINITE":
+                raise InvariantError("missing intervention CE loss requires a non-finite error")
+        elif not math.isfinite(self.intervention_loss) or self.intervention_loss < 0 or self.error_code is not None:
+            raise InvariantError("intervention CE loss or error is invalid")
+
+    @property
+    def loss_delta(self) -> float | None:
+        return self.intervention_loss - self.baseline_loss if self.intervention_loss is not None else None
+
+    def as_dict(self) -> dict[str, str | int | float]:
+        value: dict[str, str | int | float] = {
+            "source": self.source,
+            "input_count": self.input_count,
+            "target_token_count": self.target_token_count,
+            "baseline_loss": self.baseline_loss,
+        }
+        if self.intervention_loss is None:
+            value["error_code"] = "NON_FINITE"
+        else:
+            value["intervention_loss"] = self.intervention_loss
+            value["loss_delta"] = self.intervention_loss - self.baseline_loss
+        return value
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> CEEvaluation:
+        common = {"source", "input_count", "target_token_count", "baseline_loss"}
+        if not isinstance(value, dict):
+            raise ArtifactError("CE evaluation has invalid fields")
+        fields = set(value)
+        success = fields == common | {"intervention_loss", "loss_delta"}
+        failure = fields == common | {"error_code"}
+        if not success and not failure:
+            raise ArtifactError("CE evaluation has invalid fields")
+        source = value["source"]
+        input_count = value["input_count"]
+        target_token_count = value["target_token_count"]
+        baseline_loss = value["baseline_loss"]
+        intervention_loss = value.get("intervention_loss")
+        loss_delta = value.get("loss_delta")
+        error_code = value.get("error_code")
+        if (
+            source not in {"baseline_non_refusal_completions", "reference_files"}
+            or isinstance(input_count, bool)
+            or not isinstance(input_count, int)
+            or isinstance(target_token_count, bool)
+            or not isinstance(target_token_count, int)
+            or isinstance(baseline_loss, bool)
+            or not isinstance(baseline_loss, int | float)
+            or (
+                success
+                and (
+                    isinstance(intervention_loss, bool)
+                    or not isinstance(intervention_loss, int | float)
+                    or isinstance(loss_delta, bool)
+                    or not isinstance(loss_delta, int | float)
+                )
+            )
+            or (failure and error_code != "NON_FINITE")
+        ):
+            raise ArtifactError("CE evaluation has invalid values")
+        try:
+            result = cls(
+                source=source,
+                input_count=input_count,
+                target_token_count=target_token_count,
+                baseline_loss=float(baseline_loss),
+                intervention_loss=float(intervention_loss) if intervention_loss is not None else None,
+                error_code=error_code,
+            )
+        except InvariantError as error:
+            raise ArtifactError("CE evaluation has invalid values") from error
+        if success and not math.isclose(
+            cast(float, result.loss_delta),
+            float(cast(int | float, loss_delta)),
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            raise ArtifactError("CE evaluation loss delta does not match its losses")
+        return result
+
+
+@dataclass(frozen=True)
 class CandidateMetrics:
     candidate_id: str
     baseline_refusal_count: int
@@ -201,8 +304,8 @@ class CandidateMetrics:
     non_refusal_retention_rate: float
     uncertain_rate: float
     error_rate: float
-    mean_kl: float
-    ce_loss_delta: float
+    mean_kl: float | None
+    completion_ce: CEEvaluation
     baseline_completion_rate: float
     completion_rate: float
     completion_rate_delta: float
@@ -226,8 +329,15 @@ class CandidateMetrics:
     hard_filter_passed: bool = False
     rejection_reasons: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        if self.completion_ce.source != "baseline_non_refusal_completions":
+            raise InvariantError("acceptance CE must use baseline NON_REFUSAL completions")
+
     def as_dict(self) -> dict[str, Any]:
-        return {key: value for key, value in asdict(self).items() if value is not None}
+        value = {key: item for key, item in asdict(self).items() if item is not None}
+        value["mean_kl"] = self.mean_kl
+        value["completion_ce"] = self.completion_ce.as_dict()
+        return value
 
 
 @dataclass(frozen=True)

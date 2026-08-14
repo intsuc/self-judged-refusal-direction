@@ -3,17 +3,17 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
 from self_judged_refusal_direction.config import ProjectConfig
-from self_judged_refusal_direction.errors import InvariantError, PipelineError
+from self_judged_refusal_direction.errors import InvariantError, NonFiniteMetricError, PipelineError
 from self_judged_refusal_direction.models.base import ArchitectureAdapter
 from self_judged_refusal_direction.prompting import target_messages
-from self_judged_refusal_direction.schema import TargetTrajectory
+from self_judged_refusal_direction.schema import CEEvaluation, TargetTrajectory
 
 
 class CERuntime(Protocol):
@@ -53,8 +53,10 @@ class CELoss:
     token_count: int
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.total_loss) or self.total_loss < 0:
-            raise InvariantError("CE total loss must be finite and non-negative")
+        if not math.isfinite(self.total_loss):
+            raise NonFiniteMetricError("CE total loss is not finite")
+        if self.total_loss < 0:
+            raise InvariantError("CE total loss must be non-negative")
         if self.token_count <= 0:
             raise InvariantError("CE loss must contain at least one target token")
 
@@ -78,12 +80,57 @@ class CEComparison:
 
     def as_dict(self) -> dict[str, float | int]:
         return {
-            "baseline_ce_loss": self.baseline.mean_loss,
-            "baseline_ce_token_count": self.baseline.token_count,
-            "intervention_ce_loss": self.intervention.mean_loss,
-            "intervention_ce_token_count": self.intervention.token_count,
-            "ce_loss_delta": self.loss_delta,
+            "baseline_loss": self.baseline.mean_loss,
+            "intervention_loss": self.intervention.mean_loss,
+            "loss_delta": self.loss_delta,
+            "target_token_count": self.baseline.token_count,
         }
+
+    def as_evaluation(
+        self,
+        *,
+        source: Literal["baseline_non_refusal_completions", "reference_files"],
+        input_count: int,
+    ) -> CEEvaluation:
+        if source not in {"baseline_non_refusal_completions", "reference_files"}:
+            raise InvariantError("CE evaluation source is invalid")
+        if isinstance(input_count, bool) or not isinstance(input_count, int) or input_count <= 0:
+            raise InvariantError("CE evaluation input count must be positive")
+        return CEEvaluation(
+            source=source,
+            input_count=input_count,
+            target_token_count=self.baseline.token_count,
+            baseline_loss=self.baseline.mean_loss,
+            intervention_loss=self.intervention.mean_loss,
+        )
+
+    @staticmethod
+    def non_finite_evaluation(
+        baseline: CELoss,
+        *,
+        source: Literal["baseline_non_refusal_completions", "reference_files"],
+        input_count: int,
+    ) -> CEEvaluation:
+        return CEEvaluation(
+            source=source,
+            input_count=input_count,
+            target_token_count=baseline.token_count,
+            baseline_loss=baseline.mean_loss,
+            intervention_loss=None,
+            error_code="NON_FINITE",
+        )
+
+
+def ce_evaluation_from_losses(
+    baseline: CELoss,
+    intervention: CELoss | None,
+    *,
+    source: Literal["baseline_non_refusal_completions", "reference_files"],
+    input_count: int,
+) -> CEEvaluation:
+    if intervention is None:
+        return CEComparison.non_finite_evaluation(baseline, source=source, input_count=input_count)
+    return compare_ce_losses(baseline, intervention).as_evaluation(source=source, input_count=input_count)
 
 
 def raw_text_ce_inputs(runtime: CERuntime, texts: Iterable[str]) -> tuple[CEInput, ...]:

@@ -25,10 +25,9 @@ from self_judged_refusal_direction.activations import (
 )
 from self_judged_refusal_direction.artifacts import ArtifactMetadata, ArtifactProfile, ArtifactStore
 from self_judged_refusal_direction.ce_loss import (
-    CEComparison,
     CEInput,
     CELoss,
-    compare_ce_losses,
+    ce_evaluation_from_losses,
     completed_non_refusal_completion_inputs,
     compute_ce_loss,
     raw_text_ce_inputs,
@@ -51,8 +50,9 @@ from self_judged_refusal_direction.directions import (
     write_candidate_artifacts,
 )
 from self_judged_refusal_direction.editing import WeightEditPlan
-from self_judged_refusal_direction.errors import ArtifactError, InvariantError, PipelineError
+from self_judged_refusal_direction.errors import ArtifactError, InvariantError, NonFiniteMetricError, PipelineError
 from self_judged_refusal_direction.evaluation import (
+    apply_pilot_filters,
     evaluate_behavior,
     judgment_counts,
     mean_next_token_kl,
@@ -83,6 +83,7 @@ from self_judged_refusal_direction.prompting import judge_profile_hash as curren
 from self_judged_refusal_direction.runtime import BaseModelRuntime, IntervenedModelRuntime
 from self_judged_refusal_direction.schema import (
     CandidateMetrics,
+    CEEvaluation,
     DirectionCandidate,
     JudgeInput,
     JudgeLabel,
@@ -1502,19 +1503,15 @@ def _candidate_evaluation_hash(config: ProjectConfig) -> str:
     return object_sha256(
         {
             "stage_config_hash": config.stage_config_hash("candidate_evaluation"),
-            "reference_files": [
-                {
-                    "path": str(Path(path).resolve()),
-                    "content_sha256": file_sha256(Path(path).resolve()),
-                }
-                for path in config.data.reference_files
-            ],
             "implementation_hash": _implementation_hash(
                 _screen_candidates_by_kl,
                 _evaluate_candidates_phase,
                 evaluate_behavior,
                 mean_next_token_kl,
+                completed_non_refusal_completion_inputs,
                 compute_ce_loss,
+                ce_evaluation_from_losses,
+                CEEvaluation,
                 type(adapter_for_config(config)),
             ),
         }
@@ -1688,7 +1685,7 @@ def evaluate_candidates(config_path: str) -> None:
         kl_prompts,
         artifact_profile=profile,
     )
-    pilot_metrics, _, pilot_evaluation_identity = _evaluate_candidates_phase(
+    pilot_metrics, pilot_evaluation_identity = _evaluate_candidates_phase(
         config,
         store,
         bundle,
@@ -1704,24 +1701,16 @@ def evaluate_candidates(config_path: str) -> None:
     )
     pilot_eligible = [item for item in pilot_metrics if item.hard_filter_passed]
     if not pilot_eligible:
-        rejection_counts = Counter(reason for item in pilot_metrics for reason in item.rejection_reasons)
-        rejection_summary = ", ".join(f"{reason}={count}" for reason, count in sorted(rejection_counts.items()))
-        best_removal = max((item.removal_success_rate for item in pilot_metrics), default=0.0)
-        best_induction = max(
-            (item.activation_addition_induction_rate or 0.0 for item in pilot_metrics),
-            default=0.0,
-        )
         raise PipelineError(
             "no pilot evaluation candidate passed causal and quality screening; "
-            f"best removal={best_removal:.2%}, best addition induction={best_induction:.2%}; "
-            f"rejection counts: {rejection_summary}; results: {store.paths.pilot_evaluation_results}"
+            + _candidate_failure_summary(pilot_metrics, store.paths.pilot_evaluation_results)
         )
     full_validation_ids = [
         item.candidate_id
         for item in sorted(pilot_eligible, key=_pilot_ranking_key, reverse=True)[: config.search.pilot_evaluation_keep]
     ]
     full_validation_candidates = [by_id[candidate_id] for candidate_id in full_validation_ids]
-    full_validation_metrics, reference_corpus, full_validation_identity = _evaluate_candidates_phase(
+    full_validation_metrics, full_validation_identity = _evaluate_candidates_phase(
         config,
         store,
         bundle,
@@ -1735,7 +1724,13 @@ def evaluate_candidates(config_path: str) -> None:
         evaluation_phase="full_validation",
         screened_mean_kl=None,
     )
-    selected_metrics, selected_candidate = select_candidate(full_validation_metrics, by_id)
+    try:
+        selected_metrics, selected_candidate = select_candidate(full_validation_metrics, by_id)
+    except PipelineError:
+        raise PipelineError(
+            "no full validation candidate passed the configured hard filters; "
+            + _candidate_failure_summary(full_validation_metrics, store.paths.full_validation_results)
+        ) from None
     selected_direction = bundle.direction(selected_candidate)
     selected_metadata = {
         "candidate": dataclasses.asdict(selected_candidate),
@@ -1779,7 +1774,6 @@ def evaluate_candidates(config_path: str) -> None:
             "activation_screening_count": len(ranking),
             "full_validation_count": len(full_validation_candidates),
         },
-        "reference_corpus": reference_corpus,
         "selected_candidate": selected_metadata,
     }
     _write_json_artifact(
@@ -1799,57 +1793,31 @@ def _balanced_subset(values: Sequence[LabeledTrajectory], per_class: int) -> lis
     return selected
 
 
+def _candidate_failure_summary(metrics: Sequence[CandidateMetrics], results_path: Path) -> str:
+    rejection_counts = Counter(reason for item in metrics for reason in item.rejection_reasons)
+    rejection_summary = ", ".join(f"{reason}={count}" for reason, count in sorted(rejection_counts.items()))
+    best_removal = max((item.removal_success_rate for item in metrics), default=0.0)
+    best_induction = max((item.activation_addition_induction_rate or 0.0 for item in metrics), default=0.0)
+    return (
+        f"best removal={best_removal:.2%}, best addition induction={best_induction:.2%}; "
+        f"rejection counts: {rejection_summary}; results: {results_path}"
+    )
+
+
 def _pilot_ranking_key(metrics: CandidateMetrics) -> tuple[float, ...]:
     return (
         metrics.removal_success_rate,
         metrics.activation_addition_induction_rate or 0.0,
         metrics.non_refusal_retention_rate,
         -metrics.uncertain_rate,
-        -metrics.mean_kl,
-    )
-
-
-def _apply_pilot_screen(metrics: CandidateMetrics, config: ProjectConfig) -> CandidateMetrics:
-    reasons: list[str] = []
-    induction = metrics.activation_addition_induction_rate
-    if metrics.removal_success_rate <= 0:
-        reasons.append("removal_signal")
-    if induction is None or induction <= 0:
-        reasons.append("activation_addition_signal")
-    if not math.isfinite(metrics.mean_kl) or metrics.mean_kl > config.acceptance.max_mean_kl:
-        reasons.append("mean_kl")
-    if not math.isfinite(metrics.ce_loss_delta) or metrics.ce_loss_delta > config.acceptance.max_ce_loss_delta:
-        reasons.append("ce_loss_delta")
-    catastrophic_rate = 0.5
-    if metrics.error_rate >= catastrophic_rate:
-        reasons.append("catastrophic_error_rate")
-    if (
-        metrics.activation_addition_error_rate is not None
-        and metrics.activation_addition_error_rate >= catastrophic_rate
-    ):
-        reasons.append("catastrophic_activation_addition_error_rate")
-    if metrics.uncertain_rate >= catastrophic_rate:
-        reasons.append("catastrophic_uncertain_rate")
-    if metrics.non_refusal_retention_rate <= 1 - catastrophic_rate:
-        reasons.append("catastrophic_non_refusal_retention")
-    for name, degradation in (
-        ("completion_rate", -metrics.completion_rate_delta),
-        ("empty_answer_rate", metrics.empty_answer_rate_delta),
-        ("abnormal_repetition_rate", metrics.abnormal_repetition_rate_delta),
-        ("control_delimiter_repetition_rate", metrics.control_delimiter_repetition_rate_delta),
-    ):
-        if degradation >= catastrophic_rate:
-            reasons.append(f"catastrophic_{name}")
-    return dataclasses.replace(
-        metrics,
-        hard_filter_passed=not reasons,
-        rejection_reasons=tuple(reasons),
+        -(metrics.mean_kl if metrics.mean_kl is not None else math.inf),
+        -(metrics.completion_ce.loss_delta if metrics.completion_ce.loss_delta is not None else math.inf),
     )
 
 
 def _select_kl_screened_candidates(
     candidates: Sequence[DirectionCandidate],
-    mean_kl_by_candidate: Mapping[str, float],
+    mean_kl_by_candidate: Mapping[str, float | None],
     *,
     maximum: float,
     keep: int,
@@ -1857,8 +1825,9 @@ def _select_kl_screened_candidates(
     return [
         candidate
         for candidate in candidates
-        if math.isfinite(mean_kl_by_candidate[candidate.candidate_id])
-        and mean_kl_by_candidate[candidate.candidate_id] <= maximum
+        if mean_kl_by_candidate[candidate.candidate_id] is not None
+        and math.isfinite(cast(float, mean_kl_by_candidate[candidate.candidate_id]))
+        and cast(float, mean_kl_by_candidate[candidate.candidate_id]) <= maximum
     ][:keep]
 
 
@@ -1895,11 +1864,13 @@ def _candidate_kl_screen_identity(
 def _validate_candidate_kl_row(
     row: Mapping[str, Any],
     candidate: DirectionCandidate,
-) -> float:
+) -> float | None:
     if set(row) != {"candidate_id", "mean_kl"} or row["candidate_id"] != candidate.candidate_id:
         raise ArtifactError("candidate KL screening checkpoint identity is invalid")
     mean_kl = row["mean_kl"]
-    if isinstance(mean_kl, bool) or not isinstance(mean_kl, int | float):
+    if mean_kl is None:
+        return None
+    if isinstance(mean_kl, bool) or not isinstance(mean_kl, int | float) or not math.isfinite(mean_kl):
         raise ArtifactError("candidate KL screening checkpoint value is invalid")
     return float(mean_kl)
 
@@ -1912,7 +1883,7 @@ def _screen_candidates_by_kl(
     prompts: Sequence[PromptRecord],
     *,
     artifact_profile: ArtifactProfile,
-) -> tuple[list[DirectionCandidate], dict[str, float], str]:
+) -> tuple[list[DirectionCandidate], dict[str, float | None], str]:
     if not candidates or not prompts:
         raise PipelineError("candidate KL screening requires candidates and non-refusal validation prompts")
     identity = _candidate_kl_screen_identity(config, bundle, candidates, prompts, artifact_profile)
@@ -1958,7 +1929,8 @@ def _screen_candidates_by_kl(
                         plan = runtime.adapter.build_weight_edit_plan(runtime.model, direction)
                         with plan.temporary(runtime.model):
                             intervention_logits = [_next_token_logits(runtime, prompt) for prompt in prompts]
-                        mean_kl = mean_next_token_kl(base_logits, intervention_logits)
+                        measured_kl = mean_next_token_kl(base_logits, intervention_logits)
+                        mean_kl = measured_kl if math.isfinite(measured_kl) else None
                         checkpoint.write(
                             ordinal,
                             candidate.candidate_id,
@@ -1979,14 +1951,14 @@ def _screen_candidates_by_kl(
     selected = _select_kl_screened_candidates(
         candidates,
         mean_kl_by_candidate,
-        maximum=config.acceptance.max_mean_kl,
+        maximum=config.search.max_screening_kl,
         keep=config.search.activation_screening_keep,
     )
     if not selected:
-        best = min(mean_kl_by_candidate.values(), default=math.inf)
+        best = min((value for value in mean_kl_by_candidate.values() if value is not None), default=math.inf)
         raise PipelineError(
             "no direction candidate passed next-token KL screening; "
-            f"best mean KL={best:.6g}, maximum={config.acceptance.max_mean_kl:.6g}; "
+            f"best mean KL={best:.6g}, maximum={config.search.max_screening_kl:.6g}; "
             f"results: {store.paths.directions / 'kl_screening_results.jsonl'}"
         )
     return selected, mean_kl_by_candidate, identity
@@ -2002,24 +1974,8 @@ def _candidate_phase_identity(
     baseline_prompt_plan: Sequence[PromptRecord],
     artifact_profile: ArtifactProfile,
     evaluation_phase: str,
-    screened_mean_kl: Mapping[str, float] | None,
+    screened_mean_kl: Mapping[str, float | None] | None,
 ) -> str:
-    reference_input = (
-        [
-            {
-                "path": str(Path(path).resolve()),
-                "sha256": file_sha256(Path(path).resolve()),
-            }
-            for path in config.data.reference_files
-        ]
-        if config.data.reference_files
-        else {
-            "source": "baseline_non_refusal_completions",
-            "trajectory_hashes": [
-                baseline_trajectories[item.prompt_id].trajectory_hash for item in labeled if item.label == "NON_REFUSAL"
-            ],
-        }
-    )
     return object_sha256(
         {
             "phase": evaluation_phase,
@@ -2041,13 +1997,19 @@ def _candidate_phase_identity(
                 [dataclasses.asdict(prompt) for prompt in batch]
                 for batch in _fixed_batches(baseline_prompt_plan, config.target_generation.batch_size)
             ],
-            "reference_input": reference_input,
+            "completion_ce_trajectory_hashes": [
+                baseline_trajectories[item.prompt_id].trajectory_hash for item in labeled if item.label == "NON_REFUSAL"
+            ],
             "activation_addition_beta": config.acceptance.activation_addition_beta,
             "screened_mean_kl": dict(screened_mean_kl) if screened_mean_kl is not None else None,
             "implementation_hash": _implementation_hash(
                 _candidate_phase_identity,
                 evaluate_behavior,
                 mean_next_token_kl,
+                completed_non_refusal_completion_inputs,
+                compute_ce_loss,
+                ce_evaluation_from_losses,
+                CEEvaluation,
                 WeightEditPlan,
                 TargetTrajectoryGenerator,
                 type(adapter_for_config(config)),
@@ -2092,61 +2054,183 @@ def _validate_candidate_trajectory_row(
 def _validate_candidate_quality_row(
     row: Mapping[str, Any],
     candidate: DirectionCandidate,
-) -> tuple[float, CEComparison, dict[str, Any]]:
-    if set(row) != {"candidate_id", "mean_kl", "ce", "reference_corpus"}:
+) -> tuple[float | None, CEEvaluation]:
+    if set(row) != {"candidate_id", "mean_kl", "completion_ce"}:
         raise ArtifactError("candidate quality checkpoint row is invalid")
     if row["candidate_id"] != candidate.candidate_id:
         raise ArtifactError("candidate quality checkpoint identity is invalid")
     mean_kl = row["mean_kl"]
-    ce = row["ce"]
-    reference_corpus = row["reference_corpus"]
-    if (
-        isinstance(mean_kl, bool)
-        or not isinstance(mean_kl, int | float)
-        or not isinstance(ce, dict)
-        or not isinstance(reference_corpus, dict)
+    completion_ce = row["completion_ce"]
+    if mean_kl is not None and (
+        isinstance(mean_kl, bool) or not isinstance(mean_kl, int | float) or not math.isfinite(mean_kl)
     ):
         raise ArtifactError("candidate quality checkpoint values are invalid")
-    return float(mean_kl), _ce_comparison_from_dict(ce), reference_corpus
-
-
-def _ce_comparison_from_dict(value: Mapping[str, Any]) -> CEComparison:
-    required = {
-        "baseline_ce_loss",
-        "baseline_ce_token_count",
-        "intervention_ce_loss",
-        "intervention_ce_token_count",
-        "ce_loss_delta",
-    }
-    if set(value) != required:
-        raise ArtifactError("candidate CE checkpoint fields are invalid")
-    baseline_count = value["baseline_ce_token_count"]
-    intervention_count = value["intervention_ce_token_count"]
-    baseline_mean = value["baseline_ce_loss"]
-    intervention_mean = value["intervention_ce_loss"]
-    if (
-        isinstance(baseline_count, bool)
-        or not isinstance(baseline_count, int)
-        or isinstance(intervention_count, bool)
-        or not isinstance(intervention_count, int)
-        or isinstance(baseline_mean, bool)
-        or not isinstance(baseline_mean, int | float)
-        or isinstance(intervention_mean, bool)
-        or not isinstance(intervention_mean, int | float)
-    ):
-        raise ArtifactError("candidate CE checkpoint values are invalid")
-    comparison = compare_ce_losses(
-        CELoss(total_loss=float(baseline_mean) * baseline_count, token_count=baseline_count),
-        CELoss(total_loss=float(intervention_mean) * intervention_count, token_count=intervention_count),
+    if not isinstance(completion_ce, dict):
+        raise ArtifactError("candidate quality checkpoint values are invalid")
+    return (
+        float(mean_kl) if mean_kl is not None else None,
+        CEEvaluation.from_dict(completion_ce),
     )
-    delta = value["ce_loss_delta"]
-    if (
-        isinstance(delta, bool)
-        or not isinstance(delta, int | float)
-        or not math.isclose(comparison.loss_delta, float(delta), rel_tol=1e-9, abs_tol=1e-12)
-    ):
-        raise ArtifactError("candidate CE checkpoint delta does not match its losses")
-    return comparison
+
+
+def _candidate_reference_ce_identity(
+    config: ProjectConfig,
+    bundle: CandidateBundle,
+    candidates: Sequence[DirectionCandidate],
+    artifact_profile: ArtifactProfile,
+    evaluation_phase: str,
+) -> str:
+    return object_sha256(
+        {
+            "phase": evaluation_phase,
+            "profile": artifact_profile.as_dict(),
+            "reference_files": [
+                {
+                    "path": str(Path(path).resolve()),
+                    "content_sha256": file_sha256(Path(path).resolve()),
+                }
+                for path in config.data.reference_files
+            ],
+            "max_text_tokens": config.data.max_text_tokens,
+            "candidates": [
+                {
+                    "metadata": dataclasses.asdict(candidate),
+                    "direction_sha256": tensor_sha256(bundle.direction(candidate)),
+                }
+                for candidate in candidates
+            ],
+            "implementation_hash": _implementation_hash(
+                _candidate_reference_ce_identity,
+                ingest_texts,
+                raw_text_ce_inputs,
+                compute_ce_loss,
+                ce_evaluation_from_losses,
+                CEEvaluation,
+                WeightEditPlan,
+                type(adapter_for_config(config)),
+                IntervenedModelRuntime,
+            ),
+        }
+    )
+
+
+def _validate_candidate_reference_ce_row(
+    row: Mapping[str, Any],
+    candidate: DirectionCandidate,
+) -> CEEvaluation:
+    if set(row) != {"candidate_id", "reference_ce"} or row["candidate_id"] != candidate.candidate_id:
+        raise ArtifactError("candidate reference CE checkpoint row is invalid")
+    reference_ce = row["reference_ce"]
+    if not isinstance(reference_ce, dict):
+        raise ArtifactError("candidate reference CE checkpoint value is invalid")
+    result = CEEvaluation.from_dict(reference_ce)
+    if result.source != "reference_files":
+        raise ArtifactError("candidate reference CE checkpoint source is invalid")
+    return result
+
+
+def _evaluate_candidate_reference_ce(
+    config: ProjectConfig,
+    store: ArtifactStore,
+    bundle: CandidateBundle,
+    candidates: Sequence[DirectionCandidate],
+    *,
+    artifact_profile: ArtifactProfile,
+    evaluation_phase: Literal["pilot_evaluation", "full_validation"],
+) -> None:
+    results_path = store.paths.directions / f"{evaluation_phase}_reference_ce_results.jsonl"
+    identity = _candidate_reference_ce_identity(
+        config,
+        bundle,
+        candidates,
+        artifact_profile,
+        evaluation_phase,
+    )
+    diagnostic_profile = dataclasses.replace(artifact_profile, reference_ce_hash=identity)
+    if not config.data.reference_files:
+        store.write_jsonl(
+            results_path,
+            (),
+            artifact_type=f"{evaluation_phase}_reference_ce_results",
+            profile=diagnostic_profile,
+            private=False,
+        )
+        return
+    checkpoint_directory = (
+        store.paths.directions / ".candidate-evaluation-checkpoints" / evaluation_phase / "reference_ce" / identity
+    )
+    with PrivateCheckpoint(
+        checkpoint_directory,
+        identity=identity,
+        prompt_keys=[candidate.candidate_id for candidate in candidates],
+    ) as checkpoint:
+        entries = checkpoint.load()
+        results = {
+            candidates[entry.ordinal].candidate_id: _validate_candidate_reference_ce_row(
+                entry.payload,
+                candidates[entry.ordinal],
+            )
+            for entry in entries
+        }
+        if len(entries) < len(candidates):
+            with IntervenedModelRuntime(config) as runtime:
+                _validate_activation_chat_profile(artifact_profile, runtime.chat_template_hash)
+                inputs = _reference_ce_inputs(config, runtime)
+                baseline = compute_ce_loss(
+                    runtime,
+                    inputs,
+                    desc=f"{evaluation_phase}: baseline reference CE",
+                )
+                progress = tqdm(
+                    total=len(candidates),
+                    initial=len(entries),
+                    desc=f"{evaluation_phase}: reference CE",
+                    unit="candidate",
+                    dynamic_ncols=True,
+                    disable=None,
+                )
+                try:
+                    for ordinal, candidate in enumerate(candidates):
+                        if candidate.candidate_id in results:
+                            continue
+                        direction = bundle.direction(candidate)
+                        plan = runtime.adapter.build_weight_edit_plan(runtime.model, direction)
+                        try:
+                            with plan.temporary(runtime.model):
+                                intervention = compute_ce_loss(
+                                    runtime,
+                                    inputs,
+                                    desc=f"{evaluation_phase}: intervention reference CE",
+                                    leave=False,
+                                )
+                        except NonFiniteMetricError:
+                            intervention = None
+                        evaluation = ce_evaluation_from_losses(
+                            baseline,
+                            intervention,
+                            source="reference_files",
+                            input_count=len(inputs),
+                        )
+                        checkpoint.write(
+                            ordinal,
+                            candidate.candidate_id,
+                            {
+                                "candidate_id": candidate.candidate_id,
+                                "reference_ce": evaluation.as_dict(),
+                            },
+                        )
+                        results[candidate.candidate_id] = evaluation
+                        progress.update()
+                finally:
+                    progress.close()
+        rows = [dict(entry.payload) for entry in checkpoint.require_complete()]
+    store.write_jsonl(
+        results_path,
+        rows,
+        artifact_type=f"{evaluation_phase}_reference_ce_results",
+        profile=diagnostic_profile,
+        private=False,
+    )
 
 
 def _candidate_addition_error_rate(
@@ -2173,8 +2257,8 @@ def _evaluate_candidates_phase(
     artifact_profile: ArtifactProfile,
     results_profile: ArtifactProfile,
     evaluation_phase: Literal["pilot_evaluation", "full_validation"],
-    screened_mean_kl: Mapping[str, float] | None,
-) -> tuple[list[CandidateMetrics], dict[str, Any], str]:
+    screened_mean_kl: Mapping[str, float | None] | None,
+) -> tuple[list[CandidateMetrics], str]:
     phase_desc = "Pilot evaluation" if evaluation_phase == "pilot_evaluation" else "Full validation"
     labels = {item.prompt_id: item.label for item in labeled}
     prompts = [prompt_records[item.prompt_id] for item in labeled]
@@ -2217,8 +2301,7 @@ def _evaluate_candidates_phase(
         for candidate, kind, prompt in generation_plan
     ]
     generation_profile_hash = next(iter(baseline_trajectories.values())).generation_config_hash
-    quality: dict[str, tuple[float, CEComparison]] = {}
-    reference_corpus: dict[str, Any] | None = None
+    quality: dict[str, tuple[float | None, CEEvaluation]] = {}
     with (
         PrivateCheckpoint(
             checkpoint_root / "trajectories",
@@ -2246,12 +2329,8 @@ def _evaluate_candidates_phase(
         quality_entries = quality_checkpoint.load()
         for entry in quality_entries:
             candidate = candidates[entry.ordinal]
-            mean_kl, ce_comparison, saved_reference = _validate_candidate_quality_row(entry.payload, candidate)
-            quality[candidate.candidate_id] = (mean_kl, ce_comparison)
-            if reference_corpus is None:
-                reference_corpus = saved_reference
-            elif reference_corpus != saved_reference:
-                raise ArtifactError("candidate checkpoints contain different reference corpora")
+            mean_kl, completion_ce = _validate_candidate_quality_row(entry.payload, candidate)
+            quality[candidate.candidate_id] = (mean_kl, completion_ce)
         generation_progress = tqdm(
             total=len(generation_plan),
             initial=len(generation_entries),
@@ -2350,21 +2429,10 @@ def _evaluate_candidates_phase(
                             if screened_mean_kl is None
                             else []
                         )
-                        ce_inputs, current_reference_corpus = _resolve_ce_inputs(
-                            config,
+                        ce_inputs = _completion_ce_inputs(
                             runtime,
                             [baseline_trajectories[item.prompt_id] for item in labeled],
                             labels,
-                        )
-                        if reference_corpus is not None and reference_corpus != current_reference_corpus:
-                            raise ArtifactError("candidate checkpoint reference corpus changed")
-                        reference_corpus = current_reference_corpus
-                        store.write_jsonl(
-                            store.paths.directions / f"{evaluation_phase}_ce_inputs.private.jsonl",
-                            (dataclasses.asdict(item) for item in ce_inputs),
-                            artifact_type=f"{evaluation_phase}_ce_inputs",
-                            profile=artifact_profile,
-                            private=True,
                         )
                         base_ce = compute_ce_loss(
                             runtime,
@@ -2404,12 +2472,15 @@ def _evaluate_candidates_phase(
                                     if screened_mean_kl is None
                                     else []
                                 )
-                                intervention_ce = compute_ce_loss(
-                                    runtime,
-                                    ce_inputs,
-                                    desc=f"{phase_desc}: intervention CE loss",
-                                    leave=False,
-                                )
+                                try:
+                                    intervention_ce = compute_ce_loss(
+                                        runtime,
+                                        ce_inputs,
+                                        desc=f"{phase_desc}: intervention CE loss",
+                                        leave=False,
+                                    )
+                                except NonFiniteMetricError:
+                                    intervention_ce = None
                         addition_ordinals = [
                             ordinal for ordinal in candidate_ordinals if generation_plan[ordinal][1] == "addition"
                         ]
@@ -2419,23 +2490,28 @@ def _evaluate_candidates_phase(
                             with plan.activation_addition(runtime.model, block_name, beta * candidate.norm):
                                 generate_batches(addition_ordinals)
                         if needs_quality:
-                            mean_kl = (
+                            measured_kl = (
                                 mean_next_token_kl(base_logits, intervention_logits)
                                 if screened_mean_kl is None
                                 else screened_mean_kl[candidate.candidate_id]
                             )
-                            ce_comparison = compare_ce_losses(base_ce, intervention_ce)
+                            mean_kl = measured_kl if measured_kl is not None and math.isfinite(measured_kl) else None
+                            completion_ce = ce_evaluation_from_losses(
+                                base_ce,
+                                intervention_ce,
+                                source="baseline_non_refusal_completions",
+                                input_count=len(ce_inputs),
+                            )
                             quality_checkpoint.write(
                                 candidate_index,
                                 candidate.candidate_id,
                                 {
                                     "candidate_id": candidate.candidate_id,
                                     "mean_kl": mean_kl,
-                                    "ce": ce_comparison.as_dict(),
-                                    "reference_corpus": reference_corpus,
+                                    "completion_ce": completion_ce.as_dict(),
                                 },
                             )
-                            quality[candidate.candidate_id] = (mean_kl, ce_comparison)
+                            quality[candidate.candidate_id] = (mean_kl, completion_ce)
                             quality_progress.update()
             trajectory_entries = generation_checkpoint.require_complete()
             quality_checkpoint.require_complete()
@@ -2443,8 +2519,6 @@ def _evaluate_candidates_phase(
             generation_progress.close()
             quality_progress.close()
     trajectory_rows = [dict(entry.payload) for entry in trajectory_entries]
-    if reference_corpus is None:
-        raise ArtifactError("candidate quality checkpoint has no reference corpus")
     generation_error_rows = [
         {
             "candidate_id": row["candidate_id"],
@@ -2493,6 +2567,10 @@ def _evaluate_candidates_phase(
                 evaluate_export,
                 evaluate_behavior,
                 mean_next_token_kl,
+                completed_non_refusal_completion_inputs,
+                compute_ce_loss,
+                ce_evaluation_from_losses,
+                CEEvaluation,
             ),
         }
     )
@@ -2610,7 +2688,7 @@ def _evaluate_candidates_phase(
         }
         induction = _addition_induction_rate(candidate.candidate_id, judgment_rows, labels)
         addition_error_rate = _candidate_addition_error_rate(candidate.candidate_id, judgment_rows)
-        mean_kl, ce_comparison = quality[candidate.candidate_id]
+        mean_kl, completion_ce = quality[candidate.candidate_id]
         candidate_metrics = evaluate_behavior(
             candidate_id=candidate.candidate_id,
             baseline_labels=labels,
@@ -2618,14 +2696,14 @@ def _evaluate_candidates_phase(
             trajectories=[TargetTrajectory.from_dict(row["trajectory"]) for row in removal_rows],
             judgments=candidate_judgments,
             mean_kl=mean_kl,
-            ce_loss_delta=ce_comparison.loss_delta,
+            completion_ce=completion_ce,
             acceptance=config.acceptance,
             activation_addition_induction_rate=induction,
             activation_addition_error_rate=addition_error_rate,
             require_activation_addition=True,
         )
         if evaluation_phase == "pilot_evaluation":
-            candidate_metrics = _apply_pilot_screen(candidate_metrics, config)
+            candidate_metrics = apply_pilot_filters(candidate_metrics)
         metrics.append(candidate_metrics)
     results_path = (
         store.paths.pilot_evaluation_results
@@ -2639,7 +2717,15 @@ def _evaluate_candidates_phase(
         profile=results_profile,
         private=False,
     )
-    return metrics, reference_corpus, phase_identity
+    _evaluate_candidate_reference_ce(
+        config,
+        store,
+        bundle,
+        candidates,
+        artifact_profile=artifact_profile,
+        evaluation_phase=evaluation_phase,
+    )
+    return metrics, phase_identity
 
 
 def _transformer_block_name(runtime: IntervenedModelRuntime, layer: int) -> str:
@@ -2664,39 +2750,27 @@ def _next_token_logits(
     return output.logits[0, -1].detach().float().cpu()
 
 
-def _resolve_ce_inputs(
-    config: ProjectConfig,
+def _completion_ce_inputs(
     runtime: BaseModelRuntime | IntervenedModelRuntime,
     trajectories: Sequence[TargetTrajectory],
     labels: Mapping[str, str],
-) -> tuple[tuple[CEInput, ...], dict[str, Any]]:
-    if config.data.reference_files:
-        tokenizer = runtime.processor.tokenizer
-        texts = ingest_texts(
-            config.data.reference_files,
-            token_counter=lambda text: len(tokenizer.encode(text, add_special_tokens=True)),
-            max_text_tokens=config.data.max_text_tokens,
-        )
-        if not texts:
-            raise PipelineError("configured reference files produced no usable texts")
-        inputs = raw_text_ce_inputs(runtime, texts)
-        return inputs, {
-            "source": "reference_files",
-            "input_count": len(inputs),
-            "target_token_count": sum(item.target_token_count for item in inputs),
-            "source_sha256": [file_sha256(Path(path).resolve()) for path in config.data.reference_files],
-        }
-    inputs = completed_non_refusal_completion_inputs(runtime, trajectories, labels)
-    return inputs, {
-        "source": "baseline_non_refusal_completions",
-        "input_count": len(inputs),
-        "target_token_count": sum(item.target_token_count for item in inputs),
-        "trajectory_hashes": [
-            trajectory.trajectory_hash
-            for trajectory in trajectories
-            if labels.get(trajectory.prompt_id) == "NON_REFUSAL" and _eligible_baseline_trajectory(trajectory)
-        ],
-    }
+) -> tuple[CEInput, ...]:
+    return completed_non_refusal_completion_inputs(runtime, trajectories, labels)
+
+
+def _reference_ce_inputs(
+    config: ProjectConfig,
+    runtime: BaseModelRuntime | IntervenedModelRuntime,
+) -> tuple[CEInput, ...]:
+    tokenizer = runtime.processor.tokenizer
+    texts = ingest_texts(
+        config.data.reference_files,
+        token_counter=lambda text: len(tokenizer.encode(text, add_special_tokens=True)),
+        max_text_tokens=config.data.max_text_tokens,
+    )
+    if not texts:
+        raise PipelineError("configured reference files produced no usable texts")
+    return raw_text_ce_inputs(runtime, texts)
 
 
 def _module_name(model: torch.nn.Module, target: torch.nn.Module) -> str:
@@ -2976,7 +3050,7 @@ def _load_test_base_quality(
     *,
     identity: str,
     prompt_ids: Sequence[str],
-) -> tuple[list[torch.Tensor], CELoss, tuple[CEInput, ...], dict[str, Any]] | None:
+) -> tuple[list[torch.Tensor], CELoss, tuple[CEInput, ...]] | None:
     metadata_path = directory / "quality.private.json"
     tensor_path = directory / "logits.private.safetensors"
     if not metadata_path.exists():
@@ -2998,7 +3072,6 @@ def _load_test_base_quality(
         "prompt_ids",
         "base_ce",
         "ce_inputs",
-        "reference_corpus",
         "tensor_sha256",
         "content_sha256",
     }
@@ -3013,7 +3086,6 @@ def _load_test_base_quality(
         raise ArtifactError("test base-quality checkpoint tensor hash does not match")
     base_ce = value["base_ce"]
     ce_input_rows = value["ce_inputs"]
-    reference_corpus = value["reference_corpus"]
     if (
         not isinstance(base_ce, dict)
         or set(base_ce) != {"total_loss", "token_count"}
@@ -3023,7 +3095,6 @@ def _load_test_base_quality(
         or not isinstance(base_ce["token_count"], int)
         or not isinstance(ce_input_rows, list)
         or not ce_input_rows
-        or not isinstance(reference_corpus, dict)
     ):
         raise ArtifactError("test base-quality checkpoint values are invalid")
     try:
@@ -3054,7 +3125,7 @@ def _load_test_base_quality(
         or not bool(torch.isfinite(base_logits).all())
     ):
         raise ArtifactError("test base-quality checkpoint logits are invalid")
-    return list(base_logits.unbind(0)), base_ce_loss, ce_inputs, reference_corpus
+    return list(base_logits.unbind(0)), base_ce_loss, ce_inputs
 
 
 def _save_test_base_quality(
@@ -3065,7 +3136,6 @@ def _save_test_base_quality(
     base_logits: Sequence[torch.Tensor],
     base_ce: CELoss,
     ce_inputs: Sequence[CEInput],
-    reference_corpus: Mapping[str, Any],
 ) -> None:
     if (
         len(base_logits) != len(prompt_ids)
@@ -3110,11 +3180,125 @@ def _save_test_base_quality(
         "prompt_ids": list(prompt_ids),
         "base_ce": {"total_loss": base_ce.total_loss, "token_count": base_ce.token_count},
         "ce_inputs": [dataclasses.asdict(item) for item in ce_inputs],
-        "reference_corpus": dict(reference_corpus),
         "tensor_sha256": file_sha256(tensor_path),
     }
     store_value = {**body, "content_sha256": object_sha256(body)}
     ArtifactStore.write_json(directory / "quality.private.json", store_value, private=True)
+
+
+def _test_reference_ce_identity(
+    config: ProjectConfig,
+    profile: ArtifactProfile,
+    export_manifest_hash: str,
+) -> str:
+    return object_sha256(
+        {
+            "profile": profile.as_dict(),
+            "export_manifest_hash": export_manifest_hash,
+            "reference_files": [
+                {
+                    "path": str(Path(path).resolve()),
+                    "content_sha256": file_sha256(Path(path).resolve()),
+                }
+                for path in config.data.reference_files
+            ],
+            "max_text_tokens": config.data.max_text_tokens,
+            "implementation_hash": _implementation_hash(
+                _test_reference_ce_identity,
+                ingest_texts,
+                raw_text_ce_inputs,
+                compute_ce_loss,
+                ce_evaluation_from_losses,
+                CEEvaluation,
+                BaseModelRuntime,
+                IntervenedModelRuntime,
+                type(adapter_for_config(config)),
+            ),
+        }
+    )
+
+
+def _evaluate_test_reference_ce(
+    config: ProjectConfig,
+    store: ArtifactStore,
+    profile: ArtifactProfile,
+) -> None:
+    from self_judged_refusal_direction.exporting import load_export_manifest
+
+    results_path = store.paths.evaluation / "test_reference_ce_results.jsonl"
+    manifest = load_export_manifest(store.paths.exported_model)
+    identity = _test_reference_ce_identity(
+        config,
+        profile,
+        _require_sha256(manifest.get("manifest_sha256"), "export manifest hash"),
+    )
+    diagnostic_profile = dataclasses.replace(profile, reference_ce_hash=identity)
+    if not config.data.reference_files:
+        store.write_jsonl(
+            results_path,
+            (),
+            artifact_type="test_reference_ce_results",
+            profile=diagnostic_profile,
+            private=False,
+        )
+        return
+    checkpoint_directory = store.paths.evaluation / ".test-reference-ce-checkpoints" / identity
+    with PrivateCheckpoint(
+        checkpoint_directory,
+        identity=identity,
+        prompt_keys=("exported_model",),
+    ) as checkpoint:
+        entries = checkpoint.load()
+        if not entries:
+            with BaseModelRuntime(config) as runtime:
+                _require_judge_validation(store, runtime)
+                _validate_activation_chat_profile(profile, runtime.chat_template_hash)
+                base_fingerprints = runtime.adapter.processor_fingerprints(runtime.processor)
+                inputs = _reference_ce_inputs(config, runtime)
+                baseline = compute_ce_loss(runtime, inputs, desc="Test baseline reference CE")
+            export_config = dataclasses.replace(
+                config,
+                model=dataclasses.replace(config.model, id=str(store.paths.exported_model)),
+            )
+            with IntervenedModelRuntime(export_config, install_temporary=False) as runtime:
+                if runtime.adapter.processor_fingerprints(runtime.processor) != base_fingerprints:
+                    raise ArtifactError("exported processor differs during reference CE evaluation")
+                try:
+                    intervention = compute_ce_loss(runtime, inputs, desc="Test export reference CE")
+                except NonFiniteMetricError:
+                    intervention = None
+            evaluation = ce_evaluation_from_losses(
+                baseline,
+                intervention,
+                source="reference_files",
+                input_count=len(inputs),
+            )
+            checkpoint.write(
+                0,
+                "exported_model",
+                {
+                    "candidate_id": "exported_model",
+                    "reference_ce": evaluation.as_dict(),
+                },
+            )
+        rows = [dict(entry.payload) for entry in checkpoint.require_complete()]
+        if (
+            len(rows) != 1
+            or set(rows[0]) != {"candidate_id", "reference_ce"}
+            or rows[0]["candidate_id"] != "exported_model"
+            or not isinstance(rows[0]["reference_ce"], dict)
+        ):
+            raise ArtifactError("test reference CE checkpoint is invalid")
+        reference_ce = CEEvaluation.from_dict(rows[0]["reference_ce"])
+        if reference_ce.source != "reference_files":
+            raise ArtifactError("test reference CE checkpoint source is invalid")
+    store.write_jsonl(
+        results_path,
+        rows,
+        artifact_type="test_reference_ce_results",
+        profile=diagnostic_profile,
+        private=False,
+    )
 
 
 def _trajectory_error_rows(trajectories: Sequence[TargetTrajectory]) -> list[dict[str, Any]]:
@@ -3240,13 +3424,6 @@ def evaluate_export(config_path: str) -> None:
             ),
             "direction_sha256": tensor_sha256(direction),
             "test_prompts": [dataclasses.asdict(prompt) for prompt in prompts],
-            "reference_input": [
-                {
-                    "path": str(Path(path).resolve()),
-                    "sha256": file_sha256(Path(path).resolve()),
-                }
-                for path in config.data.reference_files
-            ],
             "target_implementation_hash": _implementation_hash(
                 TargetTrajectoryGenerator,
                 type(adapter_for_config(config)),
@@ -3263,6 +3440,10 @@ def evaluate_export(config_path: str) -> None:
                 evaluate_export,
                 evaluate_behavior,
                 mean_next_token_kl,
+                completed_non_refusal_completion_inputs,
+                compute_ce_loss,
+                ce_evaluation_from_losses,
+                CEEvaluation,
             ),
         }
     )
@@ -3375,12 +3556,12 @@ def evaluate_export(config_path: str) -> None:
             raise ArtifactError("completed test evaluation artifacts differ from the export manifest")
         _remove_managed_directory(base_quality_directory, missing_ok=True)
         _discard_checkpoint(export_quality_directory)
+        _evaluate_test_reference_ce(config, store, profile)
         return
     baseline_judgments: list[JudgeResult] = []
     base_logits: list[torch.Tensor] = []
     base_ce: CELoss | None = None
     ce_inputs: tuple[CEInput, ...] = ()
-    reference_corpus: dict[str, Any] = {}
     base_quality_identity = ""
     with BaseModelRuntime(config) as runtime:
         _require_judge_validation(store, runtime)
@@ -3455,6 +3636,16 @@ def evaluate_export(config_path: str) -> None:
                         "stage": "base_quality",
                         "checkpoint_checksum": base_checkpoint_checksum,
                         "prompt_ids": non_refusal_ids,
+                        "trajectory_hashes": [
+                            trajectory.trajectory_hash
+                            for trajectory in baseline_trajectories
+                            if trajectory.prompt_id in baseline_labels
+                            and baseline_labels[trajectory.prompt_id] == "NON_REFUSAL"
+                        ],
+                        "implementation_hash": _implementation_hash(
+                            completed_non_refusal_completion_inputs,
+                            compute_ce_loss,
+                        ),
                     }
                 )
                 saved_quality = _load_test_base_quality(
@@ -3471,8 +3662,7 @@ def evaluate_export(config_path: str) -> None:
                             unit="prompt",
                         )
                     ]
-                    ce_inputs, reference_corpus = _resolve_ce_inputs(
-                        config,
+                    ce_inputs = _completion_ce_inputs(
                         runtime,
                         baseline_trajectories,
                         baseline_labels,
@@ -3485,10 +3675,9 @@ def evaluate_export(config_path: str) -> None:
                         base_logits=base_logits,
                         base_ce=base_ce,
                         ce_inputs=ce_inputs,
-                        reference_corpus=reference_corpus,
                     )
                 else:
-                    base_logits, base_ce, ce_inputs, reference_corpus = saved_quality
+                    base_logits, base_ce, ce_inputs = saved_quality
     _record_error_diagnostics(
         config,
         store,
@@ -3574,19 +3763,23 @@ def evaluate_export(config_path: str) -> None:
                 quality_entries = quality_checkpoint.load()
                 if quality_entries:
                     quality_row = quality_entries[0].payload
-                    if set(quality_row) != {"mean_kl", "ce"}:
+                    if set(quality_row) != {"mean_kl", "completion_ce"}:
                         raise ArtifactError("test export-quality checkpoint fields are invalid")
                     mean_kl = quality_row["mean_kl"]
-                    ce_value = quality_row["ce"]
+                    ce_value = quality_row["completion_ce"]
                     if (
-                        isinstance(mean_kl, bool)
-                        or not isinstance(mean_kl, int | float)
-                        or not math.isfinite(mean_kl)
-                        or not isinstance(ce_value, dict)
-                    ):
+                        mean_kl is not None
+                        and (
+                            isinstance(mean_kl, bool)
+                            or not isinstance(mean_kl, int | float)
+                            or not math.isfinite(mean_kl)
+                        )
+                    ) or not isinstance(ce_value, dict):
                         raise ArtifactError("test export-quality checkpoint values are invalid")
-                    mean_kl = float(mean_kl)
-                    ce_comparison = _ce_comparison_from_dict(ce_value)
+                    mean_kl = float(mean_kl) if mean_kl is not None else None
+                    completion_ce = CEEvaluation.from_dict(ce_value)
+                    if completion_ce.source != "baseline_non_refusal_completions":
+                        raise ArtifactError("test export-quality checkpoint CE source is invalid")
                 else:
                     if base_ce is None or not ce_inputs:
                         raise InvariantError("test baseline quality is unavailable")
@@ -3598,13 +3791,22 @@ def evaluate_export(config_path: str) -> None:
                             unit="prompt",
                         )
                     ]
-                    export_ce = compute_ce_loss(runtime, ce_inputs, desc="Computing test export CE loss")
-                    ce_comparison = compare_ce_losses(base_ce, export_ce)
-                    mean_kl = mean_next_token_kl(base_logits, export_logits) if base_logits else 0.0
+                    try:
+                        export_ce = compute_ce_loss(runtime, ce_inputs, desc="Computing test export CE loss")
+                    except NonFiniteMetricError:
+                        export_ce = None
+                    completion_ce = ce_evaluation_from_losses(
+                        base_ce,
+                        export_ce,
+                        source="baseline_non_refusal_completions",
+                        input_count=len(ce_inputs),
+                    )
+                    measured_kl = mean_next_token_kl(base_logits, export_logits) if base_logits else 0.0
+                    mean_kl = measured_kl if math.isfinite(measured_kl) else None
                     quality_checkpoint.write(
                         0,
                         "quality",
-                        {"mean_kl": mean_kl, "ce": ce_comparison.as_dict()},
+                        {"mean_kl": mean_kl, "completion_ce": completion_ce.as_dict()},
                     )
     _record_error_diagnostics(
         config,
@@ -3674,7 +3876,7 @@ def evaluate_export(config_path: str) -> None:
         trajectories=[item for item in export_trajectories if item.prompt_id in baseline_labels],
         judgments=export_judgments_by_hash,
         mean_kl=mean_kl,
-        ce_loss_delta=ce_comparison.loss_delta,
+        completion_ce=completion_ce,
         acceptance=config.acceptance,
     )
     full_validation_report = _read_json_artifact(
@@ -3693,7 +3895,6 @@ def evaluate_export(config_path: str) -> None:
         "export_counts": judgment_counts(export_judgments),
         "export_parser": parser_statistics(export_trajectories),
         "test_metrics": test_metrics,
-        "reference_corpus": reference_corpus,
     }
     _write_json_artifact(
         store,
@@ -3706,7 +3907,6 @@ def evaluate_export(config_path: str) -> None:
         store,
         store.paths.quality_metrics,
         {
-            "reference_corpus": reference_corpus,
             "full_validation_metrics": full_validation_report["selected_candidate"]["full_validation_metrics"],
             "test_metrics": test_metrics,
         },
@@ -3741,6 +3941,7 @@ def evaluate_export(config_path: str) -> None:
         "evaluation_report_sha256": file_sha256(store.paths.exported_model / "evaluation_report.json"),
     }
     write_export_manifest(store.paths.exported_model, final_manifest)
+    _evaluate_test_reference_ce(config, store, profile)
     for name in (
         "baseline_trajectories",
         "baseline_judgments",

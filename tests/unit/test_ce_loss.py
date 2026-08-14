@@ -10,6 +10,9 @@ from torch import nn
 
 from self_judged_refusal_direction.ce_loss import (
     CEInput,
+    CELoss,
+    ce_evaluation_from_losses,
+    compare_ce_losses,
     completed_non_refusal_completion_inputs,
     compute_ce_loss,
 )
@@ -74,6 +77,34 @@ def test_ce_loss_uses_only_target_tokens_and_weights_them_equally() -> None:
     assert result.token_count == 3
     assert result.total_loss == pytest.approx(float(first + second))
     assert result.mean_loss == pytest.approx(float((first + second) / 3))
+
+    intervention = CELoss(total_loss=result.total_loss + 0.3, token_count=result.token_count)
+    evaluation = compare_ce_losses(result, intervention).as_evaluation(
+        source="baseline_non_refusal_completions",
+        input_count=len(inputs),
+    )
+    assert evaluation.as_dict() == {
+        "source": "baseline_non_refusal_completions",
+        "input_count": 2,
+        "target_token_count": 3,
+        "baseline_loss": result.mean_loss,
+        "intervention_loss": intervention.mean_loss,
+        "loss_delta": pytest.approx(0.1),
+    }
+    failed = ce_evaluation_from_losses(
+        result,
+        None,
+        source="baseline_non_refusal_completions",
+        input_count=len(inputs),
+    )
+    assert failed.as_dict() == {
+        "source": "baseline_non_refusal_completions",
+        "input_count": 2,
+        "target_token_count": 3,
+        "baseline_loss": result.mean_loss,
+        "error_code": "NON_FINITE",
+    }
+    assert type(failed).from_dict(failed.as_dict()) == failed
 
 
 class CompletionAdapter:
